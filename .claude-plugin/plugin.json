@@ -1,0 +1,7 @@
+{
+  "name": "adw-light",
+  "description": "Deterministic checks for code, comments, and prose.",
+  "author": {
+    "name": "ADW Lite maintainers"
+  }
+}

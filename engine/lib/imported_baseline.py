@@ -1,0 +1,237 @@
+from __future__ import annotations
+
+import hashlib
+import os
+from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from functools import cached_property
+from pathlib import Path
+
+try:
+    from . import state_recovery
+except ImportError:
+    import state_recovery
+from typing import BinaryIO
+
+try:
+    from . import path_policy, session_state
+    from .regular_file import open_regular
+except ImportError:
+    import path_policy
+    import session_state
+    from regular_file import open_regular
+
+STATE_KEY = "imported_baseline"
+STORE_DIRNAME = "imported"
+INDEX_DIRNAME = "paths"
+GIT_BASELINE = ""
+NEW_FILE = "new"
+BLOCK_BYTES = 1 << 16
+_MIGRATED: set[tuple[str, str]] = set()
+Check = Callable[[], object]
+
+
+def _unchecked() -> None:
+    return None
+
+
+def _blocks(handle: BinaryIO, check: Check) -> Iterator[bytes]:
+    for block in iter(lambda: handle.read(BLOCK_BYTES), b""):
+        check()
+        yield block
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    digest: str
+    blob: Path
+
+    @cached_property
+    def text(self) -> str | None:
+        return self.read()
+
+    def read(self, check: Check = _unchecked) -> str | None:
+        try:
+            with self.blob.open("rb") as handle:
+                data = b"".join(_blocks(handle, check))
+        except OSError:
+            return None
+        return data.decode("utf-8", errors="replace")
+
+
+def path_key(path: str | os.PathLike[str]) -> str:
+    return str(path_policy.real_path(path))
+
+
+def _stream_digest(handle: BinaryIO, check: Check) -> str:
+    digest = hashlib.sha256()
+    for block in _blocks(handle, check):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+def file_digest(path: str | os.PathLike[str], check: Check = _unchecked) -> str | None:
+    try:
+        with open_regular(path) as handle:
+            return _stream_digest(handle, check)
+    except OSError:
+        return None
+
+
+def text_digest(text: str, check: Check = _unchecked) -> str:
+    data = memoryview(text.encode("utf-8", errors="surrogatepass"))
+    digest = hashlib.sha256()
+    for start in range(0, len(data), BLOCK_BYTES):
+        check()
+        digest.update(data[start:start + BLOCK_BYTES])
+    return digest.hexdigest()
+
+
+def _store(session_id: str, root: str | os.PathLike[str] | None) -> Path:
+    return session_state.session_directory(session_id, root) / STORE_DIRNAME
+
+
+def _index_file(index: Path, key: str) -> Path:
+    return index / text_digest(key)
+
+
+def _read_mark(index: Path, key: str) -> str | None:
+    try:
+        return _index_file(index, key).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+
+
+def _put_mark(index: Path, key: str, mark: str, *, replace: bool) -> bool:
+    index.mkdir(parents=True, exist_ok=True)
+    if replace:
+        state_recovery.atomic_write(_index_file(index, key), mark)
+        return True
+    with state_recovery.temporary_file(index) as (temporary, stream):
+        stream.write(mark)
+        stream.close()
+        try:
+            os.link(temporary, _index_file(index, key))
+        except FileExistsError:
+            return False
+        return True
+
+
+def _legacy_entries(state: dict) -> dict[str, str]:
+    stored = state.get(STATE_KEY)
+    if not isinstance(stored, dict):
+        return {}
+    return {key: value for key, value in stored.items() if isinstance(key, str) and isinstance(value, str)}
+
+
+def _migrate(session_id: str, index: Path, root: str | os.PathLike[str] | None) -> None:
+    state = session_state.read_state(session_id, root)
+    if STATE_KEY not in state:
+        return
+    for key, mark in _legacy_entries(state).items():
+        _put_mark(index, key, mark, replace=False)
+    session_state.update_state(
+        session_id, lambda current: {name: value for name, value in current.items() if name != STATE_KEY}, root,
+    )
+
+
+def _index(session_id: str, root: str | os.PathLike[str] | None) -> Path:
+    index = _store(session_id, root) / INDEX_DIRNAME
+    marker = (session_id, str(index))
+    if marker not in _MIGRATED:
+        _migrate(session_id, index, root)
+        _MIGRATED.add(marker)
+    return index
+
+
+def _hashed_copy(source: BinaryIO, target: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    for block in iter(lambda: source.read(1 << 16), b""):
+        digest.update(block)
+        target.write(block)
+    return digest.hexdigest()
+
+
+def _copied_blob(source: BinaryIO, store: Path) -> str:
+    store.mkdir(parents=True, exist_ok=True)
+    with state_recovery.temporary_file(store, binary=True) as (temporary, handle):
+        digest = _hashed_copy(source, handle)
+        handle.close()
+        if not (store / digest).exists():
+            temporary.replace(store / digest)
+        return digest
+
+
+def _captured(path: Path, store: Path) -> str | None:
+    try:
+        source = open_regular(path)
+    except OSError:
+        return None
+    with source:
+        return _copied_blob(source, store)
+
+
+def snapshot_many(session_id: str, paths: list[str], root: str | os.PathLike[str] | None) -> list[str]:
+    if not session_id:
+        return []
+    store = _store(session_id, root)
+    index = _index(session_id, root)
+    changed: list[str] = []
+    for key in dict.fromkeys(map(path_key, paths)):
+        digest = _captured(Path(key), store)
+        if digest is not None and _read_mark(index, key) != digest:
+            _put_mark(index, key, digest, replace=True)
+            changed.append(key)
+    return changed
+
+
+def _first_mark(path: Path, store: Path, has_git: Callable[[Path], bool]) -> str | None:
+    if not path.is_file():
+        return NEW_FILE
+    if has_git(path):
+        return GIT_BASELINE
+    return _captured(path, store)
+
+
+def note_first_seen(session_id: str, paths: list[str], root: str | os.PathLike[str] | None, has_git: Callable[[Path], bool]) -> None:
+    if not session_id:
+        return
+    store = _store(session_id, root)
+    index = _index(session_id, root)
+    for key in dict.fromkeys(map(path_key, paths)):
+        seen = _read_mark(index, key)
+        if seen is not None:
+            _fill_hash_only(Path(key), store, seen)
+            continue
+        mark = _first_mark(Path(key), store, has_git)
+        if mark is not None:
+            _put_mark(index, key, mark, replace=False)
+
+
+def _fill_hash_only(path: Path, store: Path, mark: str) -> None:
+    if mark in (NEW_FILE, GIT_BASELINE) or (store / mark).exists():
+        return
+    if file_digest(path) == mark:
+        _captured(path, store)
+
+
+def note_written(session_id: str, paths: list[str], root: str | os.PathLike[str] | None) -> None:
+    if not session_id:
+        return
+    index = _index(session_id, root)
+    for key in dict.fromkeys(map(path_key, paths)):
+        _put_mark(index, key, NEW_FILE, replace=False)
+
+
+def lookup(cfg: dict, path: str | os.PathLike[str]) -> Snapshot | None:
+    session_id = cfg.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    root = cfg.get("state_root")
+    try:
+        digest = _read_mark(_index(session_id, root), path_key(path))
+    except (OSError, ValueError):
+        return None
+    if not digest or digest == NEW_FILE:
+        return None
+    return Snapshot(digest, _store(session_id, root) / digest)

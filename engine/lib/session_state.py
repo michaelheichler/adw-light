@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shutil
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+try:
+    from . import config_roots as config_paths
+except ImportError:
+    import config_roots as config_paths
+
+try:
+    from . import state_recovery
+except ImportError:
+    import state_recovery
+
+STATE_FILENAME = "state.json"
+LOCK_FILENAME = ".lock"
+SESSION_LEASE_DIRNAME = "session-leases"
+SESSION_LEASE_SUFFIX = ".lease.json"
+SESSION_LEASE_TTL_SECONDS = 900
+EXPLAINED_KEY = "explained_rules"
+
+
+def plugin_data_home() -> Path:
+    return config_paths.state_root()
+
+
+def referenced_blocker_reports(state_root: Path) -> set[str]:
+    paths = set()
+    for state_file in state_root.glob("*/state.json"):
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        for scope in state.get("unresolved_blockers", {}).values():
+            for record in scope.values():
+                if isinstance(record, dict) and isinstance(record.get("report"), str):
+                    paths.add(record["report"])
+            for reason in scope.get("pending", {}).values():
+                paths.update(line.partition(": ")[2] for line in reason.splitlines())
+    return paths
+
+
+def models_root() -> Path:
+    return plugin_data_home() / "models"
+
+
+def _default_root() -> Path:
+    return plugin_data_home() / "state"
+
+
+def session_lease_root(root: str | os.PathLike[str] | None = None) -> Path:
+    state_root = Path(root) if root is not None else _default_root()
+    return state_root.with_name(SESSION_LEASE_DIRNAME)
+
+
+def _validate_session_id(session_id: str) -> None:
+    if not isinstance(session_id, str) or not session_id or session_id in (".", ".."):
+        raise ValueError(f"unsafe session_id: {session_id!r}")
+    if "/" in session_id or "\\" in session_id or "\x00" in session_id:
+        raise ValueError(f"unsafe session_id: {session_id!r}")
+
+
+def _session_directory(
+    session_id: str, root: str | os.PathLike[str] | None
+) -> Path:
+    _validate_session_id(session_id)
+    base = Path(root) if root is not None else _default_root()
+    candidate = base / session_id
+    resolved_base = base.resolve()
+    resolved_candidate = candidate.resolve()
+    if not resolved_candidate.is_relative_to(resolved_base):
+        raise ValueError(f"session_id escapes state root: {session_id!r}")
+    return candidate
+
+
+def session_directory(session_id: str, root: str | os.PathLike[str] | None = None) -> Path:
+    return _session_directory(session_id, root)
+
+
+def read_state(
+    session_id: str, root: str | os.PathLike[str] | None = None
+) -> dict:
+    try:
+        return read_state_strict(session_id, root)
+    except (IsADirectoryError, ValueError, UnicodeDecodeError):
+        return {}
+
+
+def _parsed_or_empty(path: Path) -> dict:
+    try:
+        return state_recovery.parsed(path)
+    except FileNotFoundError:
+        return {}
+
+
+def _read_held(directory: Path) -> dict:
+    path = directory / STATE_FILENAME
+    try:
+        return _parsed_or_empty(path)
+    except (ValueError, UnicodeDecodeError):
+        recovered = state_recovery.restored(path)
+        if recovered is None:
+            raise
+        return recovered
+
+
+def _read_held_or_empty(directory: Path) -> dict:
+    try:
+        return _read_held(directory)
+    except (IsADirectoryError, ValueError, UnicodeDecodeError):
+        return {}
+
+
+@contextmanager
+def _session_lock(directory: Path) -> Iterator[None]:
+    lock_fd = os.open(directory / LOCK_FILENAME, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def read_state_strict(
+    session_id: str, root: str | os.PathLike[str] | None = None
+) -> dict:
+    directory = _session_directory(session_id, root)
+    try:
+        return _parsed_or_empty(directory / STATE_FILENAME)
+    except (ValueError, UnicodeDecodeError):
+        with _session_lock(directory):
+            return _read_held(directory)
+
+
+def write_state(
+    session_id: str,
+    data: dict,
+    root: str | os.PathLike[str] | None = None,
+) -> None:
+    directory = _session_directory(session_id, root)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / STATE_FILENAME
+    payload = json.dumps(data, ensure_ascii=True)
+    state_recovery.atomic_write(path, payload)
+    state_recovery.atomic_write(state_recovery.backup_path(path), payload)
+
+
+def take_recovery_notice(session_id: str, root: str | os.PathLike[str] | None = None) -> str:
+    if state_recovery.RECOVERY_KEY not in read_state(session_id, root):
+        return ""
+    claimed: list[str] = []
+
+    def mutate(state: dict) -> dict:
+        notice = state.get(state_recovery.RECOVERY_KEY)
+        if isinstance(notice, str):
+            claimed.append(notice)
+        return {key: value for key, value in state.items() if key != state_recovery.RECOVERY_KEY}
+
+    update_state(session_id, mutate, root)
+    return claimed[0] if claimed else ""
+
+
+def _update_locked(
+    session_id: str,
+    mutate: Callable[[dict], dict],
+    root: str | os.PathLike[str] | None,
+    read_held: Callable[[Path], dict],
+) -> dict:
+    directory = _session_directory(session_id, root)
+    directory.mkdir(parents=True, exist_ok=True)
+    with _session_lock(directory):
+        updated = mutate(read_held(directory))
+        if not isinstance(updated, dict):
+            raise TypeError("update mutate must return a dict")
+        write_state(session_id, updated, root)
+        return updated
+
+
+def update_state(
+    session_id: str,
+    mutate: Callable[[dict], dict],
+    root: str | os.PathLike[str] | None = None,
+) -> dict:
+    return _update_locked(session_id, mutate, root, _read_held_or_empty)
+
+
+def update_state_strict(
+    session_id: str,
+    mutate: Callable[[dict], dict],
+    root: str | os.PathLike[str] | None = None,
+) -> dict:
+    return _update_locked(session_id, mutate, root, _read_held)
+
+
+def claim_explained(
+    session_id: str,
+    rules: frozenset[str],
+    root: str | os.PathLike[str] | None = None,
+) -> frozenset[str]:
+    claimed: set[str] = set()
+
+    def mutate(state: dict) -> dict:
+        stored = state.get(EXPLAINED_KEY)
+        known = {rule for rule in stored if isinstance(rule, str)} if isinstance(stored, list) else set()
+        claimed.update(rules - known)
+        return {**state, EXPLAINED_KEY: sorted(known | claimed)}
+
+    update_state(session_id, mutate, root)
+    return frozenset(claimed)
+
+
+def _next_turn(state: dict) -> dict:
+    count = state.get("turn_count")
+    if not isinstance(count, int) or isinstance(count, bool):
+        count = 0
+    count += 1
+    return {**state, "turn_count": count, "turn_id": f"turn-{count}"}
+
+
+def advance_turn(
+    session_id: str, root: str | os.PathLike[str] | None = None
+) -> dict:
+    return update_state_strict(session_id, _next_turn, root)
+
+
+def cleanup_session(
+    session_id: str, root: str | os.PathLike[str] | None = None
+) -> None:
+    shutil.rmtree(_session_directory(session_id, root), ignore_errors=True)
+
+
+def _session_lease_path(
+    session_id: str, root: str | os.PathLike[str] | None = None,
+) -> Path:
+    _validate_session_id(session_id)
+    return session_lease_root(root) / f"{session_id}{SESSION_LEASE_SUFFIX}"
+
+
+def acquire_session_lease(
+    session_id: str,
+    root: str | os.PathLike[str] | None = None,
+    now: float | None = None,
+) -> None:
+    path = _session_lease_path(session_id, root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state_recovery.atomic_json(path, {
+        "session_id": session_id, "renewed_at": time.time() if now is None else now,
+    }, ensure_ascii=True)
+
+
+def release_session_lease(
+    session_id: str, root: str | os.PathLike[str] | None = None,
+) -> None:
+    _session_lease_path(session_id, root).unlink(missing_ok=True)
+
+
+def live_session_ids(
+    root: str | os.PathLike[str] | None = None,
+    now: float | None = None,
+) -> frozenset[str]:
+    current = time.time() if now is None else now
+    directory = session_lease_root(root)
+    if not directory.is_dir():
+        return frozenset()
+    live: set[str] = set()
+    for path in directory.glob(f"*{SESSION_LEASE_SUFFIX}"):
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+            session_id = row.get("session_id") if isinstance(row, dict) else None
+            renewed_at = row.get("renewed_at") if isinstance(row, dict) else None
+            _validate_session_id(session_id)
+            if not isinstance(renewed_at, (int, float)) or current - renewed_at > SESSION_LEASE_TTL_SECONDS:
+                raise ValueError("expired session lease")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        live.add(session_id)
+    return frozenset(live)
+
+
+def _remove_if_stale(entry: Path, cutoff: float) -> bool:
+    try:
+        mtime = entry.stat().st_mtime
+    except OSError:
+        return False
+    if mtime >= cutoff:
+        return False
+    try:
+        shutil.rmtree(entry)
+    except OSError:
+        return False
+    return not entry.exists()
+
+
+def sweep_stale(
+    max_age_seconds: float,
+    root: str | os.PathLike[str] | None = None,
+    now: float | None = None,
+) -> int:
+    base = Path(root) if root is not None else _default_root()
+    if not base.is_dir():
+        return 0
+    cutoff = (time.time() if now is None else now) - max_age_seconds
+    live = live_session_ids(root, now)
+    removed = 0
+    for entry in base.iterdir():
+        if entry.is_dir() and entry.name not in live and _remove_if_stale(entry, cutoff):
+            removed += 1
+    return removed

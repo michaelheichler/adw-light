@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import re
+from bisect import bisect_right
+from dataclasses import dataclass
+from typing import NamedTuple
+
+try:
+    from .markup import FencePolicy, markdown_lines
+except ImportError:
+    from markup import FencePolicy, markdown_lines
+
+ENGLISH = "en"
+GERMAN = "de"
+LANGUAGES = (ENGLISH, GERMAN)
+DEFAULT_LANGUAGE = ENGLISH
+MIN_STRONG_WORDS = 4
+
+ENGLISH_STOP_WORDS = frozenset("""
+a about after all and any are as at be because been before but by can could did do does
+each for from had has have he her his how i if into is it its just me might more must my
+no not of on one only or other our out over she should some such than that the their them
+then there these they this those to up us very we were what when where which while who why
+with would you your
+""".split())
+GERMAN_STOP_WORDS = frozenset("""
+aber alle als auch auf aus bei beim bereits bis das dass dem der des dich diese diesem diesen
+dieser dieses doch du durch ein eine einem einen einer eines es etwa für gegen gibt habe haben
+hatte hier ich ihr im immer ist jedoch jetzt kann kein keine können man mehr mich mit muss nach
+nicht noch nur ob oder ohne sehr sich sie sind sowie über und uns unter vom von weil wenn werden
+wie wir wird wurde wurden zu zum zur zwischen
+""".split())
+
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+URL_RE = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
+PATH_RE = re.compile(r"(?<!\S)\S*[/\\]\S*|\b[\w-]+\.[a-z0-9]{1,5}\b")
+WORD_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
+GERMAN_LETTER_RE = re.compile(r"[äöüß]", re.IGNORECASE)
+
+
+class Signal(NamedTuple):
+    language: str | None
+    words: int
+
+
+@dataclass(frozen=True, slots=True)
+class ParagraphLanguage:
+    line: int
+    text: str
+    language: str
+    weak: bool
+    end_line: int | None = None
+    line_starts: tuple[int, ...] = ()
+
+    def line_at(self, index: int) -> int:
+        if not self.line_starts:
+            return self.line + self.text.count("\n", 0, index)
+        return self.line + bisect_right(self.line_starts, index) - 1
+
+    def line_spans(self) -> list[tuple[int, int]]:
+        starts = self.line_starts or (0, *(found.end() for found in re.finditer("\n", self.text)))
+        return list(zip(starts, [*(start - 1 for start in starts[1:]), len(self.text)], strict=True))
+
+    def lines_of(self, start: int, end: int) -> tuple[int, int | None]:
+        first, last = self.line_at(start), self.line_at(max(start, end - 1))
+        return first, last if last > first else None
+
+
+def countable_text(text: str) -> str:
+    for pattern in (INLINE_CODE_RE, URL_RE, PATH_RE):
+        text = pattern.sub(" ", text)
+    return text
+
+
+def paragraph_signal(text: str) -> Signal:
+    countable = countable_text(text)
+    words = [word.lower() for word in WORD_RE.findall(countable)]
+    english = sum(word in ENGLISH_STOP_WORDS for word in words)
+    german = sum(word in GERMAN_STOP_WORDS for word in words)
+    if english != german:
+        return Signal(ENGLISH if english > german else GERMAN, len(words))
+    if GERMAN_LETTER_RE.search(countable):
+        return Signal(GERMAN, len(words))
+    return Signal(None, len(words))
+
+
+def allowed_languages(cfg: dict) -> tuple[str, ...]:
+    listed = cfg.get("prose_languages")
+    if type(listed) is not list:
+        return LANGUAGES
+    chosen = tuple(language for language in LANGUAGES if language in listed)
+    return chosen or LANGUAGES
+
+
+def _prose_lines(text: str) -> list[str]:
+    return ["" if line.hidden else line.content.strip() for line in markdown_lines(text, FencePolicy.LANGUAGE)]
+
+
+class _Block(NamedTuple):
+    line: int
+    text: str
+    end_line: int
+    line_starts: tuple[int, ...]
+
+
+def _block(first: int, lines: list[str]) -> _Block:
+    starts, offset = [], 0
+    for line in lines:
+        starts.append(offset)
+        offset += len(line) + 1
+    return _Block(first, " ".join(lines), first + len(lines) - 1, tuple(starts))
+
+
+def _paragraph_blocks(text: str) -> list[_Block]:
+    blocks: list[_Block] = []
+    current: list[str] = []
+    for number, line in enumerate([*_prose_lines(text), ""], 1):
+        if line:
+            current.append(line)
+            continue
+        if current:
+            blocks.append(_block(number - len(current), current))
+        current = []
+    return blocks
+
+
+def _is_strong(signal: Signal) -> bool:
+    return signal.language is not None and signal.words >= MIN_STRONG_WORDS
+
+
+def _document_language(signals: list[Signal]) -> str:
+    strong = [signal.language for signal in signals if _is_strong(signal)]
+    return GERMAN if strong.count(GERMAN) > strong.count(ENGLISH) else DEFAULT_LANGUAGE
+
+
+def _paragraph(block: _Block, language: str, weak: bool) -> ParagraphLanguage:
+    return ParagraphLanguage(block.line, block.text, language, weak, block.end_line, block.line_starts)
+
+
+def paragraph_languages(text: str, allowed: tuple[str, ...] = LANGUAGES) -> list[ParagraphLanguage]:
+    blocks = _paragraph_blocks(text)
+    if len(allowed) == 1:
+        return [_paragraph(block, allowed[0], False) for block in blocks]
+    signals = [paragraph_signal(block.text) for block in blocks]
+    fallback = _document_language(signals)
+    return [
+        _paragraph(block, signal.language, False) if _is_strong(signal) else _paragraph(block, fallback, True)
+        for block, signal in zip(blocks, signals, strict=True)
+    ]

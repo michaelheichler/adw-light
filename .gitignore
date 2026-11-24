@@ -1,0 +1,7 @@
+.state/
+.state-probe/
+__pycache__/
+.DS_Store
+.caliber/
+.*/
+!.claude-plugin/

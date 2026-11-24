@@ -1,0 +1,278 @@
+import hashlib
+import json
+import re
+from collections.abc import Callable, Iterable
+from functools import partial
+from pathlib import Path
+from typing import NamedTuple
+
+try:
+    from . import catalog, catalog_de, hookio, principle_kb, path_policy, session_state
+    from .findings import Finding
+    from .prose_language import GERMAN
+except ImportError:
+    import catalog
+    import catalog_de
+    import hookio
+    import principle_kb
+    import path_policy
+    import session_state
+    from findings import Finding
+    from prose_language import GERMAN
+
+MAX_MATCH_BYTES = 80
+MAX_EXPLANATION_WORDS = 80
+PRINCIPLE_LABEL = "Principle"
+PRINCIPLE_MAP = Path(__file__).with_name("principle_map.json")
+SOURCE_LABELS = {"deviq": "DevIQ", "programming-principles": "Programming Principles"}
+URL_RE = re.compile(r"https?://\S+")
+SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
+
+
+def safe_component(value: object, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or "")).strip("._")[:48]
+    return text or fallback
+
+
+def canonical_path(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        return str(path_policy.real_path(value))
+    except (OSError, RuntimeError, ValueError):
+        return value
+
+
+def finding_content_hash(finding: dict) -> str:
+    value = finding.get("content_hash")
+    if isinstance(value, str) and value:
+        return value
+    identity = {key: finding.get(key) for key in ("detail", "snippet", "action", "line")}
+    encoded = json.dumps(identity, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def deduplicated(findings: list[dict], config: dict | None = None) -> list[dict]:
+    cfg = config or {}
+    seen: set[tuple[object, ...]] = set()
+    result: list[dict] = []
+    for raw_finding in findings:
+        finding = raw_finding.to_dict() if isinstance(raw_finding, Finding) else raw_finding
+        if not isinstance(finding, dict):
+            continue
+        key = (
+            cfg.get("session_id", ""), cfg.get("turn_id", ""), finding.get("rule"),
+            canonical_path(finding.get("path") or finding.get("file")),
+            finding_content_hash(finding), finding.get("line"), finding.get("snippet"),
+        )
+        if key not in seen:
+            seen.add(key)
+            result.append(finding)
+    return result
+
+
+def safe_text(value: object) -> str:
+    safe: list[str] = []
+    for character in str(value):
+        code = ord(character)
+        if character == "\n":
+            safe.append(character)
+        elif code < 32 or code == 127 or 0x80 <= code <= 0x9F or 0x202A <= code <= 0x202E or 0x2066 <= code <= 0x2069:
+            safe.append(" ")
+        else:
+            safe.append({"`": "'", "<": "‹", ">": "›"}.get(character, character))
+    return "".join(safe)
+
+
+def clip(value: object, limit: int) -> str:
+    text = safe_text(value)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:max(limit - 3, 0)].decode("utf-8", errors="ignore") + "..."
+
+
+def _one_line(value: object) -> str:
+    return safe_text(value).replace("\n", " ")
+
+
+def _sentence(text: str) -> str:
+    stripped = text.strip()
+    return stripped if stripped.endswith((".", "!", "?")) else stripped + "."
+
+
+class ReviewNote(NamedTuple):
+    location: str
+    found: str
+    problem: str
+    action: str
+
+
+def review_row(note: ReviewNote) -> str:
+    problem, action = _sentence(_one_line(note.problem)), _sentence(_one_line(note.action))
+    return f'{_one_line(note.location)} Found "{_one_line(note.found)}". Problem: {problem} Action: {action}'
+
+
+def _german_entry(item: dict) -> "catalog_de.GermanEntry | None":
+    if item.get("language") != GERMAN:
+        return None
+    return catalog_de.RULES.get(str(item.get("rule") or ""))
+
+
+def localized(item: dict) -> dict:
+    entry = _german_entry(item)
+    if entry is None:
+        return item
+    path = item.get("path") or item.get("file")
+    detail = f"{entry.title} in {path}" if path else entry.title
+    return {**item, "detail": detail, "action": entry.action}
+
+
+def all_german(items: list[dict]) -> bool:
+    return bool(items) and all(_german_entry(item) is not None for item in items)
+
+
+class Lead(NamedTuple):
+    english: str
+    german: str
+
+
+def lead_text(lead: "str | Lead", german: bool) -> str:
+    if isinstance(lead, Lead):
+        return lead.german if german else lead.english
+    return lead
+
+
+def block_tail(extra: int, report: str, german: bool) -> str:
+    if german:
+        return f"{extra} {catalog_de.MORE_FINDINGS}: {report}" if extra > 0 else f"{catalog_de.FULL_REPORT}: {report}"
+    return f"{extra} more findings: {report}" if extra > 0 else f"Full report: {report}"
+
+
+def _title(item: dict, rule: str) -> str:
+    entry = _german_entry(item)
+    return entry.title if entry is not None else catalog.rule_entry(rule).title
+
+
+def format_row(item: dict) -> str:
+    path = _one_line(item.get("path") or item.get("file") or "<pending>")
+    status = _one_line(item.get("status")) if item.get("status") else ""
+    prefix = f"[{status}] " if status else ""
+    rule = _one_line(item.get("rule") or "")
+    title = _one_line(_title(item, rule))
+    match = item.get("match")
+    quoted = f' "{clip(_one_line(match), MAX_MATCH_BYTES)}"' if isinstance(match, str) and match.strip() else ""
+    line = _one_line(item.get("line"))
+    action = _one_line(item.get("action"))
+    return f"{prefix}{path}:{line} {title}{quoted}. {action} ({rule})"
+
+
+PrincipleLookup = Callable[[str], "principle_kb.Row | None"]
+ExplainedClaim = Callable[[frozenset[str]], frozenset[str]]
+
+
+class Explainer(NamedTuple):
+    lookup: PrincipleLookup
+    claim: ExplainedClaim
+    mapping: dict[str, str]
+
+
+def principle_map(path: Path = PRINCIPLE_MAP) -> dict[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {rule: entry for rule, entry in data.items() if isinstance(rule, str) and isinstance(entry, str)}
+
+
+def session_explainer(config: dict | None) -> Explainer | None:
+    fields = config or {}
+    session_id = fields.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    claim = partial(session_state.claim_explained, session_id, root=fields.get("state_root"))
+    lookup = partial(principle_kb.entry, root=fields.get("principle_root"))
+    return Explainer(lookup, claim, principle_map())
+
+
+def _trimmed(text: str) -> str:
+    body = URL_RE.sub("", text)
+    kept = " ".join(body.split()[:MAX_EXPLANATION_WORDS])
+    ends = [match.end() for match in SENTENCE_END_RE.finditer(kept)]
+    return kept[:ends[-1]] if ends else ""
+
+
+def _label(row: "principle_kb.Row") -> str:
+    source = SOURCE_LABELS.get(row.source, row.source)
+    title = row.title.split(":")[0].strip()
+    if title == title.lower():
+        title = title.replace("-", " ").title()
+    return f"{PRINCIPLE_LABEL} ({_one_line(source)}, {_one_line(title)}):"
+
+
+def explanation(rule: str, explainer: Explainer) -> str:
+    entry_id = explainer.mapping.get(rule)
+    if not entry_id:
+        return ""
+    try:
+        row = explainer.lookup(entry_id)
+    except Exception:
+        return ""
+    text = _trimmed(row.text) if row is not None else ""
+    return f"{_label(row)} {_one_line(text)}" if text else ""
+
+
+def _found_explanations(rules: Iterable[str], explainer: Explainer | None) -> dict[str, str]:
+    if explainer is None:
+        return {}
+    return {rule: text for rule in dict.fromkeys(rules) if (text := explanation(rule, explainer))}
+
+
+def _claimed(rules: Iterable[str], explainer: Explainer | None) -> frozenset[str]:
+    wanted = frozenset(rules)
+    if explainer is None or not wanted:
+        return frozenset()
+    try:
+        return explainer.claim(wanted)
+    except Exception:
+        return frozenset()
+
+
+def _fits(frame: tuple[str, str], lines: list[str]) -> bool:
+    return hookio.fits_once("\n".join([frame[0], *lines, frame[1]]))
+
+
+def _sent_rows(listed: list[dict], limit: int, frame: tuple[str, str]) -> list[str]:
+    rows: list[str] = []
+    for number, item in enumerate(listed, 1):
+        row = clip(f"{number}. {format_row(item)}", limit)
+        if not _fits(frame, [*rows, row]):
+            break
+        rows.append(row)
+    return rows
+
+
+def listed_lines(listed: list[dict], explainer: Explainer | None, limit: int, frame: tuple[str, str] = ("", "")) -> tuple[list[str], int]:
+    rows = _sent_rows(listed, limit, frame)
+    found = _found_explanations((str(item.get("rule") or "") for item in listed[:len(rows)]), explainer)
+    lines: list[str] = []
+    offered: dict[int, str] = {}
+    for index, (row, item) in enumerate(zip(rows, listed)):
+        lines.append(row)
+        rule = str(item.get("rule") or "")
+        text = found.get(rule, "")
+        principle = clip(f"   {_principle_line(text, item)}", limit) if text else ""
+        if principle and _fits(frame, [*lines, principle, *rows[index + 1:]]):
+            del found[rule]
+            offered[len(lines)] = rule
+            lines.append(principle)
+    claimed = _claimed(offered.values(), explainer)
+    return [line for position, line in enumerate(lines) if position not in offered or offered[position] in claimed], len(rows)
+
+
+def _principle_line(text: str, item: dict) -> str:
+    if _german_entry(item) is None:
+        return text
+    return catalog_de.PRINCIPLE_LABEL + text.removeprefix(PRINCIPLE_LABEL)

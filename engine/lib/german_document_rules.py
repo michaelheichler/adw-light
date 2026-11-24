@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import re
+
+try:
+    from .findings import finding_row
+    from .findings import spanning
+    from .german_readability import sentences, words
+    from .prose_language import ParagraphLanguage
+except ImportError:
+    from findings import finding_row
+    from findings import spanning
+    from german_readability import sentences, words
+    from prose_language import ParagraphLanguage
+
+FAMILY = "english"
+RHYTHM_MIN_SENTENCES = 8
+RHYTHM_VARIATION_LIMIT = 0.4
+UNIFORM_PARAGRAPH_MIN_COUNT = 4
+UNIFORM_PARAGRAPH_SPREAD = 2
+CONNECTOR_OPENERS = ("darüber hinaus", "außerdem", "ferner", "ebenfalls", "zudem", "danach", "anschließend")
+CONNECTOR_DENSITY_CAP = 1
+CONNECTOR_OPEN_RE = re.compile(r"(?:" + "|".join(map(re.escape, CONNECTOR_OPENERS)) + r")\b")
+
+
+def _sentence_word_counts(paragraph: ParagraphLanguage) -> list[int]:
+    counts = (len(words(sentence)) for sentence in sentences(paragraph.text))
+    return [count for count in counts if count]
+
+
+def _gleichfoermiger_rhythmus_rows(path: str, paragraphs: list[ParagraphLanguage]) -> list[dict]:
+    counts = [count for paragraph in paragraphs for count in _sentence_word_counts(paragraph)]
+    if len(counts) < RHYTHM_MIN_SENTENCES:
+        return []
+    from statistics import fmean, pstdev  # pylint: disable=import-outside-toplevel
+    variation = pstdev(counts) / fmean(counts)
+    if variation >= RHYTHM_VARIATION_LIMIT:
+        return []
+    return [spanning(finding_row(
+        FAMILY, "de_uniform_rhythm", paragraphs[0].line,
+        "Sentence lengths stay uniform across the German text in " + path,
+        paragraphs[0].text, "Vary the sentence lengths across the document.",
+    ), paragraphs[-1].end_line)]
+
+
+def _isometrisches_dokument_rows(path: str, paragraphs: list[ParagraphLanguage]) -> list[dict]:
+    if len(paragraphs) < UNIFORM_PARAGRAPH_MIN_COUNT:
+        return []
+    sentence_counts = [len(sentences(paragraph.text)) for paragraph in paragraphs]
+    if max(sentence_counts) - min(sentence_counts) > UNIFORM_PARAGRAPH_SPREAD:
+        return []
+    return [spanning(finding_row(
+        FAMILY, "de_uniform_paragraphs", paragraphs[0].line,
+        "Every German paragraph holds close to the same length in " + path,
+        paragraphs[0].text, "Let some paragraphs run shorter or longer than the rest.",
+    ), paragraphs[-1].end_line)]
+
+
+def _opens_with_connector(sentence: str) -> bool:
+    stripped = sentence.strip().lower()
+    return CONNECTOR_OPEN_RE.match(stripped) is not None
+
+
+def _mechanische_konjunktionen_rows(path: str, paragraph: ParagraphLanguage) -> list[dict]:
+    opener_count = sum(1 for sentence in sentences(paragraph.text) if _opens_with_connector(sentence))
+    if opener_count <= CONNECTOR_DENSITY_CAP:
+        return []
+    return [spanning(finding_row(
+        FAMILY, "de_repeated_connector", paragraph.line,
+        "Paragraph opens more than one sentence on a stock connector in " + path,
+        paragraph.text, "Open at most one sentence in the paragraph with a connector like außerdem.",
+    ), paragraph.end_line)]
+
+
+def scan_german_document(path: str, paragraphs: list[ParagraphLanguage], config: dict) -> list[dict]:
+    del config
+    rows = []
+    for paragraph in paragraphs:
+        rows.extend(_mechanische_konjunktionen_rows(path, paragraph))
+    rows.extend(_gleichfoermiger_rhythmus_rows(path, paragraphs))
+    rows.extend(_isometrisches_dokument_rows(path, paragraphs))
+    return rows

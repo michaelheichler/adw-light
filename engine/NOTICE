@@ -1,0 +1,122 @@
+Agent Discipline Watcher
+Copyright (c) the Agent Discipline Watcher authors. LICENSE holds the MIT terms.
+
+This file lists third-party material that ships in this ADW Lite copy, and the
+sources that its rules derive from. Each entry names the source, its license
+as stated upstream, and the files of this copy that carry it. The MIT license
+in LICENSE covers the rest of this copy. engine/SOURCE.json names the upstream
+revision. The upstream repository ships more files than this copy, such as
+the German rule modules, the exemplar corpora and the evals folder. This copy
+carries none of them, and the entries below say so where it matters.
+
+
+1. humanizer-de 5.28.1
+
+The source is https://github.com/marmbiz/humanizer-de at tag v5.28.1, by
+Martin Moeller. Portions of it derive from blader/humanizer by Siqi Chen.
+
+humanizer-de ships its scripts and original material under MIT. It ships
+references/patterns.md and the matching pattern tables under CC BY-SA 4.0.
+Those tables adapt the Wikipedia project pages "Anzeichen für KI-generierte
+Inhalte" (German) and "Signs of AI writing" (English). The humanizer-de
+NOTICE file states this split.
+
+We wrote all rule descriptions in our own words (decision Q13). These files
+of this copy follow a humanizer-de pattern.
+
+  engine/lib/markup.py, the thematic break checks, Muster 57 cases A to C
+  engine/lib/parataxis.py, the run of bare main clauses, pattern 51
+
+The upstream German rule modules with the borrowed trigger lists
+(german_rules/chatbot.py, format.py, markup.py, phrases.py, rhetoric.py,
+semantic_claims.py and words.py) do not ship here. engine/lib/german_rules
+holds only the rule loader.
+
+
+2. German style books, rules in our own words
+
+The upstream German rules restate points from these books in our own words.
+No sentence from them ships in this copy.
+
+  Monika Salchert, Verständliches Schreiben. Selbstlernheft. Bundesakademie
+  für öffentliche Verwaltung im Bundesministerium des Innern (BAköV),
+  2nd edition, September 2012.
+
+  Andreas Baumert, Professionell texten. dtv Ratgeber, C.H. Beck.
+
+  Stefan Gottschling, Einfach besser texten. GABAL, 2006.
+
+
+3. Duden
+
+The source is Dudenredaktion, Einfach können. Rechtschreibung,
+Zeichensetzung und Grammatik. Cornelsen, 2025. ISBN 978-3-411-75696-4.
+
+engine/lib/german_punctuation.py and engine/lib/catalog_de.py restate German
+typography rules in our own words. These cover the Gedankenstrich, the
+Bis-Strich, the Ergänzungsstrich, German quotation marks, the ellipsis, and
+the genitive apostrophe. No Duden text ships.
+
+
+4. Exemplar sentences and label files
+
+The upstream repository keeps German and English exemplar sentences
+(pattern_exemplars_de.jsonl, pattern_exemplars_de.json and
+pattern_exemplars.jsonl) and rater label files under evals/. They quote
+German and English Wikipedia (CC BY-SA 3.0 and GFDL), Project Gutenberg
+through sedthh/gutenberg_multilang (MIT for the collection), WildChat 4.8M
+(ODC-BY), the lmarena arena-human-preference-100k set (CC BY 4.0 for user
+prompts, provider terms for model outputs), the COLING 2025 GenAI Content
+Detection Task 1 data (Apache-2.0 for the task repository) and local
+Wikipedia, Gutenberg and CNN_DailyMail files. None of these files ship in
+this copy.
+
+
+5. German Wiktionary
+
+The upstream evals/syllable_counter.json measures the syllable counter of
+engine/lib/german_syllables.py against the Worttrennung field of
+https://de.wiktionary.org (CC BY-SA 3.0 and GFDL). That file does not ship
+in this copy, and engine/lib/german_syllables.py stores no Wiktionary text.
+
+
+6. Principle sources
+
+engine/lib/principle_kb.py reads principles.sqlite from the cache folder of
+the plugin data home when the file exists. Upstream builds that file at
+install from DevIQ (https://github.com/NimblePros/deviq-hugo at commit
+2c5341047e6cf62bc0598dd3cdc2f55951cd125a) and programming-principles
+(https://github.com/webpro/programming-principles at commit
+a0c299c981cc31f4d4bd5c265cba80d3e9471429). Neither repository carries a
+license file, see upstream. This copy ships no downloader and no text from
+them.
+
+STE100 detectors
+
+The detectors use ADW masking. Only the rule ideas and the modal-perfect expression come from scripts/ste-lint.py in danyuchn/asd-ste100-skill at commit 7073627.
+
+Upstream license text follows verbatim.
+
+```text
+MIT License
+
+Copyright (c) 2026 Dustin Yuchen Teng
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
