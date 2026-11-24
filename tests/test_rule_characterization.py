@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import re
 import subprocess
@@ -231,6 +232,7 @@ class RuleCharacterization(unittest.TestCase):
         self.addCleanup(workspace.cleanup)
         self.root = Path(workspace.name)
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        disable_background_maintenance(self.root)
 
     def write_outcome(self, path, content):
         payload = {"cwd": str(self.root), "session_id": "rule-characterization", "hook_event_name": "PreToolUse",

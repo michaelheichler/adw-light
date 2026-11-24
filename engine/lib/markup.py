@@ -308,7 +308,7 @@ COMMENTABLE_EXTS = frozenset({
     ".jsx", ".kt", ".kts", ".mjs", ".php", ".rb", ".rs", ".sh", ".swift", ".ts",
     ".tsx", ".vue", ".svelte",
 })
-SCRIPT_EXTS = frozenset({".py", ".pyi", ".bash", ".zsh", ".ksh", ".fish", ".pl", ".pm", ".lua", ".ps1", ".css", ".scss"})
+SCRIPT_EXTS = frozenset({".py", ".pyi", ".bash", ".bats", ".zsh", ".ksh", ".fish", ".pl", ".pm", ".lua", ".ps1", ".css", ".scss"})
 FRONTMATTER_RE = re.compile(r"\A-{3}[ \t]*\n.*?^(?:-{3}|\.{3})[ \t]*$", re.DOTALL | re.MULTILINE)
 
 
@@ -356,6 +356,8 @@ PIPE_RE = re.compile(r"(?<!\\)\|")
 LINK_REFERENCE_RE = re.compile(r"^\s*\[[^]]+\]:\s+\S")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
 SETEXT_RE = re.compile(r"^\s{0,3}(?:={2,}|-{2,})\s*$")
+SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+LIST_ITEM_RE = re.compile(r"^\s*(?:[-+*]|\d{1,9}[.)])(?:\s|$)")
 LABEL_LINE_RE = re.compile(r"^\s*[-+*]\s+(?:\[[ xX]\]\s*)?(?:\*{2}[^*]{1,40}\*{2}|`[^`]{1,40}`)\s*:")
 
 
@@ -411,6 +413,26 @@ def markdown_lines(text: str, policy: FencePolicy = FencePolicy.MARKDOWN) -> tup
         fence, hidden = _fence_step(line, fence, policy)
         result.append(MarkdownLine(number, line, hidden))
     return tuple(result)
+
+
+@lru_cache(maxsize=2)
+def heading_line_numbers(text: str) -> frozenset[int]:
+    lines = markdown_lines(text)
+    numbers = set()
+    for index, line in enumerate(lines):
+        if line.hidden:
+            continue
+        underline = lines[index + 1] if index + 1 < len(lines) else None
+        if HEADING_RE.match(line.content) or (underline is not None and _setext_title(line, underline)):
+            numbers.add(line.number)
+    return frozenset(numbers)
+
+
+def _setext_title(line: MarkdownLine, underline: MarkdownLine) -> bool:
+    content = line.content
+    if underline.hidden or not content.strip() or not SETEXT_UNDERLINE_RE.match(underline.content):
+        return False
+    return not (line.prose_boundary or LIST_ITEM_RE.match(content) or content.startswith(("    ", "\t")))
 
 
 def is_table_separator_row(line: str) -> bool:

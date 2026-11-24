@@ -108,8 +108,13 @@ class WorktreeRewrites(FalsePositiveHome):
     def test_git_reset_hard_passes_where_no_tests_are_tracked(self):
         self.assertEqual(self.bash(self.committed_repo(NO_TESTS), "git reset --hard"), PASSED)
 
-    def test_git_merge_is_refused_where_tests_are_tracked(self):
-        self.assertEqual(self.bash(self.committed_repo(TRACKED_TESTS), "git merge other"), REFUSED)
+    def test_git_merge_of_a_branch_that_changes_a_test_file_is_refused(self):
+        repo = self.commit_on_other(self.committed_repo(TRACKED_TESTS), {OLD_TEST: SIZE_TEST + "\n"})
+        self.assertEqual(self.bash(repo, "git merge other"), REFUSED)
+
+    def test_git_merge_of_a_branch_that_changes_only_a_non_test_file_passes(self):
+        repo = self.commit_on_other(self.committed_repo(TRACKED_TESTS), {"notes.txt": "other needle\n"})
+        self.assertEqual(self.bash(repo, "git merge other"), PASSED)
 
     def test_git_merge_passes_where_no_tests_are_tracked(self):
         self.assertEqual(self.bash(self.committed_repo(NO_TESTS), "git merge other"), PASSED)

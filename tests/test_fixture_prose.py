@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import os
 import subprocess
@@ -30,6 +31,7 @@ class FixtureProseHarness(unittest.TestCase):
         self.home.mkdir()
         self.env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home)}
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True, env=self.env)
+        disable_background_maintenance(self.root, self.env)
         self.hook("SessionStart", source="startup")
 
     def hook(self, event, cwd=None, **payload):

@@ -8,11 +8,12 @@ from typing import NamedTuple
 from lib.archive_members import PATCH, TAR, ZIP, ArchiveRead
 
 STDIN = "-"
-TAR_HAZARDS = ("--transform", "--xform", "--absolute-names", "--to-command", "--use-compress-program")
+TAR_HAZARDS = ("--transform", "--xform", "--absolute-names", "--insecure", "--to-command", "--use-compress-program")
 TAR_HAZARD_LETTERS = frozenset("PsI")
 TAR_VALUE_LETTERS = frozenset("fCbTXgKNVH")
 TAR_LONG_VALUES = {"--file": "f", "--directory": "C", "--strip-components": "strip"}
 UNZIP_VALUE_FLAGS = frozenset({"-P", "-I", "-O", "-d"})
+UNZIP_ESCAPE_LETTERS = frozenset(":^")
 PATCH_OUTPUT_FLAGS = frozenset({"-o", "--output"})
 PATCH_INPUT_FLAGS = frozenset({"-i", "--input"})
 PATCH_DIRECTORY_FLAGS = frozenset({"-d", "--directory"})
@@ -80,7 +81,7 @@ def _tar_selection(words: list[str], fields: dict[str, str], members: list[str])
 
 
 def _canonical(member: str) -> bool:
-    name = member[2:] if member.startswith("./") else member
+    name = member.removeprefix("./")
     segments = name.removesuffix("/").split("/")
     return all(segment not in {"", ".", ".."} for segment in segments)
 
@@ -179,7 +180,8 @@ def unzip_read(words: list[str]) -> ArchiveRead | None:
         position = scan.take(words, position)
     source = _plain(scan.fields.get("archive", ""))
     directory = _plain(scan.fields["-d"]) if "-d" in scan.fields else ""
-    if source is None or directory is None:
+    escapes = any(word.startswith("-") and UNZIP_ESCAPE_LETTERS.intersection(word[1:]) for word in words)
+    if source is None or directory is None or escapes:
         return None
     return ArchiveRead(ZIP, source, directory, 0, tuple(scan.patterns), scan.junk)
 

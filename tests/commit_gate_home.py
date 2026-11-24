@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import os
 import subprocess
@@ -32,6 +33,7 @@ class CommitGateHome(unittest.TestCase):
         self.root.mkdir(parents=True)
         self.trusted_env = trusting_only(self.root.resolve())
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True, env=self.trusted_env)
+        disable_background_maintenance(self.root, self.trusted_env)
 
     def place(self, name, content):
         path = self.root / name

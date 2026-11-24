@@ -10,11 +10,13 @@ try:
     from .language_layer import language_of, layer_for
     from .language_model import COMMENT_KINDS, blanked
     from .markup import MIXED_LANGUAGE_EXTS, RegionKind, extract_regions, render_regions
+    from .temp_mirror import TEMP_ROOTS, literal_prefix, mirrored_temp
 except ImportError:
     from findings import finding_row
     from language_layer import language_of, layer_for
     from language_model import COMMENT_KINDS, blanked
     from markup import MIXED_LANGUAGE_EXTS, RegionKind, extract_regions, render_regions
+    from temp_mirror import TEMP_ROOTS, literal_prefix, mirrored_temp
 
 RULE = "hard_coded_path"
 ACTION = "Build the path from a computed root such as the project root, a temp directory, or the home lookup, and join only repo-relative pieces."
@@ -49,6 +51,11 @@ URL_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 QUOTES = "\"'`"
+SEGMENT_SPLIT_RE = re.compile(r"[/\\]+")
+HOME_REFERENCE_RE = re.compile(r"\$\{?HOME\b|~|%(?:USERPROFILE|HOMEPATH|HOMEDRIVE)%", re.IGNORECASE)
+HOME_ROOTS = frozenset({"Users", "home", "root"})
+ROOT_SEGMENTS = frozenset(root.split("/")[0] for root in MACHINE_ROOTS)
+TOKEN_SEPARATOR_RE = re.compile(r"[:,\s]+")
 
 
 def path_findings(path: str, text: str) -> list[dict]:
@@ -57,12 +64,69 @@ def path_findings(path: str, text: str) -> list[dict]:
     view = code_view(path, text)
     rows = []
     for number, line in enumerate(view.split("\n"), 1):
-        found = machine_path(line)
+        found = _reported_path(path, line)
         if found is not None:
             rows.append(finding_row(
                 "code", RULE, number, "Hard-coded machine path in " + path, line, ACTION, match=found,
             ))
     return rows
+
+
+def _reported_path(path: str, line: str) -> str | None:
+    found = machine_path(line)
+    while found and not escapes_prefix(placeholder_token(line, found)) and mirrored_temp(path, found):
+        line = line.replace(found, " " * len(found))
+        found = machine_path(line)
+    return found
+
+
+def placeholder_token(line: str, token: str) -> str:
+    index = line.find(token)
+    if index < 0:
+        return token
+    pieces: list[str] = []
+    while index < len(line):
+        character = line[index]
+        if character == "{" or line.startswith("${", index):
+            close = _placeholder_end(line, index + (2 if character == "$" else 1))
+            pieces.append("{}")
+            index = close + 1
+        elif character.isspace() or character in QUOTES + "),;":
+            break
+        else:
+            pieces.append(character)
+            index += 1
+    return "".join(pieces)
+
+
+def _placeholder_end(line: str, index: int) -> int:
+    depth = 1
+    while index < len(line):
+        depth += {"{": 1, "}": -1}.get(line[index], 0)
+        if depth == 0:
+            return index
+        index += 1
+    return len(line)
+
+
+def escapes_prefix(token: str) -> bool:
+    first, *others = TOKEN_SEPARATOR_RE.split(token)
+    root = next((item for item in TEMP_ROOTS if first.startswith(item + "/")), None)
+    prefix = literal_prefix(first)
+    if root is None or prefix is None or any(_absolute_part(part) for part in others):
+        return True
+    rest = first[len(root):]
+    if HOME_REFERENCE_RE.search(rest) or DRIVE_RE.search(rest):
+        return True
+    users = {name.lower() for name in machine_users()}
+    segments = [segment for segment in SEGMENT_SPLIT_RE.split(rest) if segment]
+    if any(segment == ".." or segment in HOME_ROOTS or segment.lower() in users for segment in segments):
+        return True
+    return any(segment in ROOT_SEGMENTS for segment in SEGMENT_SPLIT_RE.split(first[len(prefix):]) if segment)
+
+
+def _absolute_part(part: str) -> bool:
+    return part.startswith(("/", "~", "\\")) or bool(HOME_REFERENCE_RE.search(part) or DRIVE_RE.match(part))
 
 
 def is_deploy_path(path: str) -> bool:

@@ -6,8 +6,10 @@ from typing import NamedTuple
 
 from lib.archive_commands import STDIN
 from lib.archive_members import ArchiveRead, landed_paths
+from lib.folder_trees import recursive_operands
 from lib.git_globs import removed_paths, tracked_paths, tree_paths
 from lib.git_writes import aliased, relocated
+from lib.incoming_paths import Incoming, changed_paths, incoming
 from lib.payloads import resolved_path
 from lib.shell_expansion import Expansions, Tree
 from lib.shell_parse import (
@@ -25,7 +27,14 @@ from lib.temp_scope import (
     segment_directories,
 )
 from lib.test_units import language_of
-from lib.tests_policy import is_test_path, outside_project
+from lib.tests_policy import (
+    foreign_scratch_repo,
+    is_test_path,
+    outside_project,
+    project_root,
+    temp_scratch_repo,
+    untracked_scratch,
+)
 from lib.write_targets import (
     GatedTargets,
     GitLookup,
@@ -68,10 +77,10 @@ def gated_paths(command: str, scope: Scope) -> tuple[list[str], list[str]]:
         lookups = scope.outer and all(map(_changes_directory, segments[:position]))
         named = _segment_paths(segment, expansions, gated, folders, scope.cwd)
         looked_up = _lookup_paths(gated._replace(indexable=gated.indexable and lookups), folders, scope.cwd)
-        inside = _tree_tests(expansions.tree(segment))
+        inside = _tree_tests(expansions.tree(segment)) if not _scratch_tree(segment, expansions, folders, scope.cwd) else []
         landed = _archive_paths(gated.archive, folders, scope.cwd)
         paths.extend([*(named or []), *(looked_up or []), *(inside or []), *(landed or [])])
-        rewrites = gated.worktree is not None and _tracks_tests(gated.worktree, folders, scope.cwd)
+        rewrites = gated.worktree is not None and _tracks_tests(gated.worktree, folders, scope.cwd, incoming(segment) if lookups else None)
         if gated.unresolved or rewrites or _unknown_repo(segment, command, gated) or named is None or looked_up is None or inside is None or landed is None:
             unresolved.append(" ".join(segment))
     return list(dict.fromkeys(paths)), unresolved
@@ -98,17 +107,21 @@ def _segment_paths(segment, expansions, gated, folders: Directories, cwd: Path) 
     return paths
 
 
-def _tracks_tests(base: str, folders: Directories, cwd: Path) -> bool:
+def _tracks_tests(base: str, folders: Directories, cwd: Path, coming: Incoming | None) -> bool:
     if folders is None:
         return True
     for folder in folders:
         directory = cwd / folder / base
-        if outside_project(str(directory), str(cwd)):
+        if _scratch_directory(str(directory), cwd) or foreign_scratch_repo(str(directory), project_root(str(cwd))):
             continue
-        listed = tracked_paths(directory)
+        listed = tracked_paths(directory) if coming is None else changed_paths(coming, directory)
         if listed is None or any(map(is_test_path, listed)):
             return True
     return False
+
+
+def _scratch_directory(directory: str, cwd: Path) -> bool:
+    return outside_project(directory, str(cwd)) or temp_scratch_repo(directory, str(cwd))
 
 
 def _archive_paths(read: ArchiveRead | None, folders: Directories, cwd: Path) -> list[str] | None:
@@ -119,12 +132,20 @@ def _archive_paths(read: ArchiveRead | None, folders: Directories, cwd: Path) ->
     found: list[str] = []
     for folder in folders:
         landed = None if read.source == STDIN else landed_paths(read, cwd / folder)
-        if landed is None and outside_project(str(cwd / folder / read.directory), str(cwd)):
+        destination = str(cwd / folder / read.directory)
+        if landed is None and (_scratch_directory(destination, cwd) or untracked_scratch(destination, project_root(str(cwd)))):
             continue
         if landed is None:
             return None
         found.extend(os.path.normpath(os.path.join(folder, path)) for path in landed)
     return found
+
+
+def _scratch_tree(segment: list[str], expansions: Expansions, folders: Directories, cwd: Path) -> bool:
+    paths = [expansions.path(raw) for raw, _follow in recursive_operands(segment)]
+    if not paths or folders is None or any(path is None for path in paths):
+        return False
+    return all(_scratch_directory(str(cwd / folder / str(path)), cwd) for path in paths for folder in folders)
 
 
 def _tree_tests(tree: Tree | None) -> list[str] | None:

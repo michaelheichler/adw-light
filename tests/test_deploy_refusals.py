@@ -32,6 +32,7 @@ class DeployRefusalCase(unittest.TestCase):
         self.marker = self.scratch / "tests-ran"
         for folder in (self.home, self.tmp, self.repo / "tools", self.repo / "tests"):
             folder.mkdir(parents=True)
+        (self.home / ".gitconfig").write_text("[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n", encoding="utf-8")
         shutil.copy2(DEPLOY, self.repo / "tools" / "deploy.sh")
         (self.repo / "tests" / "test_marker.py").write_text(MARKER_TEST, encoding="utf-8")
         self.git(self.repo, "init", "-q", "-b", "main")

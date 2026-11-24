@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import os
 import re
@@ -130,6 +131,7 @@ class SnapshotObserveRule(unittest.TestCase):
         self.home = self.root / "home"
         self.home.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        disable_background_maintenance(self.root)
 
     def configure(self, state):
         (self.root / CONFIG_NAME).write_text(json.dumps({"rule_gates": {RULE: state}}))

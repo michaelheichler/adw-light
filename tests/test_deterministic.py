@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import shlex
 import subprocess
@@ -88,6 +89,7 @@ class DeterministicChecks(unittest.TestCase):
         inherited = "We utilize this tool for the build."
         path.write_text(f"{inherited}\n\nThe build starts.\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        disable_background_maintenance(self.root)
         subprocess.run(["git", "add", path.name], cwd=self.root, check=True)
         subprocess.run([
             "git", "-c", "user.name=ADW Test", "-c", "user.email=adw-test@example.invalid",

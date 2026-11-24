@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import subprocess
 import sys
@@ -88,6 +89,7 @@ class AuthoredContentRegressions(unittest.TestCase):
     def commit_baseline(self, *names):
         identity = ["-c", "user.name=ADW Test", "-c", "user.email=adw-test@example.invalid", "-c", "commit.gpgSign=false"]
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        disable_background_maintenance(self.root)
         subprocess.run(["git", "add", *names], cwd=self.root, check=True)
         subprocess.run(["git", *identity, "commit", "-qm", "Record baseline"], cwd=self.root, check=True)
 

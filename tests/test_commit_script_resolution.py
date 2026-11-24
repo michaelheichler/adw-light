@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import io
 import json
 import os
@@ -39,6 +40,7 @@ class CommitGateHarness(unittest.TestCase):
         self.home.mkdir()
         self.trusted_env = trusting_only(self.root.resolve())
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True, env=self.trusted_env)
+        disable_background_maintenance(self.root, self.trusted_env)
 
     def place(self, name, content):
         path = self.root / name

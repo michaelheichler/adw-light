@@ -12,6 +12,7 @@ try:
     )
     from .markup import mask_quoted
     from .prose_structure import _markdown_prose_lines
+    from .command_words import command_phrase, command_word
 except ImportError:
     from findings import finding_row
     from findings import FindingDict
@@ -21,6 +22,7 @@ except ImportError:
     )
     from markup import mask_quoted
     from prose_structure import _markdown_prose_lines
+    from command_words import command_phrase, command_word
 
 
 class StructureRule(NamedTuple):
@@ -105,10 +107,31 @@ _NOT_PARTICIPLES = (
     "keen", "screen", "between", "citizen", "oxygen", "specimen", "red", "bed", "need", "speed", "seed",
     "feed", "sacred", "wicked", "naked", "rugged", "ragged", "hundred", "kindred",
 )
-_PASSIVE_VOICE_RE = re.compile(
-    r"\b(?:am|is|are|was|were|be|been|being)\s+(?:being\s+)?"
+_PARTICIPLE = (
     r"(?:(?!(?:" + "|".join(_NOT_PARTICIPLES) + r")\b)[a-z]+(?:ed|en)"
-    r"|(?:re|over|under|mis|out)?(?:" + "|".join(_IRREGULAR_PARTICIPLES) + r"))\b"
+    r"|(?:re|over|under|mis|out)?(?:" + "|".join(_IRREGULAR_PARTICIPLES) + r"))"
+)
+_PARTICIPLE_WORD_RE = re.compile(_PARTICIPLE, re.IGNORECASE)
+_BASE_FORM_PARTICIPLE_RE = re.compile(
+    r"(?:re|over|under|mis|out)?(?:bet|bid|broadcast|burst|cast|cost|cut|forecast|hit|hurt|knit|"
+    r"let|lipread|offset|preset|proofread|put|read|run|set|shed|shut|sightread|slit|split|spread|"
+    r"telecast|thrust|typeset|wed)"
+)
+_FLAG = r"(?:--[A-Za-z][A-Za-z-]*|-[A-Za-z]{1,2})(?![\w-])"
+_OPTION_VALUE = r"[^\s,;:!?()]*[^\s,.;:!?()]"
+_PREPOSITIONS = ("for", "in", "on", "to", "with", "during", "before", "after", "at", "from", "into", "under", "over")
+_PREPOSITION_TAIL = r"(?:\s+(?:" + "|".join(_PREPOSITIONS) + r")\b(?:(?!\bby\b)[^,.;:!?)])*)?"
+_BY_LATER_RE = re.compile(r"[^.!?;\n]*?\bby\b", re.IGNORECASE)
+_FLAG_AFTER_RE = re.compile(
+    r"(?:\s+" + _FLAG + r")+(?:[ =]" + _OPTION_VALUE + r")?" + _PREPOSITION_TAIL + r"\s*(?=[,.;:!?)]|$)",
+    re.IGNORECASE,
+)
+_LIST_TAIL_RE = re.compile(r",[^.!?;:\n]*")
+_LIST_SPLIT_RE = re.compile(r"\s*,\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+")
+_BARE_ITEM_RE = re.compile(r"[a-z][a-z-]*(?: [a-z][a-z-]*)?")
+_LIST_FUNCTION_WORDS = frozenset(("then", "now", "also", "not", "too", "again", "later", "so", "but", "yet"))
+_PASSIVE_VOICE_RE = re.compile(
+    r"\b(?:am|is|are|was|were|be|been|being)\s+(?:being\s+)?" + _PARTICIPLE + r"\b"
     r"|\b(?:mistakes|errors|decisions|choices|changes|promises)\s+(?:were|was)\s+made\b"
     r"|\bit\s+is\s+(?:(?:widely|generally|commonly)\s+)?(?:believed|thought|said|assumed)\s+that\b",
     re.IGNORECASE,
@@ -133,6 +156,28 @@ _LAZY_EXTREME_RE = re.compile(
     r"|\b(?:everyone|everybody|nobody)\s+\w+\s+(?:always|never|every)\b",
     re.IGNORECASE,
 )
+
+def _command_list(text: str, found: re.Match[str], word: str) -> bool:
+    tail = _LIST_TAIL_RE.match(text, found.end())
+    if tail is None or not _BASE_FORM_PARTICIPLE_RE.fullmatch(word):
+        return False
+    items = [item for item in _LIST_SPLIT_RE.split(tail.group()) if item]
+    if len(items) < 2 or not all(_BARE_ITEM_RE.fullmatch(item) for item in items):
+        return False
+    if any(item.split()[0] in _LIST_FUNCTION_WORDS for item in items):
+        return False
+    if not all(command_phrase(item) for item in items):
+        return False
+    return any(not _PARTICIPLE_WORD_RE.fullmatch(item.split()[-1]) for item in items)
+
+
+def _command_name_use(text: str, found: re.Match[str]) -> bool:
+    word = found.group().split()[-1]
+    if not _PARTICIPLE_WORD_RE.fullmatch(word) or not command_word(word.lower()):
+        return False
+    flagged = bool(_FLAG_AFTER_RE.match(text, found.end())) and not _BY_LATER_RE.match(text, found.end())
+    return flagged or _command_list(text, found, word)
+
 
 STRUCTURE_CANDIDATES = (
     StructureRule(
@@ -167,6 +212,7 @@ STRUCTURE_CANDIDATES = (
         _PASSIVE_VOICE_RE,
         "Passive voice hides the actor",
         "Name the actor and use an active verb.",
+        _command_name_use,
     ),
     StructureRule(
         "rhetorical_setup",

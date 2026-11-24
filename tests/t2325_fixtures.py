@@ -29,7 +29,7 @@ class Scratch:
         self.git_config = self.root / "gitconfig"
         for folder in (self.home, self.tmp, self.config_dir, self.codex_home):
             folder.mkdir()
-        self.git_config.write_text("", encoding="utf-8")
+        self.git_config.write_text("[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n", encoding="utf-8")
 
     def env(self, **extra):
         kept = {key: value for key, value in os.environ.items() if not key.startswith(SCRUBBED_PREFIXES)}

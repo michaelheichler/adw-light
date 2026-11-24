@@ -8,7 +8,7 @@ from pathlib import PurePath
 from typing import NamedTuple, cast
 
 try:
-    from . import doc_conventions, scan_input
+    from . import doc_conventions, program_output, scan_input
     from .comment_rules import (
         COMMENT_RE,
         DEFERRED_TAG_RE,
@@ -19,18 +19,20 @@ try:
         scan_comment_contract,
         shape_passed_removed,
     )
-    from . import families, german_punctuation, german_rules, test_rules
+    from . import families, german_punctuation, german_rules, shell_units, test_rules
     from .german_document_rules import scan_german_document
     from .prose_language import ENGLISH, GERMAN, ParagraphLanguage, allowed_languages, paragraph_languages
     from .config import calibrated_findings, effective_config, family_enabled
     from .findings import finding_row, spanning
     from .markup import (
         CONFIG_EXTS,
+        MARKDOWN_EXTS,
         MIXED_LANGUAGE_EXTS,
         PROSE_EXTS,
         TEMPLATE_EXPRESSION_RE,
         CommentSource,
         FencePolicy,
+        heading_line_numbers,
         markdown_lines,
         mask_quoted,
         is_table_separator_row as _is_table_separator_row,
@@ -55,7 +57,7 @@ try:
     from .slop_structure import scan_slop_structure
     from .ste_rules import scan_ste
 except ImportError:
-    import doc_conventions, scan_input
+    import doc_conventions, program_output, scan_input
     from comment_rules import (
         COMMENT_RE,
         DEFERRED_TAG_RE,
@@ -69,6 +71,7 @@ except ImportError:
     import families
     import german_punctuation
     import german_rules
+    import shell_units
     import test_rules
     from german_document_rules import scan_german_document
     from prose_language import ENGLISH, GERMAN, ParagraphLanguage, allowed_languages, paragraph_languages
@@ -76,11 +79,13 @@ except ImportError:
     from findings import finding_row, spanning
     from markup import (
         CONFIG_EXTS,
+        MARKDOWN_EXTS,
         MIXED_LANGUAGE_EXTS,
         PROSE_EXTS,
         TEMPLATE_EXPRESSION_RE,
         CommentSource,
         FencePolicy,
+        heading_line_numbers,
         markdown_lines,
         mask_quoted,
         is_table_separator_row as _is_table_separator_row,
@@ -313,7 +318,8 @@ def _scan_line_families(source_line: _SourceLine, sources: _LineSources, context
         number = source_line.number
         scan_line = _PunctuationLine(_line_or_blank(sources.punctuation, number), _line_or_blank(sources.prose_dash, number))
         language = _line_or_blank(sources.languages, number) or ENGLISH
-        findings.extend(_scan_punctuation(source_line, scan_line, context.prose, language))
+        heading = _markdown_heading(context, number)
+        findings.extend(_scan_punctuation(source_line, scan_line, context.prose, language, heading))
     german = _line_or_blank(sources.languages, source_line.number) == GERMAN
     if "english" in context.active_families and context.prose and not german:
         scan_line = _line_or_blank(sources.english, source_line.number)
@@ -321,6 +327,12 @@ def _scan_line_families(source_line: _SourceLine, sources: _LineSources, context
     if context.code_file:
         findings.extend(_scan_code_line(source_line, sources.comment, context.active_families))
     return findings
+
+
+def _markdown_heading(context: _ScanContext, number: int) -> bool:
+    if PurePath(context.path.lower()).suffix not in MARKDOWN_EXTS:
+        return False
+    return number in heading_line_numbers(context.text)
 
 
 def _scan_code_line(source_line: _SourceLine, comment_lines: list[str], active: frozenset[str]) -> list[dict]:
@@ -372,6 +384,8 @@ def scan_all(
 ) -> list[dict]:
     if scan_input.is_binary_content(path, text):
         return []
+    if program_output.exempt_tap(path, text):
+        return program_output.tap_findings(path, text, lambda unit, body: scan_all(unit, body, config))
     context = _scan_context(path, text, config)
     regions = extract_regions(path, text)
     source = CommentSource(path, text, regions, PurePath(path.lower()).suffix in MIXED_LANGUAGE_EXTS)
@@ -380,7 +394,7 @@ def scan_all(
     for view in views[1:]:
         findings = merged_findings(findings, _view_findings(context, source, view, hidden_ranges))
     if context.code_file and "code" in context.active_families and not _is_exempt(path, context.config):
-        findings.extend(path_findings(path, text))
+        findings.extend([] if program_output.exempt_output(path, text) else path_findings(path, text))
     return findings
 
 
@@ -431,9 +445,9 @@ def _is_config(path: str) -> bool:
 
 
 def _code_file(path: str, text: str) -> bool:
+    suffix = PurePath(path.lower()).suffix
     if scan_input.is_binary_content(path, text):
         return False
-    suffix = PurePath(path.lower()).suffix
     return (not _is_prose(path, text) and not _is_config(path)) or suffix in MIXED_LANGUAGE_EXTS
 
 
@@ -486,9 +500,13 @@ def _punctuation_texts(path: str, views: _PunctuationLine, prose: bool) -> dict[
     return {"clean": views.whole, "prose": prose_part, "semicolon": semicolon, "colon": semicolon}
 
 
-def _scan_punctuation(source_line: _SourceLine, scan_line: _PunctuationLine, prose: bool, language: str = ENGLISH) -> list[dict]:
+def _scan_punctuation(
+    source_line: _SourceLine, scan_line: _PunctuationLine, prose: bool, language: str = ENGLISH, heading: bool = False,
+) -> list[dict]:
     rules = GERMAN_PUNCTUATION_RULES if language == GERMAN else PUNCTUATION_RULES
     texts = _punctuation_texts(source_line.path, _punctuation_views(source_line.path, scan_line, language), prose)
+    if heading:
+        texts["colon"] = ""
     rows = []
     for target, regexes, rule, detail, action in rules:
         found = _first_match(regexes, texts[target])
@@ -562,7 +580,9 @@ def _long_function_rows(context: _ScanContext) -> list[tuple[int, str, int]]:
     if scan is None:
         return lexer
     rows = long_rows(scan, func_limit)
-    return merged_rows(rows, lexer) if scan.partial else rows
+    if not scan.partial:
+        return merged_rows(rows, shell_units.bats_test_rows(context.path, context.text, func_limit))
+    return merged_rows(shell_units.closed_rows(context.path, context.text, rows, func_limit, scan.errors), lexer)
 
 
 def _function_length_findings(context: _ScanContext) -> list[dict]:

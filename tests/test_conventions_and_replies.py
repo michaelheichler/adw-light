@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import re
 import shutil
@@ -51,6 +52,7 @@ class EngineHarness(unittest.TestCase):
         self.root = Path(workspace.name)
         self.state = self.root / ".adw-state"
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        disable_background_maintenance(self.root)
 
     def hook(self, event, **payload):
         call = subprocess.run(

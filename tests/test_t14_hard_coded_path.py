@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import os
 import subprocess
@@ -47,6 +48,7 @@ class HardCodedPathGate(unittest.TestCase):
         self.home.mkdir()
         self.repo.mkdir()
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        disable_background_maintenance(str(self.repo))
 
     def run_hook(self, tool_name, tool_input, extra_env):
         payload = {

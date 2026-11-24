@@ -41,7 +41,7 @@ BLOCK_COMMENT_RE = re.compile(r"/\*.*?(?:\*/|\Z)|<!--.*?(?:-->|\Z)", re.DOTALL)
 BLOCK_COMMENT_TAIL_RE = re.compile(
     r"(?P<block>/\*.*?(?:\*/|\Z)|<!--.*?(?:-->|\Z))(?P<tail>[^\n]*)", re.DOTALL,
 )
-SHELL_GLOB_COLLISION_EXTS = frozenset({".sh", ".bash", ".zsh", ".ksh"})
+SHELL_GLOB_COLLISION_EXTS = frozenset({".sh", ".bash", ".zsh", ".ksh", ".bats"})
 COMMENTED_CODE_RE = re.compile(r"^\s*(?://|#|/\*)\s*(def |class |if |for |while |return |import |from |const |let |var |(?!(?:" + _MARKER_TAGS + r")\()\w+\()", re.IGNORECASE)
 HEADER_COMMENT_RE = re.compile(r"^(spdx-license-identifier:|spdx-filecopyrighttext:|copyright\b|coding[:=]|-\*- coding:)", re.IGNORECASE)
 LETTER_RE = re.compile(r"[^\W\d_]")

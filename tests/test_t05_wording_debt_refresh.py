@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import os
 import subprocess
@@ -41,6 +42,7 @@ class DebtHome(unittest.TestCase):
         self.home.mkdir()
         (self.repo / "tests").mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        disable_background_maintenance(str(self.repo))
 
     def place(self, relative, content):
         (self.repo / relative).write_text(content, encoding="utf-8")

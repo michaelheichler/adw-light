@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import os
 import subprocess
@@ -58,6 +59,7 @@ class LayerHome:
         self.repo.mkdir()
         self.home.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        disable_background_maintenance(self.repo)
         if exact:
             self.link_language_layer()
 

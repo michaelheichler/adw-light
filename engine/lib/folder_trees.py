@@ -40,7 +40,7 @@ class _Walk(NamedTuple):
     deadline: float
     pending: list[str]
     files: list[str]
-    count: list[int]
+    seen: list[int]
 
 
 def folder_trees(segments: list[list[str]], expansions: Expansions, cwd: str) -> tuple[Tree, ...]:
@@ -107,7 +107,7 @@ def _operand(operand: tuple[str, bool], folders: Directories, scope: _Scope) -> 
         return Tree((), (), (), (f"{raw} (folder too large to check)",))
     files = [path for found in walked if found is not None for path in found]
     named = [root for root in _protected_roots(scope.cwd) for place in located if _holds(place, root, follow)]
-    return Tree((), tuple(named + [path for path in files if _protected_name(path)]), tuple(files), ())
+    return Tree((), tuple(named + [path for path in files if _protected_name(path) and not os.path.islink(path)]), tuple(files), ())
 
 
 def _walked(root: str, follow: bool) -> list[str] | None:
@@ -131,8 +131,8 @@ def _scan(walk: _Walk, folder: str) -> bool:
             children = list(entries)
     except OSError:
         return False
-    walk.count[0] += len(children)
-    if walk.count[0] > MAX_ENTRIES or time.monotonic() > walk.deadline:
+    walk.seen[0] += len(children)
+    if walk.seen[0] > MAX_ENTRIES or time.monotonic() > walk.deadline:
         return False
     walk.pending.extend(child.path for child in children if child.is_dir(follow_symlinks=False))
     walk.files.extend(child.path for child in children if not child.is_dir(follow_symlinks=False))

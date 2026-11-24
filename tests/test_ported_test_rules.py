@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import os
 import subprocess
@@ -131,6 +132,7 @@ class PortedTestRules(unittest.TestCase):
         self.home = self.root / "home"
         self.home.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        disable_background_maintenance(self.root)
 
     def write_outcome(self, path, content):
         payload = {"cwd": str(self.root), "session_id": "ported-test-rules", "hook_event_name": "PreToolUse",

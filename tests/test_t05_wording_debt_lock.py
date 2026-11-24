@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import os
 import subprocess
@@ -67,6 +68,7 @@ class WordingDebtLock(unittest.TestCase):
         repo = self.root / name
         (repo / "tests").mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        disable_background_maintenance(str(repo))
         (repo / OLD_TEST).write_text(old_test, encoding="utf-8")
         return repo
 

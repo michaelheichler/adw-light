@@ -160,8 +160,13 @@ class CommitsInsideConstructs(CommitGateHome):
 
         self.assertEqual(SCANNED, self.message_finding(response))
 
-    def test_commit_in_a_case_branch_is_scanned(self):
-        response = self.gate('case x in y) git commit -m "We utilize this." ;; esac')
+    def test_commit_in_a_case_arm_that_matches_its_word_is_scanned(self):
+        response = self.gate('case x in x) git commit -m "We utilize this." ;; esac')
+
+        self.assertEqual(SCANNED, self.message_finding(response))
+
+    def test_commit_in_a_case_on_an_unset_variable_is_scanned(self):
+        response = self.gate('case "$v" in y) git commit -m "We utilize this." ;; esac')
 
         self.assertEqual(SCANNED, self.message_finding(response))
 

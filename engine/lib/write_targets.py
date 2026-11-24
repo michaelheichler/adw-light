@@ -67,6 +67,9 @@ GIT_DRY_APPLY_FLAGS =frozenset({"--check", "--stat", "--numstat", "--summary"})
 UNZIP_READ_FLAGS = frozenset({"-l", "-t", "-p", "-v", "-Z", "-z"})
 UNZIP_READ_LETTERS = frozenset("ltpvZz")
 TAR_EXTRACT_FLAGS = frozenset({"--extract", "--get"})
+TAR_VERBS = frozenset({"tar", "bsdtar", "gtar"})
+ARCHIVE_VERBS = TAR_VERBS | {"unzip"}
+PAX_VERB = "pax"
 TAR_STDOUT_FLAG = "--to-stdout"
 TAR_COMMAND_FLAG = "--to-command"
 RESTORE_STAGED = frozenset({"--staged", "-S"})
@@ -347,8 +350,10 @@ def gated_test_targets(segment: list[str], expansions: Expansions) -> GatedTarge
     verb = _basename(segment[index]) if index < len(segment) else ""
     if verb in COPY_VERBS or verb == "git":
         return _copy_or_git(segment, index, expansions)
-    if verb in {"tar", "unzip"}:
+    if verb in ARCHIVE_VERBS:
         return _archive_targets(verb, segment[index + 1:])
+    if verb == PAX_VERB:
+        return UNRESOLVED if _pax_reads(segment[index + 1:]) else NO_TARGETS
     return _patch_targets(segment[index + 1:]) if verb == "patch" else NO_TARGETS
 
 
@@ -508,11 +513,15 @@ def _is_directory_pathspec(path: str) -> bool:
 
 def _archive_targets(verb: str, raw: list[str]) -> GatedTargets:
     words = [_bare(home_expanded(token)) for token in _without_redirects(raw)]
-    if verb == "tar":
+    if verb in TAR_VERBS:
         if not _tar_extracts(words) or _tar_to_stdout(words):
             return NO_TARGETS
         return _read_targets(tar_read(words, stdin_source(raw) or STDIN))
     return NO_TARGETS if _unzip_reads(words) else _read_targets(unzip_read(words))
+
+
+def _pax_reads(raw: list[str]) -> bool:
+    return any(word.startswith("-") and not word.startswith("--") and "r" in word[1:] for word in map(_bare, raw))
 
 
 def _unzip_reads(words: list[str]) -> bool:

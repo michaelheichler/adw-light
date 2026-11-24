@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import os
 import shutil
 import subprocess
@@ -157,6 +158,7 @@ class HiddenReferrersAtTheWriteGate(EdgeHarness):
     def test_referrer_inside_a_nested_repository_does_not_count(self):
         self.place("sub/tests/test_loader.py", referring_test("sample.md"))
         self.git("init", "-q", cwd=self.root / "sub")
+        disable_background_maintenance(self.root / "sub", self.env)
 
         self.assert_flagged_on_write()
 
@@ -196,6 +198,7 @@ class HiddenReferrersInAPlainFolder(PlainFolderHarness):
     def test_referrer_inside_a_nested_repository_does_not_count(self):
         self.place("sub/tests/test_loader.py", referring_test("sample.md"))
         self.git("init", "-q", cwd=self.root / "sub")
+        disable_background_maintenance(self.root / "sub", self.env)
 
         self.assert_flagged_on_write()
 

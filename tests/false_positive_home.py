@@ -1,3 +1,4 @@
+from quiet_git import disable_background_maintenance
 import json
 import os
 import subprocess
@@ -34,6 +35,7 @@ class FalsePositiveHome(unittest.TestCase):
         repo = self.root / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        disable_background_maintenance(str(repo))
         self.place(repo, files)
         subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(repo), *IDENTITY, "commit", "-qm", "base"], check=True)
@@ -46,6 +48,15 @@ class FalsePositiveHome(unittest.TestCase):
             path = folder / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
+
+    def commit_on_other(self, repo, files):
+        git = ["git", "-C", str(repo)]
+        subprocess.run([*git, "checkout", "-q", "other"], check=True)
+        self.place(repo, files)
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, *IDENTITY, "commit", "-qm", "other"], check=True)
+        subprocess.run([*git, "checkout", "-q", "-"], check=True)
+        return repo
 
     def reports(self):
         return {report: json.loads(report.read_text(encoding="utf-8")) for report in (self.state / "reports").glob("*.json")}

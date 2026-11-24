@@ -56,6 +56,10 @@ QA round 1 on 2026-11-24 confirmed these gaps with real shell runs. They also ex
 - A quoted heredoc delimiter such as `<<E'X'` confuses the reader.
 - An exported `CDPATH` that starts with `.` makes `cd` print the folder, so a script-folder idiom without `CDPATH=''` can point elsewhere.
 
+## Changes in 0.1.1
+
+The gate walks every `case` arm. This release dropped a trial that walked only the arm a literal word selected. QA found more than a dozen ways to change the selected arm at run time.
+
 ## Changes on 2026-11-24
 
 Meridian helper scripts that never run git commit hit these false positives, and this release fixes them.

@@ -45,6 +45,7 @@ class UnitScan(NamedTuple):
     partial: bool
     functions: tuple[UnitRow, ...]
     hollow: tuple[UnitRow, ...]
+    errors: tuple[tuple[int, int], ...] = ()
 
 
 @lru_cache(maxsize=4)
@@ -62,11 +63,15 @@ def unit_scan(path: str, text: str) -> UnitScan | None:
     hollow = tuple(
         row for unit, row in rows.items() if unit.test in marks and not _asserts(unit, text, code, language)
     )
-    return UnitScan(bool(layer.errors), tuple(rows.values()), hollow)
+    errors = tuple(
+        (bisect.bisect_left(newlines, node.start) + 1, bisect.bisect_left(newlines, max(node.end - 1, node.start)) + 1)
+        for node in layer.errors
+    )
+    return UnitScan(bool(layer.errors), tuple(rows.values()), hollow, errors)
 
 
 def long_rows(scan: UnitScan, limit: int) -> list[tuple[int, str, int]]:
-    return [tuple(row) for row in scan.functions if row.end - row.line + 1 > limit]
+    return [(row.line, row.name, row.end) for row in scan.functions if row.end - row.line + 1 > limit]
 
 
 def merged_rows(primary: list[tuple[int, str, int]], extra: list[tuple[int, str, int]]) -> list[tuple[int, str, int]]:
