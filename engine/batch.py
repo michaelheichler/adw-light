@@ -1,0 +1,512 @@
+
+from __future__ import annotations
+
+import os
+import time
+from hashlib import sha256
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import cast
+
+from lib import blocker_state, payloads, reporting, path_policy, temp_authorship
+from lib.canonical import (
+    _INVALID,
+    Canonical,
+    _canonical_value,
+    _is_exact_type,
+    _validated_mapping,
+)
+from lib.config import effective_config, payload_hook_config, resolve_outcome
+from lib.findings import Finding
+from lib.hookio import advise, config_failure, read_payload, write_payload
+from lib.reporting import run_with_ledger
+from lib.baseline import strip_committed
+from lib.scanner import read_scannable, scan_all
+from lib.temp_scope import outside_project_temp
+
+BATCH_EVENT = "PostToolBatch"
+UNDECIDABLE_KEY = blocker_state.BATCH_ERROR_KEY
+DEGRADED_RULE = "degraded_cross_file_only"
+MIN_DUPLICATE_NONSPACE = 200
+WRITE_TOOL_NAMES = payloads.WRITE_TOOL_NAMES
+
+
+StatFingerprint = tuple[int, int, int, int, int]
+
+NormalizedSignature = tuple[str, str, Canonical | None, tuple[str, ...]]
+NormalizedCall = tuple[str, str, Canonical | None, tuple[str, ...], tuple[str, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalizedCall:
+    signature: NormalizedSignature
+    raw_paths: tuple[str, ...]
+    valid: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalizedCalls:
+    calls: list[NormalizedCall]
+    all_valid: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchTurnContext:
+    session_id: str
+    turn_id: str
+    config: dict
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchVerdict:
+    entries: list[tuple[str, str, Path]]
+    kind: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PathBatchScan:
+    cwd: str
+    paths: list[str]
+    config: dict
+    source: str
+
+
+def _selected_tool_input(call: dict) -> object:
+    selected: object = _INVALID
+    for key in ("tool_input", "toolInput", "input"):
+        if key not in call:
+            continue
+        value = call[key]
+        if not _is_exact_type(value, dict):
+            return value
+        selected = value
+        if value:
+            return value
+    return selected
+
+
+def _is_write_tool(tool_name: str) -> bool:
+    return tool_name.lower() in WRITE_TOOL_NAMES
+
+
+def _normalized_path(raw_path: str, cwd: Path) -> str:
+    try:
+        return str(path_policy.anchored_identity(raw_path, cwd))
+    except (OSError, RuntimeError, ValueError):
+        return raw_path
+
+
+def _authored(session_id: str, cfg: dict) -> frozenset[str] | None:
+    return temp_authorship.authored_temp(session_id, cfg.get("state_root")) if session_id else None
+
+
+def _normalized_calls(payload: dict, authored: frozenset[str] | None) -> _NormalizedCalls:
+    cwd = Path(payloads.cwd(payload) or ".")
+    calls: list[NormalizedCall] = []
+    seen: set[NormalizedSignature] = set()
+    raw_calls = _exact_calls(payload)
+    if raw_calls is None:
+        return _NormalizedCalls(calls, False)
+    all_valid = True
+    for call in raw_calls:
+        name = call.get("tool_name")
+        if _is_exact_type(name, str) and name and not _is_write_tool(name):
+            continue
+        normalized = _normalized_call(call, cwd, authored)
+        all_valid = all_valid and normalized.valid
+        if normalized.signature not in seen:
+            seen.add(normalized.signature)
+            calls.append((*normalized.signature, normalized.raw_paths))
+    return _NormalizedCalls(calls, all_valid)
+
+
+def _normalized_call(call: dict, cwd: Path, authored: frozenset[str] | None) -> _NormalizedCall:
+    raw_call_id = call.get("tool_use_id", "")
+    raw_tool_name = call.get("tool_name", "")
+    tool_input = _selected_tool_input(call)
+    call_id = raw_call_id if _is_exact_type(raw_call_id, str) else ""
+    tool_name = raw_tool_name if _is_exact_type(raw_tool_name, str) else ""
+    canonical_value = (
+        _canonical_value(tool_input) if _is_exact_type(tool_input, dict) else _INVALID
+    )
+    valid = (
+        _is_exact_type(raw_call_id, str)
+        and _is_exact_type(raw_tool_name, str)
+        and canonical_value is not _INVALID
+    )
+    canonical = cast(Canonical, canonical_value) if valid else None
+    writes = valid and _is_write_tool(tool_name)
+    raw_paths = payloads.edited_paths({**call, "cwd": str(cwd)}, authored) if writes else ()
+    signature = (
+        call_id,
+        tool_name,
+        canonical,
+        tuple(_normalized_path(path, cwd) for path in raw_paths),
+    )
+    return _NormalizedCall(signature, raw_paths, valid)
+
+
+def _entries_from_calls(
+    calls: list[NormalizedCall], cwd: Path
+) -> list[tuple[str, str, Path]]:
+    return [
+        (call_id, raw_path, payloads.resolved_path(raw_path, cwd))
+        for call_id, _tool_name, _tool_input, _normalized, raw_paths in calls
+        for raw_path in raw_paths
+    ]
+
+
+def _complete_unique_ids(
+    normalized: _NormalizedCalls, turn: _BatchTurnContext
+) -> bool:
+    ids = [
+        call_id
+        for call_id, _tool_name, _tool_input, _normalized, _raw_paths in normalized.calls
+    ]
+    return bool(
+        normalized.all_valid
+        and turn.session_id
+        and normalized.calls
+        and all(ids)
+        and len(ids) == len(set(ids))
+    )
+
+
+def _has_write_call(payload: dict) -> bool:
+    return any(_is_write_tool(payloads.tool_name(call)) for call in payloads.tool_calls(payload))
+
+
+def _exact_calls(payload: dict) -> list[dict] | None:
+    raw_calls = payload.get("tool_calls")
+    if not _is_exact_type(raw_calls, list):
+        return None
+    calls = []
+    for call in raw_calls:
+        validated = _validated_mapping(call)
+        if validated is None:
+            return None
+        calls.append(validated)
+    return calls
+
+
+def _is_reported_edit_row(row: dict, live_ids: set[str]) -> bool:
+    return (
+        row.get("hook") == "record"
+        and row.get("event") == "edit"
+        and isinstance(row.get("tool_use_id"), str)
+        and row.get("tool_use_id") in live_ids
+        and isinstance(row.get("path"), str)
+        and bool(row.get("path"))
+    )
+
+
+def _reported_entries(
+    normalized: _NormalizedCalls, turn: _BatchTurnContext
+) -> set[tuple[str, str]]:
+    live_ids = {
+        call_id
+        for call_id, _tool_name, _tool_input, _normalized, _raw_paths in normalized.calls
+    }
+    reported: set[tuple[str, str]] = set()
+    rows = reporting.read_session_turn(
+        turn.session_id,
+        turn.turn_id,
+        turn.config.get("ledger_root"),
+    )
+    for row in reversed(rows):
+        if row.get("session_id") != turn.session_id:
+            continue
+        if row.get("turn_id") != turn.turn_id:
+            break
+        if _is_reported_edit_row(row, live_ids):
+            reported.add((row["tool_use_id"], row["path"]))
+    return reported
+
+
+def _duplicate_groups(entries: list[tuple[str, str, Path]], cfg: dict) -> list[tuple[list[str], str]]:
+    contents: dict[str, dict[tuple[int, int], str]] = {}
+    for _call_id, _raw_path, path in sorted(entries, key=lambda item: str(item[2])):
+        read = _stable_read(path, cfg)
+        if read is None:
+            continue
+        file_id, text = read
+        contents.setdefault(text, {}).setdefault(file_id, str(path))
+    return sorted((sorted(group.values()), text) for text, group in contents.items() if len(group) > 1)
+
+
+def _duplicate_file_findings(entries: list[tuple[str, str, Path]], cfg: dict) -> list[dict]:
+    return [_duplicate_row(paths) for paths, _text in _duplicate_groups(entries, cfg)]
+
+
+def _stable_read(path: Path, cfg: dict) -> tuple[tuple[int, int], str] | None:
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        fingerprint = _stat_fingerprint(path.stat())
+    except (OSError, ValueError):
+        return None
+    text = _read_path(path, cfg)
+    try:
+        if _stat_fingerprint(path.stat()) != fingerprint:
+            return None
+    except OSError:
+        return None
+    if text is None or len("".join(text.split())) < MIN_DUPLICATE_NONSPACE:
+        return None
+    return fingerprint[:2], text
+
+
+def _duplicate_row(paths: list[str]) -> dict:
+    joined = ", ".join(paths)
+    return Finding(
+        family="code",
+        rule="duplicate_file_content",
+        line=1,
+        detail="Exact substantive content is duplicated across batch files.",
+        force=None,
+        snippet=joined[:180],
+        action="Keep one implementation and remove or extract the duplicate.",
+        path=joined,
+        severity=None,
+        tool_use_id="",
+    ).to_dict()
+
+
+def _stat_fingerprint(file_stat: os.stat_result) -> StatFingerprint:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _project_entries(entries: list[tuple[str, str, Path]], cwd: Path) -> list[tuple[str, str, Path]]:
+    return [entry for entry in entries if not outside_project_temp(entry[2], cwd)]
+
+
+def _scan_path(path: Path, cfg: dict) -> list[dict]:
+    text = _read_path(path, cfg)
+    if text is None:
+        return []
+    digest = sha256(text.encode("utf-8")).hexdigest()
+    findings = strip_committed(path, scan_all(str(path), text, cfg), cfg, text)
+    return [
+        Finding.from_dict(finding).with_path(str(path)).with_content_hash(digest).to_dict()
+        for finding in findings
+    ]
+
+
+def _read_path(path: Path, cfg: dict) -> str | None:
+    try:
+        return read_scannable(path, cfg)
+    except (OSError, ValueError):
+        return None
+
+
+def _sanitized_payload(payload: object) -> dict:
+    validated = _validated_mapping(payload)
+    if validated is None:
+        return {}
+    source = dict.copy(validated)
+    raw_session_id = source.get("session_id")
+    raw_cwd = source.get("cwd")
+    raw_agent_id = source.get("agent_id")
+    raw_calls = source.get("tool_calls", _INVALID)
+    sanitized: dict[str, object] = {
+        "session_id": raw_session_id if _is_exact_type(raw_session_id, str) else "",
+        "cwd": raw_cwd if _is_exact_type(raw_cwd, str) else "",
+    }
+    if _is_exact_type(raw_agent_id, str) and raw_agent_id:
+        sanitized["agent_id"] = raw_agent_id
+    if raw_calls is not _INVALID:
+        sanitized["tool_calls"] = (
+            list.copy(raw_calls) if _is_exact_type(raw_calls, list) else raw_calls
+        )
+    return sanitized
+
+
+def _findings_for_calls(
+    normalized: _NormalizedCalls,
+    entries: list[tuple[str, str, Path]],
+    turn: _BatchTurnContext,
+) -> list[dict]:
+    findings = _duplicate_file_findings(entries, turn.config)
+    if not _complete_unique_ids(normalized, turn):
+        return findings
+    reported = _reported_entries(normalized, turn) if turn.turn_id else set()
+    ordered = sorted(entries, key=lambda item: (str(item[2]), item[0]))
+    for call_id, raw_path, path in ordered:
+        if (call_id, raw_path) in reported:
+            continue
+        for finding in _scan_path(path, turn.config):
+            findings.append(Finding.from_dict(finding).with_tool_use_id(call_id).to_dict())
+    return findings
+
+
+def findings_for_batch(payload: dict, config: dict | None = None, turn_id: str = "") -> list[dict]:
+    payload = _sanitized_payload(payload)
+    cfg = effective_config(config, payloads.cwd(payload) or None)
+    cwd = Path(payloads.cwd(payload) or ".")
+    normalized = _normalized_calls(payload, _authored(payloads.session_id(payload), cfg))
+    entries = _project_entries(_entries_from_calls(normalized.calls, cwd), cwd)
+    turn = _BatchTurnContext(payloads.session_id(payload), turn_id, cfg)
+    return _findings_for_calls(normalized, entries, turn)
+
+
+def _path_batch_scan(
+    value: PathBatchScan | str, arguments: tuple[object, ...]
+) -> PathBatchScan:
+    if isinstance(value, PathBatchScan):
+        if arguments:
+            raise TypeError("PathBatchScan cannot be combined with positional scan fields")
+        return value
+    if len(arguments) != 4:
+        raise TypeError("findings_for_paths requires cwd, paths, config, and source")
+    cwd, paths, config, source = arguments
+    if not isinstance(cwd, str) or not isinstance(source, str):
+        raise TypeError("cwd and source must be strings")
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise TypeError("paths must be a list of strings")
+    if not isinstance(config, dict):
+        raise TypeError("config must be a dictionary")
+    return PathBatchScan(cwd, paths, config, source)
+
+
+def findings_for_paths(scan: PathBatchScan | str, *arguments: object) -> list[dict]:
+    return _findings_for_path_scan(_path_batch_scan(scan, arguments))
+
+
+def _findings_for_path_scan(scan: PathBatchScan) -> list[dict]:
+    base = Path(scan.cwd or ".")
+    entries = _project_entries([
+        (scan.source, raw_path, payloads.resolved_path(raw_path, base))
+        for raw_path in scan.paths
+    ], base)
+    findings = _duplicate_file_findings(entries, scan.config)
+    for call_id, _raw_path, path in entries:
+        for finding in _scan_path(path, scan.config):
+            findings.append(
+                Finding.from_dict(finding).with_tool_use_id(call_id).to_dict()
+            )
+    return findings
+
+
+def duplicate_findings_for_paths(cwd: str, paths: list[str], cfg: dict) -> list[dict]:
+    base = Path(cwd or ".")
+    entries = [("<end-turn>", raw_path, payloads.resolved_path(raw_path, base)) for raw_path in paths]
+    return [
+        {**_duplicate_row(group), "content_hash": sha256(text.encode("utf-8")).hexdigest()}
+        for group, text in _duplicate_groups(_project_entries(entries, base), cfg)
+    ]
+
+
+def _record_batch_row(
+    turn: _BatchTurnContext, duration_ms: int, **fields: object
+) -> None:
+    reporting.record_decision(
+        session_id=turn.session_id, hook="batch", event=BATCH_EVENT,
+        duration_ms=duration_ms, turn_id=turn.turn_id,
+        root=turn.config.get("ledger_root"),
+        **fields,
+    )
+
+
+def _record_decisions(
+    session_id: str,
+    cfg: dict,
+    turn_id: str,
+    duration_ms: int,
+    decisions: list[tuple[dict, str]],
+    payload: dict,
+    calls: list[NormalizedCall],
+    all_valid: bool,
+) -> None:
+    turn = _BatchTurnContext(session_id, turn_id, cfg)
+    normalized = _NormalizedCalls(calls, all_valid)
+    for finding, outcome in decisions:
+        _record_batch_row(
+            turn, duration_ms,
+            family=finding["family"], rule=finding["rule"], path=finding["path"],
+            tool_use_id=finding.get("_tool_use_id", ""), outcome=outcome,
+        )
+    if _has_write_call(payload) and not _complete_unique_ids(normalized, turn):
+        _record_batch_row(
+            turn, duration_ms,
+            family="", rule=DEGRADED_RULE, path="", tool_use_id="", outcome="release",
+        )
+
+
+def _update_blocker_state(
+    scope: blocker_state.BlockerScope, verdict: _BatchVerdict
+) -> None:
+    paths = [str(path) for _call, _raw, path in verdict.entries]
+    reason = verdict.reason if verdict.kind == "block" else None
+    blocker_state.apply_paths(scope, paths, {blocker_state.BATCH_KEY: reason, UNDECIDABLE_KEY: None})
+
+
+def _batch_gate(payload: dict, cfg: dict, session_id: str) -> Callable[[str], dict[str, object]]:
+    def gate(turn_id: str) -> dict:
+        started = time.monotonic()
+        cwd = Path(payloads.cwd(payload) or ".")
+        normalized = _normalized_calls(payload, _authored(session_id, cfg))
+        entries = _entries_from_calls(normalized.calls, cwd)
+        turn = _BatchTurnContext(session_id, turn_id, cfg)
+        findings = _findings_for_calls(normalized, entries, turn)
+        decisions = [(finding, resolve_outcome(finding, cfg)) for finding in findings]
+        duration_ms = int((time.monotonic() - started) * 1000)
+        if session_id:
+            _record_decisions(
+                session_id, cfg, turn_id, duration_ms, decisions, payload,
+                normalized.calls, normalized.all_valid,
+            )
+        report_cfg = {**cfg, "session_id": session_id, "turn_id": turn_id}
+        kind, reason = reporting.verdict_message(decisions, report_cfg)
+        if session_id:
+            scope = blocker_state.BlockerScope(session_id, blocker_state.scope(payload), cfg.get("state_root"))
+            _update_blocker_state(scope, _BatchVerdict(entries, kind, reason))
+        return _batch_response(kind, reason)
+
+    return gate
+
+
+def _batch_response(kind: str, reason: str) -> dict:
+    if kind == "block":
+        return {"decision": "block", "reason": reason}
+    if kind == "observe":
+        return advise(reason, BATCH_EVENT)
+    return {}
+
+
+def run(payload: dict, config: dict | None = None) -> dict:
+    try:
+        return _run(payload, config)
+    except Exception as exc:
+        reason = config_failure("batch", exc, payloads.cwd(payload) or None)
+        blocker_state.hold_undecidable(_sanitized_payload(payload), config, UNDECIDABLE_KEY, reason)
+        return {"decision": "block", "reason": reason}
+
+
+def _run(payload: dict, config: dict | None) -> dict:
+    payload = _sanitized_payload(payload)
+    cfg = payload_hook_config(config, payload)
+    return run_with_ledger(
+        hook="batch",
+        payload=payload,
+        gate=_batch_gate(payload, cfg, payloads.session_id(payload)),
+        ledger_root=cfg.get("ledger_root"),
+        state_root=cfg.get("state_root"),
+    )
+
+
+def cli_response(response: dict) -> dict:
+    if response.get("decision") != "block":
+        return response
+    return advise(str(response.get("reason") or "PostToolBatch blocked findings"), BATCH_EVENT)
+
+
+if __name__ == "__main__":
+    write_payload(cli_response(run(read_payload())))

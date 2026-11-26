@@ -1,0 +1,9 @@
+{
+  "name": "adw-light",
+  "description": "Deterministic checks for code, comments, and prose.",
+  "author": {
+    "name": "ADW Lite maintainers"
+  },
+  "version": "0.1.2",
+  "hooks": "./.codex-plugin/empty-hooks.json"
+}

@@ -1,0 +1,369 @@
+from __future__ import annotations
+
+import os
+import re
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NamedTuple
+
+from lib.baseline import split_against
+from lib.commit_command import GitCall, UnreadableCommit, git_calls
+from lib.commit_index_source import takes_content_outside_index
+from lib.config import SURFACE_COMMIT, StorageRoots, effective_config
+from lib.fixture_prose import index_scan_config
+from lib.git_port import view
+from lib.hookio import (
+    PARSE_FAILURE, advise, allow, claude_pretool_response, deny, fail_closed, read_payload, write_payload,
+)
+from lib.merge_state import incoming_commits, revision_text, session_started
+from lib.regular_file import read_regular_text
+from lib.path_policy import anchored
+from lib.reporting import inherited_advice, record_findings, run_with_ledger, verdict_message
+from lib.scan_input import is_binary_content
+from lib.scanner import file_length_findings, scan_all, scannable_text
+from lib.shell_text import decode_ansi_c_value
+
+COMMIT_MESSAGE_PATH = "commit_message.md"
+CONVENTIONAL_SUBJECT_RE = re.compile(
+    r"\A(?P<prefix>[A-Za-z][A-Za-z0-9_-]*(?:\([^()\r\n]+\))?!?:[ \t]+)"
+)
+TRAILER_PREFIX_RE = re.compile(
+    r"^(?P<prefix>(?:BREAKING CHANGE|[^\s:]+)[ \t]*:[ \t]*)"
+)
+
+COMMIT_REFUSED = "agent-discipline-watcher blocked this commit rather than letting it through. Cause: "
+STAGE_SEPARATELY = (
+    "The commit gate scans the index before this command runs, so it cannot judge content the same command stages "
+    "or reads from the worktree. Stage in its own tool call, then commit without paths, -a, -i, -o, or -p."
+)
+
+@dataclass(frozen=True, slots=True)
+class _CommitRunContext:
+    payload: dict
+    config: dict | None
+    roots: StorageRoots
+
+
+def run(
+    payload: dict,
+    config: dict | None = None,
+    ledger_root: str | os.PathLike[str] | None = None,
+    state_root: str | os.PathLike[str] | None = None,
+) -> dict:
+    context = _CommitRunContext(
+        payload=payload,
+        config=config,
+        roots=StorageRoots(state=state_root, ledger=ledger_root),
+    )
+    return fail_closed("commit", lambda: _checked_run(context))
+
+
+def _checked_run(context: _CommitRunContext) -> dict:
+    if context.payload is PARSE_FAILURE:
+        raise ValueError("unreadable hook payload")
+    return _run(context)
+
+
+def _run(context: _CommitRunContext) -> dict:
+    return run_with_ledger(
+        hook="pre_commit",
+        payload=context.payload,
+        gate=lambda turn_id: _index_checked_gate(context, turn_id),
+        ledger_root=context.roots.ledger,
+        state_root=context.roots.state,
+    )
+
+
+def _index_checked_gate(context: _CommitRunContext, turn_id: str) -> dict:
+    try:
+        calls = git_calls(_bash_command(context.payload), _payload_cwd(context.payload))
+    except UnreadableCommit as exc:
+        return deny(f"{COMMIT_REFUSED}{exc}")
+    if takes_content_outside_index(calls):
+        return deny(STAGE_SEPARATELY)
+    commit_cwds = [call for call in calls if call.verb == "commit"]
+    return _gate(context, turn_id, commit_cwds) if commit_cwds else allow()
+
+
+def _gate(context: _CommitRunContext, turn_id: str, commit_cwds: list[GitCall]) -> dict:
+    started = time.monotonic()
+    cwd = _payload_cwd(context.payload)
+    repo_rows = _repo_findings_by_repo(commit_cwds, context.config, _session_start(context))
+    outer_cfg = effective_config(context.config, cwd)
+    try:
+        message_findings = _message_findings(_bash_command(context.payload), outer_cfg, cwd)
+    except UnreadableCommit as exc:
+        return deny(f"{COMMIT_REFUSED}{exc}")
+    stamp = _RecordStamp(
+        session_id=str(context.payload.get("session_id") or ""),
+        tool_use_id=str(context.payload.get("tool_use_id") or ""),
+        turn_id=turn_id,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        ledger_root=context.roots.ledger,
+    )
+    scan = _CommitScan(repo_rows, message_findings, outer_cfg)
+    decisions = _record_all(scan, stamp)
+    kind, message = verdict_message(decisions, outer_cfg) if decisions else ("release", "")
+    if kind == "block":
+        return deny(message)
+    notice = _inherited_notice(scan)
+    if kind == "observe":
+        return advise("\n".join(part for part in (message, notice) if part), "PreToolUse")
+    return {"systemMessage": notice} if notice else allow()
+
+
+def _inherited_notice(scan: _CommitScan) -> str:
+    notices = (inherited_advice(row.inherited, row.cfg) for row in scan.repository_rows)
+    return "\n".join(notice for notice in notices if notice)
+
+
+class _RecordStamp(NamedTuple):
+    session_id: str
+    tool_use_id: str
+    turn_id: str
+    duration_ms: int
+    ledger_root: str | os.PathLike[str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _RepoScan:
+    cfg: dict
+    owned: list[dict]
+    inherited: list[dict]
+
+
+@dataclass(frozen=True, slots=True)
+class _CommitScan:
+    repository_rows: list[_RepoScan]
+    message_rows: list[dict]
+    outer_config: dict
+
+
+def _record_all(
+    scan: _CommitScan, stamp: _RecordStamp
+) -> list[tuple[dict, str]]:
+    decisions: list[tuple[dict, str]] = []
+    for row in scan.repository_rows:
+        decisions.extend(record_findings(
+            session_id=stamp.session_id, hook="pre_commit", event="PreCommit",
+            findings=row.owned, turn_id=stamp.turn_id, tool_use_id=stamp.tool_use_id,
+            duration_ms=stamp.duration_ms, root=stamp.ledger_root, config=row.cfg,
+        ))
+    decisions.extend(record_findings(
+        session_id=stamp.session_id, hook="pre_commit", event="PreCommit",
+        findings=scan.message_rows, turn_id=stamp.turn_id,
+        tool_use_id=stamp.tool_use_id, duration_ms=stamp.duration_ms,
+        root=stamp.ledger_root, config=scan.outer_config,
+    ))
+    return decisions
+
+
+def _session_start(context: _CommitRunContext) -> float | None:
+    session_id = str(context.payload.get("session_id") or "")
+    return session_started(session_id, context.roots.state) if session_id else None
+
+
+def _repo_findings_by_repo(commit_cwds: list[GitCall], config: dict | None, started_at: float | None) -> list[_RepoScan]:
+    rows: list[_RepoScan] = []
+    seen: set[tuple[Path, Path | None]] = set()
+    for call in commit_cwds:
+        repo = _repo_root(call.cwd)
+        if repo is None or (repo, call.index_file) in seen:
+            continue
+        seen.add((repo, call.index_file))
+        cfg = effective_config(config, repo)
+        with _scan_index(call.index_file):
+            rows.append(_RepoScan(cfg, *_repo_findings(repo, cfg, started_at)))
+    return rows
+
+
+@contextmanager
+def _scan_index(path: Path | None):
+    if path is None:
+        yield
+        return
+    previous = os.environ.get("GIT_INDEX_FILE")
+    os.environ["GIT_INDEX_FILE"] = os.fspath(path)
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ["GIT_INDEX_FILE"]
+        else:
+            os.environ["GIT_INDEX_FILE"] = previous
+
+
+def _repo_findings(repo: Path, cfg: dict, started_at: float | None) -> tuple[list[dict], list[dict]]:
+    incoming = incoming_commits(repo, started_at)
+    findings: list[dict] = []
+    inherited: list[dict] = []
+    for path in _staged(repo):
+        raw = _staged_bytes(repo, path)
+        if is_binary_content(path, raw):
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        scanned = file_length_findings(path, text) if scannable_text(text, cfg) is None else scan_all(path, text, index_scan_config(cfg, path, repo))
+        previous = [revision_text(repo, revision, path) for revision in ("HEAD", *incoming)]
+        owned, carried = split_against(previous, path, scanned, cfg, text)
+        findings.extend({**finding, "path": path} for finding in owned)
+        if incoming:
+            inherited.extend({**finding, "path": path} for finding in carried)
+    return findings, inherited
+
+
+def _message_findings(command: str | list[str], cfg: dict, cwd: Path | None = None) -> list[dict]:
+    text = "\n\n".join(_commit_messages(command, cwd))
+    if not text:
+        return []
+    return [
+        {**finding, "path": COMMIT_MESSAGE_PATH, "surface": SURFACE_COMMIT}
+        for finding in scan_all(
+            COMMIT_MESSAGE_PATH, text, cfg, hidden_ranges=_commit_metadata_ranges(text)
+        )
+    ]
+
+
+def _commit_metadata_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    subject = CONVENTIONAL_SUBJECT_RE.match(text)
+    ranges = [subject.span("prefix")] if subject else []
+    ranges.extend(_trailer_metadata_ranges(text))
+    return tuple(ranges)
+
+
+def _trailer_metadata_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    lines = text.splitlines(keepends=True)
+    end = len(lines) - 1
+    while end >= 0 and not lines[end].strip():
+        end -= 1
+    start = end
+    while start > 0 and lines[start - 1].strip():
+        start -= 1
+    if start <= 0:
+        return ()
+    offset = sum(len(line) for line in lines[:start])
+    ranges = []
+    saw_trailer = False
+    for line in lines[start:end + 1]:
+        match = TRAILER_PREFIX_RE.match(line)
+        if match:
+            ranges.append((offset + match.start("prefix"), offset + match.end("prefix")))
+            saw_trailer = True
+        elif not saw_trailer or not line.startswith((" ", "\t")):
+            return ()
+        offset += len(line)
+    return tuple(ranges)
+
+
+def _commit_messages(command: str | list[str], cwd: Path | None = None) -> list[str]:
+    calls = git_calls(command, cwd or Path.cwd())
+    return [value for call in calls if call.verb == "commit" for value in _message_values(call.args, call.cwd, call.stdin)]
+
+
+def _file_message(value: str, cwd: Path | None, stdin: str | None) -> str:
+    name = decode_ansi_c_value(value)
+    if name == "-" and stdin is not None:
+        return stdin
+    if not name or name == "-":
+        raise UnreadableCommit("commit message stdin is unavailable; use -m or a readable --file")
+    base = cwd or Path.cwd()
+    path = anchored(name, base)
+    literal = base / name
+    if literal != path and literal.exists():
+        raise UnreadableCommit("commit message path has both literal and expanded home targets; use an absolute path")
+    try:
+        return read_regular_text(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UnreadableCommit(f"commit message file cannot be read: {path}") from exc
+
+
+def _message_file_at(tokens: list[str], cursor: int) -> tuple[str | None, int]:
+    token = tokens[cursor]
+    if token.startswith("--file="):
+        return token.partition("=")[2], cursor + 1
+    short = token[1:] if token.startswith("-") and not token.startswith("--") else ""
+    flags, marker, inline = short.partition("F")
+    bundled = bool(marker) and all(char in _BOOLEAN_BUNDLE_CHARS for char in flags)
+    if bundled and inline:
+        return inline, cursor + 1
+    if token == "--file" or bundled:
+        if cursor + 1 >= len(tokens):
+            raise UnreadableCommit("commit message file is missing")
+        return tokens[cursor + 1], cursor + 2
+    return None, cursor + 1
+
+
+def _message_value_at(tokens: list[str], cursor: int, cwd: Path | None = None, stdin: str | None = None) -> tuple[str | None, int]:
+    token = tokens[cursor]
+    file_name, next_cursor = _message_file_at(tokens, cursor)
+    if file_name is not None:
+        return _file_message(file_name, cwd, stdin), next_cursor
+    if token in {"-m", "--message"} or _is_message_bundle(token):
+        next_cursor = cursor + 2
+        if cursor + 1 >= len(tokens):
+            return None, next_cursor
+        return decode_ansi_c_value(tokens[cursor + 1]), next_cursor
+    name, separator, inline = token.partition("=")
+    if separator and name == "--message":
+        return decode_ansi_c_value(inline), cursor + 1
+    if token.startswith("-m") and len(token) > 2:
+        return decode_ansi_c_value(token[2:]), cursor + 1
+    return None, cursor + 1
+
+
+def _message_values(tokens: list[str], cwd: Path | None = None, stdin: str | None = None) -> list[str]:
+    values: list[str] = []
+    cursor = 0
+    while cursor < len(tokens):
+        if tokens[cursor] == "--":
+            break
+        value, cursor = _message_value_at(tokens, cursor, cwd, stdin)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+_BOOLEAN_BUNDLE_CHARS = frozenset("anqvoes")
+
+
+def _is_message_bundle(token: str) -> bool:
+    if not token.startswith("-") or token.startswith("--") or len(token) <= 2:
+        return False
+    if token[-1] != "m":
+        return False
+    return all(char in _BOOLEAN_BUNDLE_CHARS for char in token[1:-1])
+
+
+def _bash_command(payload: dict) -> str | list[str]:
+    tool_input = payload.get("tool_input") or payload.get("toolInput") or payload.get("input") or {}
+    for key in ("command", "cmd", "input"):
+        if key in tool_input:
+            command = tool_input[key]
+            return list(command) if isinstance(command, list) else str(command)
+    return ""
+
+
+def _payload_cwd(payload: dict) -> Path:
+    return Path(payload.get("cwd") or os.getcwd())
+
+
+def _active_index() -> Path | None:
+    index = os.environ.get("GIT_INDEX_FILE")
+    return Path(index) if index else None
+
+
+def _repo_root(cwd: Path) -> Path | None:
+    return view().toplevel(cwd, strict=True)
+
+
+def _staged(cwd: Path) -> list[str]:
+    return view().staged_paths(cwd, _active_index()) or []
+
+
+def _staged_bytes(repo: Path, path: str) -> bytes:
+    return view().index_bytes(repo, path, _active_index())
+
+
+if __name__ == "__main__":
+    write_payload(claude_pretool_response(run(read_payload())))

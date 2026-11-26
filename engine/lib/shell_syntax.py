@@ -1,0 +1,504 @@
+from __future__ import annotations
+
+import re
+import shlex
+from pathlib import PurePosixPath
+from typing import NamedTuple
+
+from .shell_operators import (
+    LEADING_REDIRECT_RE, PIPE_OPERATORS, SEPARATORS,
+    _merge_adjacent_fragments, _split_punctuation_runs,
+)
+from .shell_text import _closing_paren, shell_tokens, shell_words
+from .shell_unfold import unfolded
+
+DYNAMIC_RE = re.compile(r"[$`]")
+INTERPRETERS = frozenset({
+    "python", "python3", "sh", "bash", "zsh", "dash", "command", "env", "exec", "sudo", "time", "nohup",
+    "nice", "timeout",
+})
+WRAPPER_COMMANDS = frozenset({"env", "sudo", "nohup", "time", "command", "exec", "nice", "timeout"})
+RESERVED_PREFIXES = frozenset({"!", "{", "if", "then", "else", "elif", "while", "until", "do", "coproc"})
+WRAPPER_OPERANDS = {"timeout": 1}
+WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "nice": frozenset({"-n", "--adjustment"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-a", "--argv0"}),
+    "sudo": frozenset({
+        "-u", "--user", "-g", "--group", "-h",
+        "-C", "--close-from", "-D", "--chdir", "-R", "--chroot",
+        "-T", "--command-timeout", "-p", "--prompt", "-r", "--role", "-t", "--type",
+    }),
+    "time": frozenset({"-f", "--format", "-o", "--output"}),
+    "exec": frozenset({"-a"}),
+}
+ENV_SPLIT_STRING_FLAGS = frozenset({"-S", "--split-string"})
+INTERPRETER_CODE_FLAGS: dict[str, frozenset[str]] = {
+    "python": frozenset({"-c"}), "python3": frozenset({"-c"}), "python2": frozenset({"-c"}),
+    "node": frozenset({"-e", "--eval", "-p", "--print"}), "nodejs": frozenset({"-e", "--eval", "-p", "--print"}),
+    "ruby": frozenset({"-e"}),
+    "perl": frozenset({"-e", "-E"}),
+    "php": frozenset({"-r"}),
+    "sh": frozenset({"-c"}), "bash": frozenset({"-c"}), "zsh": frozenset({"-c"}), "dash": frozenset({"-c"}), "ksh": frozenset({"-c"}),
+}
+SHELL_C_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+VERSIONED_PYTHON_RE = re.compile(r"^(python[23])\.\d+$")
+PYTHON_VALUE_OPTION_RE = re.compile(r"^-[bBdEhIiOPqRsSuvVx]*([cmWX])")
+QUOTED_SPAN_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+PROCESS_SUBSTITUTION_RE = re.compile(r"[<>]\(")
+
+
+class InterpreterInvocation(NamedTuple):
+    interpreter: str
+    flag: str
+    payload: str | None
+
+
+def _command_word_index(segment: list[str]) -> int:
+    return _skip_prefixes(segment, INTERPRETERS)
+
+
+def _payload_command_index(segment: list[str]) -> int:
+    return _skip_prefixes(segment, WRAPPER_COMMANDS)
+
+
+def _skip_prefixes(segment: list[str], names: frozenset[str]) -> int:
+    index = 0
+    while index < len(segment):
+        redirect_index = _skip_leading_redirect(segment, index)
+        if redirect_index is not None:
+            index = redirect_index
+            continue
+        token = segment[index]
+        if token in RESERVED_PREFIXES:
+            index += 1
+            continue
+        if not _is_quoted(token):
+            name, separator, _ = token.partition("=")
+            if separator and name:
+                index += 1
+                continue
+        command_name = _basename(token)
+        if command_name in names:
+            if command_name in WRAPPER_COMMANDS:
+                index = _skip_wrapper_options(segment, index)
+            else:
+                index += 1
+            continue
+        return index
+    return len(segment)
+
+
+def _skip_leading_redirect(segment: list[str], index: int) -> int | None:
+    token = segment[index]
+    if _is_quoted(token):
+        return None
+    match = LEADING_REDIRECT_RE.match(token)
+    if not match:
+        return None
+    rest = token[match.end():]
+    index += 1
+    if not rest and index < len(segment):
+        index += 1
+    return index
+
+
+def _without_redirects(args: list[str]) -> list[str]:
+    kept = []
+    position = 0
+    while position < len(args):
+        skipped = _skip_leading_redirect(args, position)
+        if skipped is None:
+            kept.append(args[position])
+        position = position + 1 if skipped is None else skipped
+    return kept
+
+
+def _skip_wrapper_options(segment: list[str], index: int) -> int:
+    wrapper = _basename(segment[index])
+    value_flags = WRAPPER_VALUE_FLAGS.get(wrapper, frozenset())
+    operands = WRAPPER_OPERANDS.get(wrapper, 0)
+    index += 1
+    while index < len(segment):
+        token = segment[index]
+        bare = _bare(token)
+        if bare == "--":
+            return index + 1 + operands
+        if _assignment_word(token) is not None:
+            index += 1
+            continue
+        if not bare.startswith("-"):
+            return index + operands
+        if "=" in bare or not _wrapper_consumes_value(bare, value_flags):
+            index += 1
+            continue
+        index += 2
+    return index
+
+
+def _assignment_word(token: str) -> str | None:
+    decoded = _decoded_payload(token)
+    word = token if decoded is None else decoded
+    name, separator, _ = word.partition("=")
+    return word if separator and name and not word.startswith("-") else None
+
+
+def _wrapper_consumes_value(bare: str, value_flags: frozenset[str]) -> bool:
+    if bare in value_flags:
+        return True
+    if bare.startswith("--") or len(bare) < 2:
+        return False
+    value_letters = {flag[1] for flag in value_flags if len(flag) == 2}
+    positions = [position for position, letter in enumerate(bare[1:], 1) if letter in value_letters]
+    return bool(positions) and positions[0] == len(bare) - 1
+
+
+def _interpreter_code_flags(name: str) -> frozenset[str] | None:
+    flags = INTERPRETER_CODE_FLAGS.get(name)
+    if flags is not None:
+        return flags
+    match = VERSIONED_PYTHON_RE.fullmatch(name)
+    if match is None:
+        return None
+    return INTERPRETER_CODE_FLAGS.get(match.group(1))
+
+
+def interpreter_invocation(segment: list[str]) -> InterpreterInvocation | None:
+    index = _payload_command_index(segment)
+    if index >= len(segment):
+        return None
+    name = _basename(segment[index])
+    flags = _interpreter_code_flags(name)
+    if flags is None:
+        return None
+    matched = _flag_payload_token(segment[index + 1:], flags, python_options=name.startswith("python"))
+    if matched is None:
+        return None
+    flag, payload_token = matched
+    if payload_token is None:
+        return None
+    return InterpreterInvocation(name, flag, _decoded_payload(payload_token))
+
+
+def _decoded_payload(token: str) -> str | None:
+    if len(token) >= 2 and token[0] == token[-1] == "'" and "'" not in token[1:-1]:
+        return token[1:-1]
+    if DYNAMIC_RE.search(token):
+        return None
+    try:
+        words = shlex.split(token)
+    except ValueError:
+        return None
+    return words[0] if len(words) == 1 else None
+
+
+def _flag_payload_token(
+    args: list[str], flags: frozenset[str], *, python_options: bool = False,
+) -> tuple[str, str | None] | None:
+    if python_options:
+        return _python_flag_payload_token(args)
+    long_flags = [flag for flag in flags if flag.startswith("--")]
+    short_flags = [flag for flag in flags if len(flag) == 2 and flag.startswith("-")]
+    for i, arg in enumerate(args):
+        bare = _bare(arg)
+        if bare in flags:
+            return bare, args[i + 1] if i + 1 < len(args) else None
+        for flag in long_flags:
+            prefix = flag + "="
+            if bare.startswith(prefix):
+                return flag, bare[len(prefix):]
+        next_arg = args[i + 1] if i + 1 < len(args) else None
+        for flag in short_flags:
+            letter = flag[1]
+            if len(bare) > 2 and bare.startswith("-") and not bare.startswith("--") and bare[-1] == letter and bare[1:-1].isalpha():
+                return flag, next_arg
+        for flag in short_flags:
+            if bare.startswith(flag) and len(bare) > len(flag):
+                return flag, bare[len(flag):]
+    return None
+
+
+def _python_flag_payload_token(args: list[str]) -> tuple[str, str | None] | None:
+    value_pending = False
+    index = 0
+    while index < len(args):
+        after_redirect = _skip_leading_redirect(args, index)
+        if after_redirect is not None:
+            index = after_redirect
+            continue
+        token = _bare(args[index])
+        index += 1
+        if value_pending:
+            value_pending = False
+            continue
+        option = PYTHON_VALUE_OPTION_RE.match(token)
+        if option is None:
+            continue
+        if option[1] == "m":
+            return None
+        if option[1] in {"W", "X"}:
+            value_pending = option.end() == len(token)
+            continue
+        return "-c", token[option.end():] or (args[index] if index < len(args) else None)
+    return None
+
+
+def _is_literal_token(token: str) -> bool:
+    if token.startswith("'") and token.endswith("'") and len(token) >= 2:
+        return True
+    return not DYNAMIC_RE.search(token)
+
+
+def has_process_substitution(segment: str) -> bool:
+    masked = QUOTED_SPAN_RE.sub(lambda match: "'" * len(match.group()), segment)
+    return bool(PROCESS_SUBSTITUTION_RE.search(masked))
+
+
+CLOBBER_HEAD_RE = re.compile(r"^\d*>$")
+
+
+CONDITIONAL_BODY = re.compile(r'''(?:[^'"$;&|()\x60\\\]\n]|\](?!\])|\$(?!\()|'[^']*'|"(?:[^"\x60\\$]|\$(?!\())*"|&&|\|\|)+?(?<=\s)\]\](?=$|[\s;&|()])''')
+
+
+def _comparison_end(command: str, start: int, leads: bool) -> int:
+    expansion = command.startswith("$((", start)
+    if expansion or (leads and command.startswith("((", start)):
+        inner = start + 2 + int(expansion)
+        end = _closing_paren(command, inner)
+        body = command[inner:end]
+        if command.startswith("))", end) and not any(word in body for word in ("$(", chr(96), "<(", ">(")):
+            return end + 2
+    if leads and command.startswith("[[", start) and command[start + 2:start + 3].isspace():
+        match = CONDITIONAL_BODY.match(command, start + 2)
+        if match:
+            return match.end()
+    return start
+
+
+def _comparison_words(command: str) -> str:
+    if not any(c in command for c in "<>") or not any(c in command for c in ("((", "[[")):
+        return command
+    parts = []
+    end = 0
+    leads = True
+    for token in shell_tokens(command):
+        match = token.match
+        if match is None or match.start() < end or not match.group().strip():
+            continue
+        start = match.start()
+        stop = _comparison_end(command, start, leads)
+        if stop > start:
+            parts.extend((command[end:start], command[start:stop].replace(">", "=").replace("<", "=")))
+            end = stop
+        leads = match.lastgroup == "separator" or (leads and match.group() in RESERVED_PREFIXES | {"for"})
+    return "".join([*parts, command[end:]])
+
+
+def _tokens(command: str) -> list[str]:
+    command = _comparison_words(command)
+    raw = _merge_adjacent_fragments(command, _split_punctuation_runs(shell_words(command)))
+    return _expand_env_split_strings(unfolded(_merge_clobber_operator(raw)))
+
+
+def _is_unquoted_assignment(token: str) -> bool:
+    if _is_quoted(token):
+        return False
+    name, separator, _ = token.partition("=")
+    return bool(separator and name)
+
+
+def _expand_command_position_token(
+    tokens: list[str], index: int, result: list[str],
+) -> tuple[int, bool]:
+    token = tokens[index]
+    if _is_unquoted_assignment(token):
+        result.append(token)
+        return index + 1, True
+    command_name = _basename(token)
+    if command_name == "env":
+        result.append(token)
+        return _expand_env_flags(tokens, index + 1, result), True
+    if command_name in WRAPPER_COMMANDS:
+        result.append(token)
+        child = _skip_wrapper_options(tokens, index)
+        result.extend(tokens[index + 1:child])
+        return child, True
+    result.append(token)
+    return index + 1, False
+
+
+def _copy_env_flag(tokens: list[str], index: int, result: list[str]) -> int:
+    token = tokens[index]
+    bare = _bare(token)
+    result.append(token)
+    if "=" in bare or not _wrapper_consumes_value(bare, WRAPPER_VALUE_FLAGS["env"]):
+        return index + 1
+    if index + 1 >= len(tokens) or tokens[index + 1] in SEPARATORS:
+        return index + 1
+    result.append(tokens[index + 1])
+    return index + 2
+
+
+def _expand_env_split_strings(tokens: list[str]) -> list[str]:
+    result: list[str] = []
+    index = 0
+    command_position = True
+    while index < len(tokens):
+        token = tokens[index]
+        if token in SEPARATORS:
+            result.append(token)
+            command_position = True
+            index += 1
+            continue
+        if not command_position:
+            result.append(token)
+            index += 1
+            continue
+        index, command_position = _expand_command_position_token(tokens, index, result)
+    return result
+
+
+def _expand_env_flags(tokens: list[str], index: int, result: list[str]) -> int:
+    while index < len(tokens):
+        if tokens[index] in SEPARATORS:
+            return index
+        payload, consumed, keep_prefix = _env_split_string_at(tokens, index)
+        if payload is not None:
+            replacement = ([keep_prefix] if keep_prefix else []) + _tokens(payload)
+            tokens[index:index + consumed] = replacement
+            continue
+        token = tokens[index]
+        bare = _bare(token)
+        if bare == "--":
+            result.append(token)
+            return index + 1
+        if _assignment_word(token) is not None:
+            result.append(token)
+            index += 1
+            continue
+        if not bare.startswith("-"):
+            return index
+        index = _copy_env_flag(tokens, index, result)
+    return index
+
+
+def _env_split_string_at(tokens: list[str], index: int) -> tuple[str | None, int, str | None]:
+    bare = _bare(tokens[index])
+    next_token = tokens[index + 1] if index + 1 < len(tokens) and tokens[index + 1] not in SEPARATORS else None
+    if bare in ENV_SPLIT_STRING_FLAGS and next_token is not None:
+        return _bare(next_token), 2, None
+    if bare.startswith("--split-string="):
+        payload, consumed = _fused_split_string_payload(tokens, index, bare.partition("=")[2])
+        return payload, consumed, None
+    if bare.startswith("-S") and not bare.startswith("--") and len(bare) > 2:
+        rest = bare[2:]
+        payload, consumed = _fused_split_string_payload(
+            tokens, index, rest[1:] if rest.startswith("=") else rest,
+        )
+        return payload, consumed, None
+    letters = bare[1:]
+    if next_token is not None and bare.startswith("-") and not bare.startswith("--") and letters.endswith("S") and letters[:-1].isalpha():
+        return _bare(next_token), 2, bare[:-1]
+    return None, 0, None
+
+
+def _fused_split_string_payload(tokens: list[str], index: int, rest: str) -> tuple[str, int]:
+    payload = rest
+    consumed = 1
+    cursor = index + 1
+    while payload and payload[0] in "'\"" and not _is_quoted(payload) and cursor < len(tokens) and tokens[cursor] not in SEPARATORS:
+        payload = payload + " " + tokens[cursor]
+        consumed += 1
+        cursor += 1
+    return _bare(payload), consumed
+
+
+def _segments(command: str) -> list[list[str]]:
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in _tokens(command):
+        if token in SEPARATORS:
+            if current:
+                segments.append(current)
+            current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _pipeline_groups(command: str) -> list[list[list[str]]]:
+    groups: list[list[list[str]]] = []
+    group: list[list[str]] = []
+    current: list[str] = []
+    for token in _tokens(command):
+        if token in PIPE_OPERATORS:
+            if current:
+                group.append(current)
+            current = []
+            continue
+        if token in SEPARATORS:
+            if current:
+                group.append(current)
+            current = []
+            if group:
+                groups.append(group)
+            group = []
+            continue
+        current.append(token)
+    if current:
+        group.append(current)
+    if group:
+        groups.append(group)
+    return groups
+
+
+def _merge_clobber_operator(tokens: list[str]) -> list[str]:
+    merged: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if (
+            not _is_quoted(token) and CLOBBER_HEAD_RE.match(token)
+            and index + 1 < len(tokens) and tokens[index + 1] == "|"
+        ):
+            merged.append(token)
+            index += 2
+            continue
+        merged.append(token)
+        index += 1
+    return merged
+
+
+def _is_quoted(token: str) -> bool:
+    return len(token) > 1 and token[0] in "\"'" and token[-1] == token[0]
+
+
+def _bare(token: str) -> str:
+    return token[1:-1] if _is_quoted(token) else token
+
+
+def _segment_text(segment: list[str]) -> str:
+    return " ".join("''" if _is_quoted(token) else token for token in segment)
+
+
+def _leading_assignments(segment: list[str]) -> list[str]:
+    names = []
+    start = next((index for index, token in enumerate(segment) if token not in RESERVED_PREFIXES), len(segment))
+    for token in segment[start:]:
+        if _is_quoted(token):
+            break
+        name, separator, _ = token.partition("=")
+        if not separator or not name:
+            break
+        names.append(name)
+    return names
+
+
+def _words(segment: list[str]) -> list[str]:
+    return [_bare(token) for token in segment]
+
+
+def _basename(token: str) -> str:
+    return PurePosixPath(_bare(token).strip(",")).name

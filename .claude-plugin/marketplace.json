@@ -1,0 +1,14 @@
+{
+  "name": "adw-light",
+  "metadata": {"description": "GitHub marketplace for ADW Lite."},
+  "owner": {
+    "name": "ADW Lite maintainers"
+  },
+  "plugins": [
+    {
+      "name": "adw-light",
+      "source": "./",
+      "description": "Deterministic checks for code, comments, and prose."
+    }
+  ]
+}
