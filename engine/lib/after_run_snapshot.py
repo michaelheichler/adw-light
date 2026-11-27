@@ -364,7 +364,14 @@ def content_rows(hook: Hook, path: Path, digest: str, root: Path, base: tuple | 
         owned = scanned_rewrite(path, hook.cfg)
     else:
         owned = _moved_rows(hook, path, root, base[1])
+    if owned and _is_git_ignored(root, path):
+        return []
     return [{**row, "path": str(path), "content_hash": digest} for row in owned]
+
+
+def _is_git_ignored(root: Path, path: Path) -> bool:
+    relative = path.relative_to(root).as_posix()
+    return relative in git_port.view().ignored_paths(root, [relative])
 
 
 def _moved_rows(hook: Hook, path: Path, root: Path, before: str | None) -> list[dict]:

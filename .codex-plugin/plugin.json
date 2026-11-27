@@ -4,6 +4,6 @@
   "author": {
     "name": "ADW Lite maintainers"
   },
-  "version": "0.1.3.3",
+  "version": "0.1.3.4",
   "hooks": "./.codex-plugin/empty-hooks.json"
 }
