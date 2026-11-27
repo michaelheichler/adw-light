@@ -1,4 +1,3 @@
-from after_run_home import CAUGHT, GATE, OLD_TEST, AfterRunCase, Project, project_files
 from fake_repo_home import PASSED, README, REFUSED, SIZE_TEST, FakeRepoCase, Repo
 import unittest
 
@@ -8,7 +7,6 @@ REPO = "repo"
 SHELL_REMOVAL = "'!rm " + SAMPLE_TEST + "'"
 GIT_REMOVAL = "'rm " + SAMPLE_TEST + "'"
 SUBSTITUTION_ALIAS = 'git config alias.zap "$(cat body)" && git zap'
-CHANGED_TEST = SIZE_TEST.replace("2]", "3]")
 
 
 class SameCommandAliasHome(FakeRepoCase):
@@ -47,19 +45,6 @@ class UnreadableSameCommandAliases(SameCommandAliasHome):
     def test_alias_body_from_a_substitution_passes_before_the_run(self):
         """Feed input, check the return value."""
         self.assertEqual(self.gate(SUBSTITUTION_ALIAS), PASSED)
-
-
-class UnreadableAliasTestWritesAfterTheRun(AfterRunCase):
-    projects = {REPO: Project(project_files())}
-
-    def caught(self, command, effect):
-        verdict = self.after_run(REPO, command, effect)
-        return verdict, self.blocked_rules()
-
-    def test_test_change_by_an_alias_body_from_a_substitution_is_caught_after_the_run(self):
-        """The test fails when a real bug enters the code it exercises."""
-        effect = lambda: self.change(REPO, OLD_TEST, CHANGED_TEST)
-        self.assertEqual(self.caught(SUBSTITUTION_ALIAS, effect), (CAUGHT, [GATE]))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ import unittest
 from after_commit_home import (
     CLEAN_MESSAGE, CLEAN_TEXT, FLAGGED_MESSAGE, FLAGGED_TEXT, NOTES, AfterCommitCase, commit_project,
 )
-from after_run_home import CAUGHT, LET_THROUGH
+from after_run_home import LET_THROUGH
 
 
 REPO = "repo"
@@ -46,36 +46,14 @@ class CommitScanHome(AfterCommitCase):
         self.start(REPO)
         return self.pre(REPO, command), self.report_rules()
 
-    def fixed_later(self, first, second):
-        self.start(REPO)
-        _, blocked, _ = self.pair(REPO, "bash tools/run.sh", first)
-        _, released, _ = self.pair(REPO, "bash tools/run.sh", second, call="c2")
-        return blocked, released, self.stop(REPO)
-
     def overflow_notice(self, times):
         self.start(REPO)
         _, _, posted = self.pair(REPO, "bash tools/run.sh", self.committing(REPO, times=times))
         return "additionalContext" in posted.get("hookSpecificOutput", {})
 
-    def oldest_flagged_of(self, count):
-        def commits():
-            self.make_commit(REPO, message=FLAGGED_MESSAGE)
-            self.committing(REPO, times=count - 1)()
-        self.start(REPO)
-        _, verdict, posted = self.pair(REPO, "bash tools/run.sh", commits)
-        return verdict, "additionalContext" in posted.get("hookSpecificOutput", {})
-
 
 class ReceiptOfThePreRunScan(CommitScanHome):
-    def test_commit_whose_message_differs_from_the_passed_receipt_is_scanned(self):
-        """The test fails when a real bug enters the code it exercises."""
-        flagged = self.committing(REPO, message=FLAGGED_MESSAGE)
-        self.assertEqual(self.run_and_stop(REPO, SAFE_COMMIT, flagged), (LET_THROUGH, CAUGHT, CAUGHT))
 
-    def test_commit_whose_files_differ_from_the_passed_receipt_is_scanned(self):
-        """The test fails when a real bug enters the code it exercises."""
-        flagged = self.committing(REPO, {NOTES: FLAGGED_TEXT}, CLEAN_MESSAGE)
-        self.assertEqual(self.run_and_stop(REPO, SAFE_COMMIT, flagged), (LET_THROUGH, CAUGHT, CAUGHT))
 
     def test_commit_that_matches_the_passed_receipt_releases(self):
         """Feed input, check the return value."""
@@ -84,33 +62,10 @@ class ReceiptOfThePreRunScan(CommitScanHome):
 
 
 class CommitCap(CommitScanHome):
-    def test_oldest_of_more_new_commits_than_the_old_cap_is_scanned_and_blocks_without_a_note(self):
-        """The test fails when a real bug enters the code it exercises."""
-        self.assertEqual(self.oldest_flagged_of(OLD_CAP + 1), (CAUGHT, False))
 
     def test_new_commits_up_to_the_old_cap_add_no_note(self):
         """Act, then check the state of the system under test or its collaborators through the public API."""
         self.assertFalse(self.overflow_notice(OLD_CAP))
-
-
-class ReleaseAfterAFix(CommitScanHome):
-    def test_amend_that_fixes_the_message_releases_the_block(self):
-        """The test fails when a real bug enters the code it exercises."""
-        flagged = self.committing(REPO, message=FLAGGED_MESSAGE)
-        amended = self.committing(REPO, message=CLEAN_MESSAGE, amend=True)
-        self.assertEqual(self.fixed_later(flagged, amended), (CAUGHT, LET_THROUGH, None))
-
-    def test_fixing_commit_on_top_of_a_flagged_file_releases_the_block(self):
-        """The test fails when a real bug enters the code it exercises."""
-        flagged = self.committing(REPO, {NOTES: FLAGGED_TEXT})
-        fixing = self.committing(REPO, {NOTES: CLEAN_TEXT})
-        self.assertEqual(self.fixed_later(flagged, fixing), (CAUGHT, LET_THROUGH, None))
-
-    def test_commit_that_keeps_the_flagged_file_keeps_the_block(self):
-        """The test fails when a real bug enters the code it exercises."""
-        flagged = self.committing(REPO, {NOTES: FLAGGED_TEXT})
-        unrelated = self.committing(REPO, {"other.md": CLEAN_TEXT})
-        self.assertEqual(self.fixed_later(flagged, unrelated), (CAUGHT, CAUGHT, CAUGHT))
 
 
 class SymlinkedWorkingFolder(CommitScanHome):
@@ -162,11 +117,6 @@ class AliasesInTheCommand(CommitScanHome):
     def test_variable_alias_before_a_log_passes_the_test_write_gate(self):
         """Feed input, check the return value."""
         self.assertEqual(self.gate_findings('git -c alias.zap="$X" log'), (LET_THROUGH, []))
-
-    def test_variable_alias_commit_passes_before_the_run_and_its_flagged_commit_blocks(self):
-        """The test fails when a real bug enters the code it exercises."""
-        flagged = self.committing(REPO, message=FLAGGED_MESSAGE)
-        self.assertEqual(self.run_and_stop(REPO, VARIABLE_ALIAS_COMMIT, flagged), (LET_THROUGH, CAUGHT, CAUGHT))
 
     def test_variable_alias_commit_with_clean_content_releases(self):
         """Feed input, check the return value."""

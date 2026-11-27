@@ -32,11 +32,6 @@ MORE_FINDINGS = "weitere Befunde"
 PRINCIPLE_LABEL = "Prinzip"
 
 RULES: dict[str, GermanEntry] = {
-    "after_run_deferred": GermanEntry(
-        "Commit-Prüfung nicht abgeschlossen",
-        "Die Commit-Prüfung konnte nicht abgeschlossen werden",
-        "Wiederhole die Commit-Prüfung beim Stop-Hook.",
-    ),
     "unresolved_doc_reference": GermanEntry("Unbekannter Name", "Der Name fehlt in dieser Datei", "Nutze einen Namen aus der Datei oder Backticks."),
     "banned_dash": GermanEntry(
         "Unzulässiger Strich",

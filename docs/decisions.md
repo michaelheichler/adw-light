@@ -14,6 +14,8 @@ The language layer keeps its five broad exception handlers. ruff.toml ignores th
 
 ADW Lite no longer refuses a shell command only because it cannot see what the command writes. After each shell command it compares test files and scanned files with a snapshot taken before the command.
 
+The 0.1.3.5 ruling at the end of this file removed this check again.
+
 - A test change by any agent other than adw-test-writer blocks the next step. So does new prose that breaks a rule.
 - The eight write-visibility refusals end. So do the 100-character shell write cap and the refusal of script files such as python3 file.py.
 - An open tests window exempts the check, the same way it exempts the check before the run.
@@ -45,3 +47,7 @@ The owner accepted a full suite of about 316 seconds for 0.1.3. The target stays
 ## Portable home paths only get a note (2026-11-27)
 
 A path under ~/ that is the same on every machine, such as ~/.claude/settings.json, gets the observe-only note hard_coded_system_path. A path that names a real user home stays a hard block.
+
+## 0.1.3.5: no guessing in ADW (owner, 2026-11-27)
+
+The owner ruled that ADW must not guess, and that the guessing parts get removed instead of fixed. ADW no longer decides who changed a file from timing windows or from before-and-after snapshots. The after-run snapshot comparison, its held rows, the after-run blocker, the explained-writer records and every release rule built on them leave the engine. Checks stay where the actor is certain: Write and Edit, shell writes whose target ADW parses, and the scan of content an agent commits. A commit of test content is not a test write. ADW blocks test writing only at the moment a non-writer writes.

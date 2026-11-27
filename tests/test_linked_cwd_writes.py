@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from after_run_home import BLOCK, CODEX, DENY, GATE, TEST_WRITER, AfterRunCase, Project, identity, project_files
+from after_run_home import CODEX, DENY, GATE, TEST_WRITER, AfterRunCase, Project, identity, project_files
 from fake_repo_home import SIZE_TEST
 
 
@@ -20,8 +20,6 @@ NOTES = "docs/new.md"
 OPAQUE = "printf 'More.\\n' >> \"$(cat target.txt)\""
 NESTED = "nested"
 NESTED_HELPER = "tests/e2e/helpers.py"
-MADE_TEST = "tests/test_made.py"
-MADE_NOTES = "docs/made.md"
 EDGE = "edge"
 EDGE_PROJ = "edge/tests/proj"
 APP = "src/app.py"
@@ -59,11 +57,6 @@ class LinkedCwdWrites(AfterRunCase):
     def named_shell(self, command, cwd=LINK):
         self.start(cwd)
         return self.pre(cwd, command), self.report_rules()
-
-    def touch_both_roots(self):
-        self.change(PROJ, MADE_TEST, SIZE_TEST)
-        self.change(PROJ, MADE_NOTES, FLAGGED)
-        self.change(BARE, "notes.txt", CLEAN)
 
     def patch(self, files):
         body = "".join(f"*** Add File: {name}\n+{content}" for name, content in files.items())
@@ -126,32 +119,11 @@ class LinkedCwdWrites(AfterRunCase):
         """Feed input, check the return value."""
         self.assertEqual(self.named_shell(f"printf 'We utilize this tool for the build.\\n' > {self.project(NOTES)}"), FLAGGED_WRITE)
 
-    def test_opaque_shell_write_into_the_project_is_caught_after_the_run(self):
-        """The test fails when a real bug enters the code it exercises."""
-        made = lambda: self.change(PROJ, "docs/made.md", FLAGGED)
-        self.assertEqual(self.after_run(BARE_LINK, OPAQUE, made, before=identity(TEST_WRITER)), BLOCK)
-
-    def test_opaque_shell_finding_is_kept_at_stop(self):
-        """Act, then check the state of the system under test or its collaborators through the public API."""
-        self.after_run(BARE_LINK, OPAQUE, lambda: self.change(PROJ, "docs/made.md", FLAGGED), before=identity(TEST_WRITER))
-        self.assertEqual(self.stop(BARE_LINK), BLOCK)
-
     def test_opaque_shell_finding_is_released_at_stop_once_repaired(self):
         """Act, then check the state of the system under test or its collaborators through the public API."""
         self.after_run(BARE_LINK, OPAQUE, lambda: self.change(PROJ, "docs/made.md", FLAGGED), before=identity(TEST_WRITER))
         self.change(PROJ, "docs/made.md", CLEAN)
         self.assertIsNone(self.stop(BARE_LINK))
-
-    def test_one_opaque_command_across_both_roots_is_caught_in_the_project_it_left(self):
-        """The test fails when a real bug enters the code it exercises."""
-        verdict = self.after_run(BARE_LINK, OPAQUE, self.touch_both_roots)
-        observed = (verdict, self.finding_paths(GATE, PROJ), self.finding_paths("utilize", PROJ))
-        self.assertEqual(observed, (BLOCK, [MADE_TEST], [MADE_NOTES]))
-
-    def test_findings_of_one_opaque_command_across_both_roots_are_kept_at_stop(self):
-        """Act, then check the state of the system under test or its collaborators through the public API."""
-        self.after_run(BARE_LINK, OPAQUE, self.touch_both_roots)
-        self.assertEqual(self.stop(BARE_LINK), BLOCK)
 
     def test_write_of_a_helper_under_a_nested_package_marker_is_refused(self):
         """The test fails when a real bug enters the code it exercises."""

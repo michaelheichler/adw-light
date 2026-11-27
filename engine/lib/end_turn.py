@@ -54,11 +54,11 @@ def _batch_findings(
 
 def _remaining_reason(session_id: str, agent_id: str, root) -> str:
     pending, _paths, _revision = blocker_state.details(session_id, agent_id, root)
-    return "\n".join(dict.fromkeys(reason for key, reason in pending.items() if key != blocker_state.AFTER_RUN_KEY))
+    return "\n".join(dict.fromkeys(pending.values()))
 
 
 def _residual_reasons(pending: dict[str, str], paths: list[str]) -> list[str]:
-    resolved = set(paths) | {blocker_state.BATCH_KEY, blocker_state.AFTER_RUN_KEY}
+    resolved = set(paths) | {blocker_state.BATCH_KEY}
     return [value for key, value in pending.items() if key not in resolved]
 
 

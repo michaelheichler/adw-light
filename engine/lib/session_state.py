@@ -25,6 +25,7 @@ SESSION_LEASE_DIRNAME = "session-leases"
 SESSION_LEASE_SUFFIX = ".lease.json"
 SESSION_LEASE_TTL_SECONDS = 900
 EXPLAINED_KEY = "explained_rules"
+RETIRED_KEYS = frozenset({"after_run", "commit_scan_receipts", "nested_repos"})
 
 
 def plugin_data_home() -> Path:
@@ -90,9 +91,13 @@ def read_state(
         return {}
 
 
+def _current(state: dict) -> dict:
+    return {key: value for key, value in state.items() if key not in RETIRED_KEYS}
+
+
 def _parsed_or_empty(path: Path) -> dict:
     try:
-        return state_recovery.parsed(path)
+        return _current(state_recovery.parsed(path))
     except FileNotFoundError:
         return {}
 
@@ -105,7 +110,7 @@ def _read_held(directory: Path) -> dict:
         recovered = state_recovery.restored(path)
         if recovered is None:
             raise
-        return recovered
+        return _current(recovered)
 
 
 def _read_held_or_empty(directory: Path) -> dict:

@@ -2,19 +2,17 @@ import json
 import unittest
 from unittest import mock
 
-from after_run_home import CAUGHT, LET_THROUGH, AfterRunCase, Project, project_files
+from after_run_home import LET_THROUGH, AfterRunCase, Project, project_files
 from lib import temp_authorship
 
 
 REPO = "repo"
 DENY = "deny"
 WIRING = "watcher_wiring_removal"
-PROSE_RULE = "utilize"
 NOTES = "docs/long.md"
 PLAIN_TARGET = "docs/out.txt"
 TEST_TARGET = "tests/test_out.py"
 CLEAN_LONG = "The build keeps the release notes short so the reader can follow each step of the release and its checks in order."
-FLAGGED = "We utilize this tool for the build."
 LONG_PRINTF = "printf '%s %s\\n' '" + CLEAN_LONG + "' \"$EXTRA\" > " + NOTES
 CAP = 3
 FIRST_BATCH = tuple(f"scratch/first_{number}.txt" for number in range(CAP + 2))
@@ -103,12 +101,6 @@ class DroppedShellWriteRefusals(DroppedRefusalHome):
     def test_long_printf_into_a_markdown_file_passes_before_the_run(self):
         """Feed input, check the return value."""
         self.assertEqual(self.first_seen(LONG_PRINTF), LET_THROUGH)
-
-    def test_prose_a_long_printf_wrote_is_scanned_after_the_run(self):
-        """The test fails when a real bug enters the code it exercises."""
-        written = lambda: self.change(REPO, NOTES, CLEAN_LONG + " " + FLAGGED + "\n")
-        verdict = self.after_run(REPO, LONG_PRINTF, written)
-        self.assertEqual((verdict, self.blocked_rules()), (CAUGHT, [PROSE_RULE]))
 
     def test_base64_decode_into_a_test_file_still_blocks(self):
         """The test fails when a real bug enters the code it exercises."""

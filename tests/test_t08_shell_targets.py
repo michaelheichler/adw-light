@@ -4,9 +4,9 @@ from unittest import mock
 
 from adw_light import run_hook
 from after_run_home import (
-    CAUGHT, CLAUDE, CODEX, DENY, GATE, LET_THROUGH, OLD_TEST, AfterRunCase, Project, project_files,
+    CLAUDE, DENY, LET_THROUGH, OLD_TEST, AfterRunCase, Project, project_files,
 )
-from fake_repo_home import PLAIN_MODULE, SIZE_TEST
+from fake_repo_home import PLAIN_MODULE
 
 
 REPO = "repo"
@@ -28,47 +28,17 @@ class ShellTargetCase(AfterRunCase):
         SCRATCH: Project({"a.py": PLAIN_MODULE}, git=False),
     }
 
-    def edit_old_test(self, kind):
-        return lambda: self.change(REPO, OLD_TEST, SIZE_TEST + "X = " + repr(kind) + "\n")
-
     def decisions(self, commands):
         self.start(REPO)
         return {name: self.pre(REPO, command, call=name) for name, command in commands.items()}
 
 
-class OpaqueWritesAreJudgedAfterTheRun(ShellTargetCase):
-    def claude_steps(self, kind):
-        self.start(REPO, run=kind)
-        decision, batched, _ = self.pair(REPO, OPAQUE_WRITES[kind], self.edit_old_test(kind), run=kind)
-        return decision, batched, self.stop(REPO, run=kind)
+class OpaqueWritesBeforeTheRun(ShellTargetCase):
 
-    def codex_steps(self, kind):
-        self.start(REPO, CODEX, run=kind)
-        decision, posted, _ = self.pair(REPO, OPAQUE_WRITES[kind], self.edit_old_test(kind), host=CODEX, run=kind)
-        return decision, posted, self.stop(REPO, CODEX, run=kind)
-
-    def blocked_paths(self, kind):
-        self.shell(REPO, OPAQUE_WRITES[kind], self.edit_old_test(kind), run=kind)
-        return self.finding_paths(GATE, REPO, run=kind)
 
     def test_unknown_mktemp_and_bash_c_writes_pass_before_the_run(self):
         """Feed input, check the return value."""
         self.assertEqual(self.decisions(OPAQUE_WRITES), dict.fromkeys(OPAQUE_WRITES, LET_THROUGH))
-
-    def test_claude_batch_and_stop_block_a_test_change_by_an_opaque_write(self):
-        """The test fails when a real bug enters the code it exercises."""
-        verdicts = {kind: self.claude_steps(kind) for kind in OPAQUE_WRITES}
-        self.assertEqual(verdicts, dict.fromkeys(OPAQUE_WRITES, (LET_THROUGH, CAUGHT, CAUGHT)))
-
-    def test_codex_post_tool_use_and_stop_block_a_test_change_by_an_opaque_write(self):
-        """The test fails when a real bug enters the code it exercises."""
-        verdicts = {kind: self.codex_steps(kind) for kind in OPAQUE_WRITES}
-        self.assertEqual(verdicts, dict.fromkeys(OPAQUE_WRITES, (LET_THROUGH, CAUGHT, CAUGHT)))
-
-    def test_the_after_run_block_names_the_changed_test_path(self):
-        """Act, then check the state of the system under test or its collaborators through the public API."""
-        paths = {kind: self.blocked_paths(kind) for kind in OPAQUE_WRITES}
-        self.assertEqual(paths, dict.fromkeys(OPAQUE_WRITES, [OLD_TEST]))
 
     def test_unknown_delete_that_also_names_a_test_is_refused_before_the_run(self):
         """The test fails when a real bug enters the code it exercises."""

@@ -1,7 +1,6 @@
-from fake_repo_home import DENY, OLD_TEST, PASSED, PLAIN_MODULE, REFUSED, SIZE_TEST, FakeRepoCase, Repo
+from fake_repo_home import OLD_TEST, PASSED, PLAIN_MODULE, REFUSED, SIZE_TEST, FakeRepoCase, Repo
 import unittest
 
-from after_run_home import CAUGHT, LET_THROUGH, AfterRunCase, Project, project_files
 
 
 TRACKED = "tracked"
@@ -256,31 +255,7 @@ class WritingGitAfterAnUnknownMinusCFolderIsRefused(ReplayHome):
         self.assertEqual(self.bash(TRACKED, LOOPED_REMOVAL), REFUSED)
 
 
-AFTER_RUN = "after-run"
 AWK_TARGET = "tests/x"
-AFTER_RUN_SHAPES = {
-    "awk": "awk '{print > \"" + AWK_TARGET + "\"}' src/app.py",
-    "sed": "git ls-files | xargs sed -i s/2]/3]/",
-    "rg": "git ls-files | xargs rg --pre rm needle",
-}
-
-
-class ReplayedBypassShapesAreCaughtAfterTheRun(AfterRunCase):
-    projects = {AFTER_RUN: Project(project_files({"src/app.py": PLAIN_MODULE}))}
-
-    def effect(self, kind):
-        return {
-            "awk": lambda: self.change(AFTER_RUN, AWK_TARGET, PLAIN_MODULE),
-            "sed": lambda: self.change(AFTER_RUN, OLD_TEST, SIZE_TEST.replace("2]", "3]")),
-            "rg": lambda: self.remove(AFTER_RUN, OLD_TEST),
-        }[kind]
-
-    def verdicts(self):
-        return {kind: self.shell(AFTER_RUN, command, self.effect(kind), run=kind) for kind, command in AFTER_RUN_SHAPES.items()}
-
-    def test_awk_redirect_and_xargs_test_changes_pass_before_the_run_and_block_after_it(self):
-        """Use a parameterized test for several inputs."""
-        self.assertEqual(self.verdicts(), dict.fromkeys(AFTER_RUN_SHAPES, (LET_THROUGH, CAUGHT)))
 
 
 if __name__ == "__main__":

@@ -23,8 +23,6 @@ EVENTS = {
 }
 
 
-AFTER_RUN_MODULES = frozenset({"record", "batch"})
-
 
 def _deadline(started_at: float) -> float:
     return import_module("lib.stop_scan").deadline(started_at)
@@ -74,14 +72,7 @@ def run(
     handler = module.run
     if event == "SessionStart":
         return handler(payload, settings, drift=lambda: "")
-    if module_name in AFTER_RUN_MODULES:
-        result = handler(payload, settings, until=_deadline(started_at))
-    else:
-        result = handler(payload, settings)
-    if event == "PostToolUseFailure" and payload.get("tool_name") == "Bash":
-        import_module("lib.after_run").post(payload, settings, event, until=_deadline(started_at))
-    if result.pop("_after_run_block", False):
-        return result
+    result = handler(payload, settings)
     if event == "PostToolBatch":
         return module.cli_response(result)
     if event == "PreToolUse":

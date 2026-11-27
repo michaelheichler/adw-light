@@ -98,10 +98,7 @@ def _dispatch(payload: dict, config: dict | None, gates: Gates) -> dict:
     if name in DIRECT_WRITERS:
         return gates.write(payload, config)
     if name == "Bash":
-        result = _merge([gates.bash(payload, config), gates.commit(payload, config)])
-        if not _is_denial(result):
-            import_module("lib.after_run").pre(payload, config)
-        return result
+        return _merge([gates.bash(payload, config), gates.commit(payload, config)])
     if name in PYTHON_TOOLS:
         return gates.python(payload, config)
     if name.startswith("mcp__"):
@@ -111,11 +108,6 @@ def _dispatch(payload: dict, config: dict | None, gates: Gates) -> dict:
 
 def run(payload: dict, config: dict | None = None, *, gates: Gates = Gates()) -> dict:
     try:
-        if isinstance(payload, dict) and payloads.tool_name(payload) in {"Write", "Bash"}:
-            from lib import after_run_config
-
-            with after_run_config.restore_scope(payload, config):
-                return _dispatch(payload, config, gates)
         return _dispatch(payload, config, gates)
     except Exception as exc:
         return deny(config_failure("tool call", exc, payloads.cwd(payload)))

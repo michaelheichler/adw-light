@@ -5,7 +5,7 @@ import unittest
 from typing import NamedTuple
 
 from after_commit_home import CLEAN_MESSAGE, CLEAN_TEXT, FLAGGED_MESSAGE, FLAGGED_TEXT, NOTES, AfterCommitCase, commit_project
-from after_run_home import CAUGHT, LET_THROUGH, Project
+from after_run_home import LET_THROUGH, Project
 from fake_repo_home import Repo, repo_state
 from in_memory_hook import ALLOWED, DENY, PASSED, PRINCIPLE, TEST_WRITER, InMemoryHookCase
 from lib.git_port import FakeGitView
@@ -190,16 +190,6 @@ class CommitIntoAFolderMadeInTheSameCommand(AfterCommitCase):
         """Feed input, check the return value."""
         self.assertEqual(self.before_the_run(CLEAN_COMMIT), LET_THROUGH)
 
-    def test_flagged_first_commit_message_is_caught_after_the_run(self):
-        """The test fails when a real bug enters the code it exercises."""
-        effect = self.committed({NOTES: CLEAN_TEXT}, FLAGGED_MESSAGE)
-        self.assertEqual(self.run_and_stop(REPO, CLEAN_COMMIT, effect), (LET_THROUGH, CAUGHT, CAUGHT))
-
-    def test_flagged_file_in_the_first_commit_is_caught_after_the_run(self):
-        """The test fails when a real bug enters the code it exercises."""
-        effect = self.committed({NOTES: FLAGGED_TEXT}, CLEAN_MESSAGE)
-        self.assertEqual(self.run_and_stop(REPO, CLEAN_COMMIT, effect), (LET_THROUGH, CAUGHT, CAUGHT))
-
     def test_clean_first_commit_releases_after_the_run(self):
         """Feed input, check the return value."""
         effect = self.committed({NOTES: CLEAN_TEXT}, CLEAN_MESSAGE)
@@ -319,16 +309,6 @@ class CommitsIntoNewReposUnderSkippedFolders(AfterCommitCase):
         """Use a parameterized test for several inputs."""
         decisions = [self.before_the_run(form, CLEAN_MESSAGE) for form in NESTED_FORMS]
         self.assertEqual(decisions, [LET_THROUGH] * len(NESTED_FORMS))
-
-    def test_flagged_message_of_a_new_nested_repo_is_caught_after_the_run(self):
-        """The test fails when a real bug enters the code it exercises."""
-        outcomes = [self.outcome(form, {NOTES: CLEAN_TEXT}, FLAGGED_MESSAGE) for form in NESTED_FORMS]
-        self.assertEqual(outcomes, [(LET_THROUGH, CAUGHT, CAUGHT)] * len(NESTED_FORMS))
-
-    def test_flagged_file_in_a_new_nested_repo_is_caught_after_the_run(self):
-        """The test fails when a real bug enters the code it exercises."""
-        outcomes = [self.outcome(form, {NOTES: FLAGGED_TEXT}, CLEAN_MESSAGE) for form in NESTED_FORMS]
-        self.assertEqual(outcomes, [(LET_THROUGH, CAUGHT, CAUGHT)] * len(NESTED_FORMS))
 
     def test_clean_first_commit_of_a_new_nested_repo_releases_after_the_run(self):
         """Feed input, check the return value."""

@@ -1,7 +1,7 @@
 import unittest
 
 from after_run_home import (
-    CAUGHT, LET_THROUGH, OLD_TEST, TEST_WRITER, AfterRunCase, Project, identity, project_files,
+    LET_THROUGH, OLD_TEST, TEST_WRITER, AfterRunCase, Project, identity, project_files,
 )
 from fake_repo_home import SIZE_TEST
 
@@ -29,10 +29,6 @@ class StatWalkOutsideGit(AfterRunCase):
 
     def verdicts(self, before=None):
         return {kind: self.after_run(LOOSE, HIDDEN_WRITE, self.effect(kind), before=before, run=kind) for kind in CHANGES}
-
-    def test_main_agent_test_changes_outside_git_are_caught_after_the_run(self):
-        """Use a parameterized test for several inputs."""
-        self.assertEqual(self.verdicts(), dict.fromkeys(CHANGES, CAUGHT))
 
     def test_test_writer_changes_outside_git_pass(self):
         """The test fails when a real bug enters the code it exercises."""

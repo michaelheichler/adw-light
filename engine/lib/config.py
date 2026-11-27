@@ -85,7 +85,6 @@ DEFAULTS = {
     "baseline": "report",
     "gates": {},
     "rule_gates": {
-        "after_run_deferred": "enforce",
         "apology_comment": "observe",
         "dead_metaphor": "observe",
         "ai_tell": "observe",

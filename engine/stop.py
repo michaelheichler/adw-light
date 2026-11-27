@@ -23,18 +23,15 @@ class _StopTurn(NamedTuple):
     payload: dict
     cfg: dict
     until: float
-    config: dict | None
 
 
 def _verdict(turn: _StopTurn, turn_id: str) -> dict:
-    from lib import after_run_stop
-    payload, cfg, until, config = turn
-    after_run_reason, after_run_notice = after_run_stop.stop(payload, cfg, until, config=config)
+    payload, cfg, until = turn
     scan_paths = stop_scan.ScanPaths.from_cwd(payloads.cwd(payload))
     outcome, foreign = turn_outcome(payload, cfg, turn_id, until=until, scan_paths=scan_paths)
     recovered = session_state.take_recovery_notice(payloads.session_id(payload), cfg.get("state_root"))
-    own = join_notices(recovered, outcome.notice, after_run_notice)
-    reason = join_notices(outcome.reason, foreign.reason, after_run_reason)
+    own = join_notices(recovered, outcome.notice)
+    reason = join_notices(outcome.reason, foreign.reason)
     if reason:
         return {**stop_block(reason), **(system_message(own) if own else {})}
     if host.is_codex_host():
@@ -67,7 +64,7 @@ def _run(payload: dict, config: dict | None, until: float) -> dict:
     return run_with_ledger(
         hook="stop",
         payload=payload,
-        gate=_gate(_StopTurn(payload, cfg, until, config)),
+        gate=_gate(_StopTurn(payload, cfg, until)),
         ledger_root=cfg.get("ledger_root"),
         state_root=cfg.get("state_root"),
     )
