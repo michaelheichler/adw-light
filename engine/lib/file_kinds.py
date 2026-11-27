@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from pathlib import PurePath
 
 try:
-    from . import scan_input
+    from . import office_text, scan_input
     from .markup import (
         CONFIG_EXTS,
         MIXED_LANGUAGE_EXTS,
@@ -12,6 +13,7 @@ try:
         is_json_lines,
     )
 except ImportError:
+    import office_text
     import scan_input
     from markup import (
         CONFIG_EXTS,
@@ -28,16 +30,27 @@ CONFIG_BASENAMES = frozenset({
 })
 
 
-def _is_prose(path: str, text: str | None = None) -> bool:
+class ProseBasis(StrEnum):
+    SUFFIX = "suffix"
+    CONTENT = "content"
+
+
+def _prose_basis(path: str, text: str | None = None) -> ProseBasis | None:
     if text and text.startswith("#!"):
-        return False
+        return None
     lowered = path.lower()
-    if any(lowered.endswith(ext) for ext in PROSE_EXTS):
-        return True
     pure = PurePath(path)
+    path_is_extracted_document = pure.suffix.lower() in office_text.DOCUMENT_SUFFIXES
+    if path_is_extracted_document or any(lowered.endswith(ext) for ext in PROSE_EXTS):
+        return ProseBasis.SUFFIX
     if text is None or pure.name in CONFIG_BASENAMES or _is_config(path):
-        return False
-    return pure.suffix.lower() not in scan_input.TEXT_SUFFIXES - {"", ".out", ".log"} and _sniff_prose(text)
+        return None
+    suffix_allows_guess = pure.suffix.lower() not in scan_input.TEXT_SUFFIXES - {"", ".out", ".log"}
+    return ProseBasis.CONTENT if suffix_allows_guess and _sniff_prose(text) else None
+
+
+def _is_prose(path: str, text: str | None = None) -> bool:
+    return _prose_basis(path, text) is not None
 
 
 def _is_config(path: str) -> bool:

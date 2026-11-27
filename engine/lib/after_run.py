@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 try:
-    from . import after_commit, after_run_config, agent_types, blocker_state, host, ignored_configs, nested_repos
+    from . import after_commit, after_run_config, after_run_state, agent_types, blocker_state, host, ignored_configs, nested_repos
     from . import payloads, reporting, session_state, shell_snapshot, tests_policy
     from .commit_test_changes import known_target
     from .config import effective_hook_config, payload_hook_config, resolve_outcome
@@ -15,10 +15,11 @@ try:
     from .after_run_snapshot import (
         Prefetched, advance_snapshot, capture_roots, close_turn_roots, compare_snapshot, content_rows,
         direct_comparison, extend_snapshots, legacy_clean_path, nested_locations, new_commit_snapshots, prefetch, project_locations,
-        prune_sources, record_call, root_snapshot, shared_worktree_heads, snapshots, turn_snapshots,
+        prune_sources, record_call, root_snapshot, shared_worktree_heads, snapshots, turn_snapshots, unchanged_root,
+        writer_explained,
     )
 except ImportError:
-    import after_commit, after_run_config, agent_types, blocker_state, host, ignored_configs, nested_repos
+    import after_commit, after_run_config, after_run_state, agent_types, blocker_state, host, ignored_configs, nested_repos
     import payloads, reporting, session_state, shell_snapshot, tests_policy
     from commit_test_changes import known_target
     from config import effective_hook_config, payload_hook_config, resolve_outcome
@@ -26,10 +27,11 @@ except ImportError:
     from after_run_snapshot import (
         Prefetched, advance_snapshot, capture_roots, close_turn_roots, compare_snapshot, content_rows,
         direct_comparison, extend_snapshots, legacy_clean_path, nested_locations, new_commit_snapshots, prefetch, project_locations,
-        prune_sources, record_call, root_snapshot, shared_worktree_heads, snapshots, turn_snapshots,
+        prune_sources, record_call, root_snapshot, shared_worktree_heads, snapshots, turn_snapshots, unchanged_root,
+        writer_explained,
     )
 
-STATE = "after_run"
+STATE = after_run_state.STATE
 BLOCKER = blocker_state.AFTER_RUN_KEY
 LIVE_BLOCK = "_after_run_block"
 MAX_CALLS = 100
@@ -91,14 +93,11 @@ def _ledger(hook: Hook, findings: list[dict]) -> str:
 
 
 def _stored(hook: Hook) -> dict:
-    return session_state.read_state(hook.scope.session_id, hook.scope.root).get(STATE, {})
+    return after_run_state.stored(hook.scope.session_id, hook.scope.root)
 
 
 def _save(hook: Hook, update: Callable[[dict], dict]) -> None:
-    def mutate(state: dict) -> dict:
-        return {**state, STATE: update(state.get(STATE, {}))}
-
-    session_state.update_state_strict(hook.scope.session_id, mutate, hook.scope.root)
+    after_run_state.save(hook.scope.session_id, hook.scope.root, update)
 
 
 def _window(hook: Hook) -> bool:
@@ -203,7 +202,7 @@ class Judged:
 
 
 def _path_change(hook: Hook, compared: shell_snapshot.Comparison, raw: str, prior: dict, old: tuple,
-                 *, guard_tests: bool) -> tuple[dict, list[dict]]:
+                 *, guard_tests: bool, state: dict) -> tuple[dict, list[dict]]:
     digest, after = compared.current(raw)
     path = shell_snapshot.project_path(compared.root, raw)
     if path is None or digest == shell_snapshot.UNKNOWN:
@@ -212,7 +211,9 @@ def _path_change(hook: Hook, compared: shell_snapshot.Comparison, raw: str, prio
     if before_digest == digest:
         return prior, []
     expected = _unrestored(path, compared.root, prior.get("test"), digest, after)
-    if expected is None and not prior.get("test") and guard_tests and before_digest != shell_snapshot.UNKNOWN:
+    writer = writer_explained(state.get(STATE, {}), agent_types.known(state), compared.before["agent_id"], compared.root,
+                              path, digest, hook.until)
+    if expected is None and not prior.get("test") and guard_tests and before_digest != shell_snapshot.UNKNOWN and not writer:
         change = tests_policy.PendingChange(str(path), before, after)
         named = tests_policy.is_test_path(raw, str(compared.root))
         if named or tests_policy.touches_tests(change, str(compared.root)):
@@ -289,8 +290,11 @@ def _refreshed(hook: Hook, raw: str, prior: dict) -> dict | None:
         return None
     known = _known_before(root, path, prior.get("test"), hook.until)
     expected = _unrestored(path, root, known, digest, shell_snapshot.read_text(path))
-    if expected and not expected.get("checked_worktree") and prior.get("digest") == digest:
-        if legacy_clean_path(hook, _stored(hook), root, path, digest):
+    if expected and prior.get("digest") == digest:
+        state = after_run_state.read(hook.scope.session_id, hook.scope.root)
+        stored = state.get(STATE, {})
+        if writer_explained(stored, agent_types.known(state), hook.scope.agent_id, root, path, digest, hook.until) or (
+                not expected.get("checked_worktree") and legacy_clean_path(hook, stored, root, path, digest)):
             expected = None
     current, _ = _scan_entry(hook, path, digest, expected, root)
     if "seal" in prior:
@@ -307,12 +311,13 @@ def _restored(hook: Hook, entries: dict, changes: dict) -> dict:
 def _changes(hook: Hook, compared: shell_snapshot.Comparison, entries: dict) -> Judged:
     changes, found, deferred = {}, [], []
     guard_tests = _test_gate(hook, compared.before)
+    state = after_run_state.read(hook.scope.session_id, hook.scope.root) if guard_tests else {}
     old, late = shell_snapshot.previous_sources(compared, list(compared.paths))
     late |= compared.late
 
     def judge(raw: str) -> tuple[dict, list[dict]]:
         prior = entries.get(str(compared.root / raw), {})
-        return _path_change(hook, compared, raw, prior, old[raw], guard_tests=guard_tests)
+        return _path_change(hook, compared, raw, prior, old[raw], guard_tests=guard_tests, state=state)
 
     judged = _bounded(hook, [raw for raw in compared.paths if raw not in late], judge)
     for raw in compared.paths:
@@ -490,28 +495,6 @@ def _store_work(hook: Hook, agent: str, deferred: dict, *, stop: bool, held: dic
     _save(hook, store)
 
 
-def _stop_work(hook: Hook, data: dict) -> tuple[dict, str]:
-    agent = hook.scope.agent_id
-    entries = data.get("pending", {}).get(agent, {})
-    commits = after_commit.compare(hook, {}, entries, _commit_work(data, agent), stop=True)
-    pending = {key: value for key, value in (entries | commits.changes).items() if value}
-
-    def store(state: dict) -> dict:
-        work = dict(state.get(COMMIT_WORK, {}))
-        work.pop(agent, None)
-        everyone = dict(state.get("pending", {}))
-        if pending:
-            everyone[agent] = pending
-        else:
-            everyone.pop(agent, None)
-        return {**state, "pending": everyone, COMMIT_WORK: work}
-
-    _save(hook, store)
-    _publish(hook, entries, pending, agent)
-    observed = _ledger(hook, commits.found) if commits.found else ""
-    return pending, join_notices(commits.notice, observed)
-
-
 def _defer(hook: Hook, agent: str, paths: list[str]) -> None:
     if not paths:
         return
@@ -556,10 +539,16 @@ def _check_snapshots(hook: Hook, snapshots: dict[str, dict], config: dict | None
     shared_heads = shared_worktree_heads(fetched) if multiple else {}
     notices = []
     exempt_roots, complete_roots = set(), set()
+    data = _stored(hook) if stop and multiple else {}
+    held = {entry["root"] for entry in data.get("pending", {}).get(hook.scope.agent_id, {}).values()}
+    held |= _commit_work(data, hook.scope.agent_id).keys()
     for root, snapshot in snapshots.items():
         scoped = _snapshot_hook(hook, snapshot, config)
         if _window(scoped) or (not stop and snapshot["exempt"]):
             exempt_roots.add(root)
+        if stop and multiple and unchanged_root(snapshot, fetched[root], root in held):
+            complete_roots.add(root)
+            continue
         try:
             pending, notice, complete = _check(scoped, _stored(hook), snapshot, stop=stop, multiple=multiple,
                                                fetched=fetched[root], other_heads=shared_heads.get(root))
@@ -638,59 +627,6 @@ def batch_reason(payload: dict, cfg: dict, until: float | None = None) -> str:
     return _publish(hook, pending, pending, hook.scope.agent_id)
 
 
-def _stop_scope(hook: Hook, data: dict, config: dict | None) -> tuple[dict, str]:
-    agent = hook.scope.agent_id
-    snapshots = turn_snapshots(data, agent)
-    if snapshots:
-        return _check_snapshots(hook, snapshots, config, stop=True)
-    if _commit_work(data, agent):
-        try:
-            return _stop_work(hook, data)
-        except (OSError, ValueError, RuntimeError) as error:
-            hook.timing(_snapshot_rule(error))
-    entries = data.get("pending", {}).get(agent, {})
-    return _recheck_pending(hook, entries), ""
-
-
-def _stop_hooks(hook: Hook, data: dict) -> list[Hook]:
-    if hook.scope.agent_id:
-        return [hook]
-    actors = data.get("turns", {}).keys() | data.get("pending", {}).keys()
-    actors |= data.get(COMMIT_WORK, {}).keys()
-    return [hook, *(Hook({**hook.payload, "agent_id": agent}, hook.cfg, time.monotonic(), hook.event, hook.until)
-                    for agent in sorted(actors - {""}))]
-
-
-def stop(
-    payload: dict, cfg: dict, until: float | None = None, *, config: dict | None = None,
-) -> tuple[str, str]:
-    hook = _hook(payload, cfg, "Stop", until)
-    data = _stored(hook)
-    if not data:
-        return "", ""
-    paths: dict[str, list[dict]] = {}
-    notices, entries = [], []
-    for scoped in _stop_hooks(hook, data):
-        pending, notice = _stop_scope(scoped, data if scoped == hook else _stored(scoped), config)
-        for path, entry in pending.items():
-            paths.setdefault(path, []).extend(entry["rows"])
-        entries.extend(pending.values())
-        notices.append(notice)
-    return _render_stop(hook, paths, after_commit.actions(entries)), join_notices(*dict.fromkeys(notices))
-
-
-def _render_stop(hook: Hook, paths: dict[str, list[dict]], action: str = "") -> str:
-    shown = [rows[0] for rows in paths.values()]
-    rows = [row for findings in paths.values() for row in findings]
-    if not rows:
-        return ""
-    if len(shown) == len(rows):
-        return join_notices(_render(hook, shown), action)
-    cfg = {**hook.cfg, "session_id": hook.scope.session_id}
-    reason = reporting.compact_block(shown, cfg, report_path=reporting.write_full_report(rows, cfg))[0]
-    return join_notices(reason, action)
-
-
 def note_direct_write(payload: dict, config: dict | None, *, until: float | None = None, expected: str | None = None) -> None:
     if not payloads.session_id(payload) or not payloads.tool_use_id(payload):
         return
@@ -731,12 +667,3 @@ def prime_ignored(session_id: str, cwd: str, state_root: str | None) -> None:
         return {**state, STATE: nested_repos.remember(remembered, {str(root): nested})}
 
     session_state.update_state_strict(session_id, store, state_root)
-
-
-def subagent_stop(
-    payload: dict, cfg: dict, until: float | None = None, *, config: dict | None = None,
-) -> tuple[str, str]:
-    hook = _hook(payload, cfg, "SubagentStop", until)
-    pending, notice = _stop_scope(hook, _stored(hook), config)
-    action = after_commit.actions(pending.values())
-    return _render_stop(hook, {path: entry["rows"] for path, entry in pending.items()}, action), notice

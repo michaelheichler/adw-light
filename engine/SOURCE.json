@@ -12,6 +12,8 @@
     "lib.after_run",
     "lib.after_run_config",
     "lib.after_run_snapshot",
+    "lib.after_run_state",
+    "lib.after_run_stop",
     "lib.archive_commands",
     "lib.archive_members",
     "lib.archive_targets",

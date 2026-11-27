@@ -7,6 +7,7 @@ from typing import BinaryIO
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
+DOCUMENT_SUFFIXES = frozenset({".docx", ".odt", ".pptx", ".xlsx"})
 MEMBER = re.compile(r"word/(?:document|header\d+|footer\d+|footnotes|endnotes|comments)\.xml|ppt/(?:slides/slide|notesSlides/notesSlide)\d+\.xml|xl/(?:sharedStrings|worksheets/sheet\d+)\.xml|content\.xml")
 
 

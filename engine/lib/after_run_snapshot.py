@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 try:
     from . import after_commit, baseline, git_port, ignored_configs, nested_repos, payloads, shell_snapshot
+    from . import tests_policy
     from .commit_command import GitCall, UnreadableCommit, bash_command, git_calls
     from .commit_test_changes import capture_index, moved_sources
     from .named_directories import named_directories
@@ -19,6 +20,7 @@ try:
     from .write_targets import mutation_targets
 except ImportError:
     import after_commit, baseline, git_port, ignored_configs, nested_repos, payloads, shell_snapshot
+    import tests_policy
     from lib.commit_command import GitCall, UnreadableCommit, bash_command, git_calls
     from commit_test_changes import capture_index, moved_sources
     from named_directories import named_directories
@@ -340,6 +342,19 @@ def legacy_clean_path(hook: Hook, stored: dict, root: Path, path: Path, digest: 
     return head.get(raw, (shell_snapshot.UNKNOWN, None))[0] == digest.removeprefix("link:")
 
 
+def writer_explained(stored: dict, types: dict[str, str], agent: str, root: Path, path: Path, digest: str,
+                     until: float) -> bool:
+    raw = path.relative_to(root).as_posix()
+    entry = turn_snapshots(stored, agent).get(str(root), {}).get("explained", {}).get(raw)
+    if type(entry) is not dict or types.get(str(entry.get("agent_id"))) not in tests_policy.TEST_WRITER_TYPES:
+        return False
+    mark = entry.get("mark")
+    if mark is not None:
+        return type(mark) is list and len(mark) == 2 and mark[1] == shell_snapshot.stamp(path)
+    head, _ = shell_snapshot.head_sources(root, [raw], until)
+    return head.get(raw, (shell_snapshot.UNKNOWN, None))[0] == digest.removeprefix("link:")
+
+
 def content_rows(hook: Hook, path: Path, digest: str, root: Path, base: tuple | None = None) -> list[dict]:
     if digest in {shell_snapshot.ABSENT, shell_snapshot.UNKNOWN} or digest.startswith("link:"):
         return []
@@ -474,6 +489,57 @@ def close_turn_roots(data: dict, agent: str, completed: set[str]) -> dict:
         turns.pop(agent, None)
     updated = {**data, "turns": turns}
     return {**updated, "sources": prune_sources(updated)}
+
+
+def drop_missing_roots(data: dict, actors: set[str], own: str) -> dict:
+    turns = dict(data.get("turns", {}))
+    for actor in actors & turns.keys():
+        if kept := _existing(snapshots(turns[actor])):
+            turns[actor] = {"roots": kept}
+        else:
+            turns.pop(actor)
+    calls = {call: {**record, "roots": _existing(record["roots"])} if "roots" in record and _owner(record) == own else record
+             for call, record in data.get("calls", {}).items()}
+    updated = {**data, "turns": turns, "calls": calls}
+    return {**updated, "sources": prune_sources(updated)}
+
+
+def _existing(roots: dict[str, dict]) -> dict[str, dict]:
+    return {root: snapshot for root, snapshot in roots.items() if snapshot.get("new_commit_root") or Path(root).is_dir()}
+
+
+def _owner(record: dict) -> str | None:
+    return next((snapshot.get("agent_id") for snapshot in record["roots"].values()), None)
+
+
+def missing_roots(data: dict, actors: set[str], own: str) -> bool:
+    records = [*(snapshots(data.get("turns", {}).get(actor, {})) for actor in actors),
+               *(record["roots"] for record in data.get("calls", {}).values() if "roots" in record and _owner(record) == own)]
+    return any(roots != _existing(roots) for roots in records)
+
+
+def unchanged_root(snapshot: dict, fetched: Prefetched, held: bool) -> bool:
+    if held or "cwd" not in snapshot or snapshot.get("new_repo") or snapshot.get("configs_only"):
+        return False
+    if snapshot.get("head_walk_complete") is False:
+        return False
+    try:
+        observed, current, listed = fetched.observe(), fetched.current_heads(), fetched.listing()
+    except FETCH_ERRORS:
+        return False
+    if observed is None or current is None or listed is None or not listed.complete or not current[1]:
+        return False
+    root, marks = Path(snapshot["root"]), dict(observed)
+    shell_snapshot.hidden_marks(root, listed.paths, marks)
+    shell_snapshot.config_marks(root, Path(snapshot["cwd"]), marks)
+    before, after = snapshot.get("heads", {}), current[0]
+    return marks == snapshot["marks"] and before.keys() == after.keys() and all(
+        _same_head(before[key], after[key]) for key in before)
+
+
+def _same_head(before: object, after: object) -> bool:
+    return (isinstance(before, dict) and isinstance(after, dict)
+            and before.get("head") == after.get("head") and before.get("local") == after.get("local"))
 
 
 def record_call(data: dict, agent: str, call_id: str, captured: list[tuple[dict, dict, dict | None]], limit: int) -> dict:
