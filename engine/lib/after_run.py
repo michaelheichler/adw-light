@@ -14,8 +14,8 @@ try:
     from .hookio import advise, join_notices, stop_block
     from .after_run_snapshot import (
         Prefetched, advance_snapshot, capture_roots, close_turn_roots, compare_snapshot, content_rows,
-        direct_comparison, extend_snapshots, nested_locations, new_commit_snapshots, prefetch, project_locations,
-        prune_sources, record_call, root_snapshot, snapshots, turn_snapshots,
+        direct_comparison, extend_snapshots, legacy_clean_path, nested_locations, new_commit_snapshots, prefetch, project_locations,
+        prune_sources, record_call, root_snapshot, shared_worktree_heads, snapshots, turn_snapshots,
     )
 except ImportError:
     import after_commit, after_run_config, agent_types, blocker_state, host, ignored_configs, nested_repos
@@ -25,8 +25,8 @@ except ImportError:
     from hookio import advise, join_notices, stop_block
     from after_run_snapshot import (
         Prefetched, advance_snapshot, capture_roots, close_turn_roots, compare_snapshot, content_rows,
-        direct_comparison, extend_snapshots, nested_locations, new_commit_snapshots, prefetch, project_locations,
-        prune_sources, record_call, root_snapshot, snapshots, turn_snapshots,
+        direct_comparison, extend_snapshots, legacy_clean_path, nested_locations, new_commit_snapshots, prefetch, project_locations,
+        prune_sources, record_call, root_snapshot, shared_worktree_heads, snapshots, turn_snapshots,
     )
 
 STATE = "after_run"
@@ -216,7 +216,8 @@ def _path_change(hook: Hook, compared: shell_snapshot.Comparison, raw: str, prio
         change = tests_policy.PendingChange(str(path), before, after)
         named = tests_policy.is_test_path(raw, str(compared.root))
         if named or tests_policy.touches_tests(change, str(compared.root)):
-            expected = {"digest": before_digest, "inline": not named, "before": before if not named else None}
+            expected = {"digest": before_digest, "inline": not named, "before": before if not named else None,
+                        "checked_worktree": True}
     return _scan_entry(hook, path, digest, expected, compared.root, scan=raw not in compared.tested,
                        base=compared.moved.get(raw))
 
@@ -229,7 +230,7 @@ def _late_change(hook: Hook, compared: shell_snapshot.Comparison, raw: str, prio
     deferred = raw not in compared.tested
     if prior.get("test") or not guard_tests or not tests_policy.is_test_path(raw, str(compared.root)):
         return prior, [], deferred
-    expected = {"digest": old[0], "inline": False, "before": None}
+    expected = {"digest": old[0], "inline": False, "before": None, "checked_worktree": True}
     current, found = _scan_entry(hook, path, shell_snapshot.UNKNOWN, expected, compared.root, scan=False)
     return current, found, deferred
 
@@ -288,6 +289,9 @@ def _refreshed(hook: Hook, raw: str, prior: dict) -> dict | None:
         return None
     known = _known_before(root, path, prior.get("test"), hook.until)
     expected = _unrestored(path, root, known, digest, shell_snapshot.read_text(path))
+    if expected and not expected.get("checked_worktree") and prior.get("digest") == digest:
+        if legacy_clean_path(hook, _stored(hook), root, path, digest):
+            expected = None
     current, _ = _scan_entry(hook, path, digest, expected, root)
     if "seal" in prior:
         current, _ = after_run_config.seal_entry(path, root, current, prior["seal"], digest, prior.get("seal_text"))
@@ -411,7 +415,7 @@ def _publish(hook: Hook, before: dict, pending: dict, agent: str) -> str:
 
 
 def _check(hook: Hook, data: dict, snapshot: dict, *, stop: bool, multiple: bool = False,
-           fetched: Prefetched | None = None) -> tuple[dict, str, bool]:
+           fetched: Prefetched | None = None, other_heads: list[str] | None = None) -> tuple[dict, str, bool]:
     exempt = _window(hook) or (not stop and snapshot["exempt"])
     agent = snapshot["agent_id"]
     entries = data.get("pending", {}).get(agent, {})
@@ -428,7 +432,8 @@ def _check(hook: Hook, data: dict, snapshot: dict, *, stop: bool, multiple: bool
         after_run_config.seal_changes(replace(compared, paths=windowed), entries, judged)
     guard = not exempt and (stop or not snapshot.get("replays")) and _test_gate(hook, snapshot)
     commits = after_commit.compare(hook, snapshot, entries, _commit_work(data, agent) if stop else None, stop=stop,
-                                   current_heads=fetched.current_heads() if fetched else None, guard_tests=guard)
+                                   current_heads=fetched.current_heads() if fetched else None, guard_tests=guard,
+                                   cached=data.get("sources", {}).get(snapshot["root"]), other_heads=other_heads)
     compared.before["checked_heads"] = commits.checked
     changes = {**judged.changes, **commits.changes}
     if not exempt and (stop or host.is_codex_host()):
@@ -548,6 +553,7 @@ def _check_snapshots(hook: Hook, snapshots: dict[str, dict], config: dict | None
         _save(hook, lambda state: nested_repos.remember(state, records))
     multiple = len(snapshots) > 1
     fetched = prefetch(hook, snapshots, _stored(hook), stop=stop)
+    shared_heads = shared_worktree_heads(fetched) if multiple else {}
     notices = []
     exempt_roots, complete_roots = set(), set()
     for root, snapshot in snapshots.items():
@@ -556,7 +562,7 @@ def _check_snapshots(hook: Hook, snapshots: dict[str, dict], config: dict | None
             exempt_roots.add(root)
         try:
             pending, notice, complete = _check(scoped, _stored(hook), snapshot, stop=stop, multiple=multiple,
-                                               fetched=fetched[root])
+                                               fetched=fetched[root], other_heads=shared_heads.get(root))
         except (OSError, ValueError, RuntimeError) as error:
             hook.timing(_snapshot_rule(error), root)
         else:

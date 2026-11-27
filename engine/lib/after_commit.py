@@ -8,7 +8,7 @@ from pathlib import Path
 
 try:
     from . import baseline, git_port, payloads, session_state, shell_snapshot, stop_scan
-    from .commit_test_changes import TEST, TEST_ACTION, written_test_rows
+    from .commit_test_changes import TEST, TEST_ACTION, content_digest, disk_content, holds_test_row, snapshot_sources, written_test_rows
     from .config import SURFACE_COMMIT, effective_hook_config, resolve_outcome
     from .hookio import join_notices
     from .findings import finding_row
@@ -17,7 +17,7 @@ try:
     from .scanner import file_length_findings, scan_all, scannable_text
 except ImportError:
     import baseline, git_port, payloads, session_state, shell_snapshot, stop_scan
-    from commit_test_changes import TEST, TEST_ACTION, written_test_rows
+    from commit_test_changes import TEST, TEST_ACTION, content_digest, disk_content, holds_test_row, snapshot_sources, written_test_rows
     from config import SURFACE_COMMIT, effective_hook_config, resolve_outcome
     from hookio import join_notices
     from findings import finding_row
@@ -163,21 +163,31 @@ def _read(value):
     return value
 
 
-def _scan(root, revision, hook, receipt, guard_tests: bool = False) -> list[tuple[dict, dict]]:
+def _scan(root: Path, revision: str, hook, receipt: str | None, sources: dict | None) -> list[tuple[dict, dict]]:
     git, until = git_port.view(), hook.until
     parents = _read(git.commit_parents(root, revision, until=until))
     message = _read(git.commit_message(root, revision, until=until))
     paths = _read(git.commit_paths(root, revision, until=until))
     blobs = {p: _read(git.commit_bytes(root, revision, p, until=until)) for p in paths}
-    if len(parents) <= 1 and receipt and receipt == _signature(next(iter(parents), ""), message, blobs):
-        return []
     meta = {"revision": revision, "parents": parents}
-    found = [(row, {**meta, "kind": MESSAGE}) for row in _message_rows(message, hook.cfg)]
-    if guard_tests:
-        found.extend((row, {**meta, "kind": TEST}) for row in written_test_rows(root, revision, parents, blobs, until))
+    found = _committed_test_pairs(root, revision, parents, blobs, until, sources) if sources is not None else []
+    if len(parents) <= 1 and receipt and receipt == _signature(next(iter(parents), ""), message, blobs):
+        return found
+    found.extend((row, {**meta, "kind": MESSAGE}) for row in _message_rows(message, hook.cfg))
     for path, raw in blobs.items():
         baseline.remaining(until)
         found.extend((row, {**meta, "kind": CONTENT}) for row in _file_rows(root, path, raw, parents, hook))
+    return found
+
+
+def _committed_test_pairs(root: Path, revision: str, parents: list[str], blobs: dict[str, bytes], until: float,
+                          sources: dict) -> list[tuple[dict, dict]]:
+    found = []
+    for row in written_test_rows(root, revision, parents, blobs, until, sources=sources):
+        raw = Path(row["path"]).relative_to(root).as_posix()
+        disk = disk_content(root, raw, until)
+        matches = None if disk == shell_snapshot.UNKNOWN else disk == content_digest(blobs.get(raw))
+        found.append((row, {"kind": TEST, "revision": revision, "disk_matches": matches}))
     return found
 
 
@@ -193,7 +203,8 @@ class Resolved:
 def _new_revisions(root: Path, item: dict, hook) -> tuple[list[str], bool]:
     after = _record(item.get("after")) or _read(repo_record(root, hook.until))
     before = item["before"]
-    tips = [tip for tip in (after["head"], *after["local"].values()) if tip]
+    other_heads = set(item.get("other_heads", ()))
+    tips = [tip for tip in (after["head"], *after["local"].values()) if tip and tip not in other_heads]
     since = int(before.get("since", 0)) - SKEW_SECONDS if before.get("since") else 0
     revisions = _read(git_port.view().new_commits(root, tips, before["tips"], since=since, limit=LIMIT + 1, until=hook.until))
     return revisions[:LIMIT], len(revisions) > LIMIT
@@ -209,14 +220,16 @@ def resolve(root: Path, item: dict, hook, receipt=None) -> Resolved:
             if revisions is None:
                 revisions, result.listed_over = _new_revisions(root, item, scoped)
             for revision in revisions:
-                found = _scan(root, revision, scoped, receipt, item.get("tests") is True)
+                sources = item.get("test_sources", {}) if item.get("tests") is True else None
+                found = _scan(root, revision, scoped, receipt, sources)
                 result.found.extend(row for row, _ in found)
                 result.held.extend(pair for pair in found if resolve_outcome(pair[0], scoped.cfg) == "block")
                 done += 1
     except (baseline.OutOfTime, OSError) as error:
         result.failed = not isinstance(error, baseline.OutOfTime)
         left = {"revisions": revisions[done:]} if revisions is not None else {key: item[key] for key in ("before", "after") if key in item}
-        result.rest = {**left, "config": item.get("config") or {}, "tests": item.get("tests") is True}
+        result.rest = {**left, "config": item.get("config") or {}, "tests": item.get("tests") is True,
+                       "test_sources": item.get("test_sources", {}), "other_heads": item.get("other_heads", [])}
     return result
 
 
@@ -229,7 +242,9 @@ def retry_pair(root, item: dict) -> tuple[dict, dict]:
 
 def _holds(root: Path, row: dict, meta: dict, hook) -> bool:
     git = git_port.view()
-    if meta["kind"] in {MESSAGE, TEST}:
+    if meta["kind"] == TEST:
+        return holds_test_row(root, row, meta, hook.until)
+    if meta["kind"] == MESSAGE:
         return _read(git.commit_reachable(root, meta["revision"], until=hook.until))
     head = _read(git.commit_head(root, until=hook.until))
     if head == meta["revision"]:
@@ -332,7 +347,8 @@ def _current(root: str, current: dict, complete: bool, hook) -> tuple[bool, dict
 
 
 def compare(hook, snapshot: dict, entries: dict, work: dict | None = None, *, stop: bool = False,
-            current_heads: tuple[dict, bool] | None = None, guard_tests: bool = False) -> Compared:
+            current_heads: tuple[dict, bool] | None = None, guard_tests: bool = False,
+            cached: dict | None = None, other_heads: list[str] | None = None) -> Compared:
     compared = Compared()
     for key, entry in entries.items():
         if key.startswith(PREFIX) and entry.get("commit"):
@@ -357,7 +373,9 @@ def compare(hook, snapshot: dict, entries: dict, work: dict | None = None, *, st
         if before and after and after["head"] == before["head"] and after["local"] == before["local"]:
             continue
         start = before or {"tips": [], "since": snapshot.get("since", 0)}
-        item = {"before": start, "config": config, "tests": guard_tests, **({"after": after} if after else {})}
+        sources = snapshot_sources(snapshot, cached or {}) if guard_tests and root == snapshot.get("root") else {}
+        item = {"before": start, "config": config, "tests": guard_tests, "test_sources": sources,
+                "other_heads": other_heads or [], **({"after": after} if after else {})}
         _settle_item(compared, entries, root, resolve(Path(root), item, hook, receipts.get(root)), stop=stop)
     for root, items in (work or {}).items():
         for item in items if Path(root).exists() else []:

@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 try:
-    from . import after_commit, baseline, ignored_configs, nested_repos, payloads, shell_snapshot
+    from . import after_commit, baseline, git_port, ignored_configs, nested_repos, payloads, shell_snapshot
     from .commit_command import GitCall, UnreadableCommit, bash_command, git_calls
-    from .commit_test_changes import moved_sources
+    from .commit_test_changes import capture_index, moved_sources
     from .named_directories import named_directories
     from .parallel_calls import attempted, gathered
     from .path_policy import PROJECT_MARKERS, anchored_identity, exited_project, marked_project
@@ -18,9 +18,9 @@ try:
     from .shell_write_paths import write_paths
     from .write_targets import mutation_targets
 except ImportError:
-    import after_commit, baseline, ignored_configs, nested_repos, payloads, shell_snapshot
+    import after_commit, baseline, git_port, ignored_configs, nested_repos, payloads, shell_snapshot
     from lib.commit_command import GitCall, UnreadableCommit, bash_command, git_calls
-    from commit_test_changes import moved_sources
+    from commit_test_changes import capture_index, moved_sources
     from named_directories import named_directories
     from parallel_calls import attempted, gathered
     from path_policy import PROJECT_MARKERS, anchored_identity, exited_project, marked_project
@@ -66,7 +66,7 @@ def project_locations(hook: Hook, cwd: Path) -> dict[Path, tuple[bool, bool]]:
             root, in_git = location
             locations.setdefault(root, (in_git, is_linked))
     _add_target_projects(hook, locations, paths)
-    _add_parent_repos(hook, cwd, locations)
+    _add_commit_repos(hook, cwd, locations)
     return locations
 
 
@@ -144,10 +144,15 @@ def _new_repo_snapshot(parent: dict, nested: str) -> dict:
             "discover_nested": False, "worktree_move": False, "new_repo": True, "marks": {}, "heads": {}, "explained": {}}
 
 
-def _add_parent_repos(hook: Hook, cwd: Path, locations: dict[Path, tuple[bool, bool]]) -> None:
+def _add_commit_repos(hook: Hook, cwd: Path, locations: dict[Path, tuple[bool, bool]]) -> None:
     for call in _commit_calls(hook, cwd):
-        if call.verb == "commit" and call.parent_repo is not None and not _within_walk(call.parent_repo, locations):
-            locations[call.parent_repo] = (True, True)
+        if call.verb not in {"commit", "commit-tree", "update-ref", "reset"} or call.new_folder:
+            continue
+        if call.parent_repo is None and _within_walk(call.cwd.resolve(), locations):
+            continue
+        root = call.repo()
+        if root is not None:
+            locations.setdefault(root.resolve(), (True, True))
 
 
 def _commit_calls(hook: Hook, cwd: Path) -> list[GitCall]:
@@ -206,8 +211,10 @@ def compare_snapshot(hook: Hook, data: dict, snapshot: dict, *, stop: bool, exem
         return shell_snapshot.Comparison(Path(root), snapshot, {}, (), {}, until=hook.until)
     cached = data.get("sources", {}).get(root, {})
     explained = {} if stop else turn_snapshots(data, snapshot["agent_id"]).get(root, {}).get("explained", {})
-    moved = head_moves(hook, snapshot, fetched, skip=exempt or (not stop and snapshot.get("replays")))
-    return shell_snapshot.compare(snapshot, cached, explained, exempt=exempt, until=hook.until,
+    current = fetched.current_heads() if fetched else None
+    previous = _previous_head(snapshot, current)
+    moved = head_moves(hook, snapshot, current, skip=exempt or (not stop and snapshot.get("replays")))
+    return shell_snapshot.compare({**snapshot, "previous_head": previous}, cached, explained, exempt=exempt, until=hook.until,
                                   capture=exempt or blamed, record=data.get("ignored", {}).get(root), refresh=stop,
                                   observe=fetched.observe if fetched else None,
                                   refreshed=fetched.listing() if fetched else None,
@@ -298,11 +305,39 @@ def prefetch(hook: Hook, roots: dict[str, dict], stored: dict, *, stop: bool) ->
     return {root: Prefetched(*results[3 * index:3 * index + 3]) for index, root in enumerate(roots)}
 
 
+def shared_worktree_heads(fetched: dict[str, Prefetched]) -> dict[str, list[str]]:
+    current = {root: head_results.heads[0].get(root) for root, head_results in fetched.items()
+               if isinstance(head_results.heads, tuple) and head_results.heads[0].get(root)}
+    heads = {root: record["head"] for root, record in current.items() if record["head"]}
+    shared = {}
+    for root, record in current.items():
+        tips = set(record["local"].values()) - {record["head"]}
+        candidates = {sibling: head for sibling, head in heads.items() if head in tips}
+        if candidates and (common := git_port.view().common_dir(Path(root))) is not None:
+            shared[root] = [head for sibling, head in candidates.items()
+                            if git_port.view().common_dir(Path(sibling)) == common]
+    return shared
+
+
 def _refreshed_listing(snapshot: dict, stored: dict, until: float, stop: bool) -> ignored_configs.Listing | None:
     if not stop or "cwd" not in snapshot:
         return None
     record = stored.get("ignored", {}).get(snapshot["root"])
     return shell_snapshot.ignored_listing(Path(snapshot["root"]), snapshot["git"], record, until, refresh=True)
+
+
+def legacy_clean_path(hook: Hook, stored: dict, root: Path, path: Path, digest: str) -> bool:
+    snapshot = turn_snapshots(stored, hook.scope.agent_id).get(str(root), {})
+    windows = snapshot.get("windows", [])
+    mark = shell_snapshot.stamp(path)
+    if not mark or not windows or snapshot.get("background"):
+        return False
+    changed_at = mark[3]
+    if changed_at >= windows[-1][0] or any(start <= changed_at <= end for start, end in windows):
+        return False
+    raw = path.relative_to(root).as_posix()
+    head, _ = shell_snapshot.head_sources(root, [raw], hook.until)
+    return head.get(raw, (shell_snapshot.UNKNOWN, None))[0] == digest.removeprefix("link:")
 
 
 def content_rows(hook: Hook, path: Path, digest: str, root: Path, base: tuple | None = None) -> list[dict]:
@@ -328,10 +363,17 @@ def _moved_rows(hook: Hook, path: Path, root: Path, before: str | None) -> list[
     return after_commit.rows_against(root, path.relative_to(root).as_posix(), raw, lambda: [before], hook)
 
 
-def head_moves(hook: Hook, snapshot: dict, fetched: Prefetched | None, *, skip: bool) -> dict:
-    if skip or not snapshot.get("git") or fetched is None:
+def _previous_head(snapshot: dict, current: tuple[dict, bool] | None) -> str | None:
+    root = snapshot["root"]
+    before = snapshot.get("heads", {}).get(root)
+    after = current[0].get(root) if current else None
+    return before["head"] if before and after and before["head"] != after["head"] else None
+
+
+def head_moves(hook: Hook, snapshot: dict, current: tuple[dict, bool] | None, *, skip: bool) -> dict:
+    if skip or not snapshot.get("git") or current is None:
         return {}
-    return moved_sources(Path(snapshot["root"]), snapshot, fetched.current_heads(), hook.until, after_commit.SKEW_SECONDS)
+    return moved_sources(Path(snapshot["root"]), snapshot, current, hook.until, after_commit.SKEW_SECONDS)
 
 
 def _current_heads(snapshot: dict, until: float) -> tuple[dict, bool] | None:
@@ -381,6 +423,8 @@ def capture_root(hook: Hook, stored: dict, snapshot: dict) -> tuple[dict, dict, 
     shell_snapshot.config_marks(root, Path(snapshot["cwd"]), marks)
     snapshot.update(unsearched=unsearched, marks=marks, since=since)
     snapshot["heads"], snapshot["head_walk_complete"] = heads
+    if in_git and not snapshot["exempt"]:
+        snapshot["test_index"] = capture_index(root, marks)
     cached = stored.get("sources", {}).get(str(root), {})
     try:
         return snapshot, shell_snapshot.capture_sources(root, marks, cached, until), listed.record
@@ -404,8 +448,8 @@ def advance_snapshot(snapshot: dict, compared: shell_snapshot.Comparison, call_i
             marks[raw] = mark
         if call_id:
             explained[raw] = {"mark": mark, "tool_use_id": call_id, "agent_id": compared.before["agent_id"], "at_ns": now}
-    return {**snapshot, "marks": marks, "explained": explained,
-            "heads": {**snapshot.get("heads", {}), **compared.before.get("checked_heads", {})}}
+    heads = {**snapshot.get("heads", {}), **compared.before.get("checked_heads", {})}
+    return {**snapshot, "marks": marks, "explained": explained, "heads": heads, "test_index": {}}
 
 
 def prune_sources(data: dict) -> dict:
