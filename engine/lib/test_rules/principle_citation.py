@@ -40,23 +40,27 @@ def _lines(text):
     return text.splitlines()
 
 
-def _line_marker(unit):
+def citation_comment_markers(path: str, language: str = "") -> tuple[str, ...]:
     try:
         from ..machine_paths import DASH_COMMENT_SUFFIXES
     except ImportError:
         from lib.machine_paths import DASH_COMMENT_SUFFIXES
 
-    suffix = Path(unit.path.lower()).suffix
+    suffix = Path(path.lower()).suffix
     if suffix in DASH_COMMENT_SUFFIXES:
         return ("--",)
     if suffix == ".php":
         return ("#", "//")
-    return ("#",) if suffix in HASH_COMMENTS or unit.language in {"ruby", "shell", "bash"} else ("//",)
+    return ("#",) if suffix in HASH_COMMENTS | SHELL_SUFFIXES or language in {"ruby", "shell", "bash"} else ("//",)
+
+
+def match_comment_citation(markers: tuple[str, ...], line: str) -> re.Match[str] | None:
+    choices = "|".join(map(re.escape, markers))
+    return re.fullmatch(f"(?:{choices})" + r"[ \t]*Principle: (.+)", line.strip())
 
 
 def verified_comment(markers, line):
-    markers = "|".join(map(re.escape, markers))
-    match = re.fullmatch(f"(?:{markers})" + r"[ \t]*Principle: (.+)", line.strip())
+    match = match_comment_citation(markers, line)
     return bool(match and _quoted(match[1]))
 
 
@@ -92,7 +96,7 @@ def broken_heads(unit, text):
 
 
 def comment_citations(unit, text):
-    return _verified_lines(Path(unit.path.lower()).suffix, _line_marker(unit), text)
+    return _verified_lines(Path(unit.path.lower()).suffix, citation_comment_markers(unit.path, unit.language), text)
 
 
 @lru_cache(maxsize=16)
@@ -177,7 +181,9 @@ def without_verified_citations(path, text, findings):
     verified = verified_citation_lines(path, text)
     return [row for row in findings if not (
         row.get("line") in verified and (row.get("end_line") or row["line"]) == row["line"]
-        and (row["rule"] in DOC_RULES if path.lower().endswith(".py") else row["family"] != "code")
+        and (row["rule"] in DOC_RULES if path.lower().endswith(".py") else (
+            row["family"] != "code" and row["rule"] != "prose_colon"
+        ))
     )]
 
 

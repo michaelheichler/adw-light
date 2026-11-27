@@ -23,6 +23,7 @@ try:
     )
     from .prose_language import ENGLISH, GERMAN
     from .scan_lines import _SourceLine
+    from .test_rules.principle_citation import citation_comment_markers, match_comment_citation
 except ImportError:
     import german_punctuation
     from comment_rules import (
@@ -42,6 +43,7 @@ except ImportError:
     )
     from prose_language import ENGLISH, GERMAN
     from scan_lines import _SourceLine
+    from test_rules.principle_citation import citation_comment_markers, match_comment_citation
 
 
 BAD_DASH_RE = re.compile("[" + "".join(chr(code_point) for code_point in (0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015)) + "]")
@@ -136,7 +138,20 @@ def _punctuation_views(path: str, scan_line: _PunctuationLine, language: str) ->
 def _punctuation_texts(path: str, views: _PunctuationLine, prose: bool) -> dict[str, str]:
     prose_part = _punctuation_prose_part(path, views.prose_dash, prose)
     semicolon = "" if _is_config(path) else URL_RE.sub("", prose_part)
-    return {"clean": views.whole, "prose": prose_part, "semicolon": semicolon, "colon": semicolon}
+    return {"clean": views.whole, "prose": prose_part, "semicolon": semicolon}
+
+
+def _colon_text(source: _SourceLine, visible: str, prose: bool, language: str, fallback: str) -> str:
+    if prose or _is_config(source.path) or ":" not in source.text or source.path.lower().endswith((".py", ".pyi")):
+        return fallback
+    citation = match_comment_citation(citation_comment_markers(source.path), source.text)
+    if citation is None:
+        return fallback
+    quote_start = citation.start(1)
+    visible = visible.lstrip()
+    if not visible.startswith(citation.string[:quote_start]):
+        return fallback
+    return URL_RE.sub("", _clean_view(visible[quote_start:], language))
 
 
 def _scan_punctuation(
@@ -145,7 +160,7 @@ def _scan_punctuation(
     rules = GERMAN_PUNCTUATION_RULES if language == GERMAN else PUNCTUATION_RULES
     texts = _punctuation_texts(source_line.path, _punctuation_views(source_line.path, scan_line, language), prose)
     if colons is not None:
-        colons.count(source_line, texts["colon"])
+        colons.count(source_line, _colon_text(source_line, scan_line.prose_dash, prose, language, texts["semicolon"]))
     rows = []
     for target, regexes, rule, detail, action in rules:
         found = _first_match(regexes, texts[target])
