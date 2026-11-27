@@ -143,7 +143,7 @@ The rules apply in every language the language layer reads. A framework table na
 
 A test of a function whose job is producing text passes only when four guards hold. First, the expected text appears nowhere in production code. Second, the test makes exactly one call under test. Third, the expected text shares most of its words with a string passed straight into that call. Fourth, that input differs from the expected text in more than punctuation and spacing. A production match or a near-copy input always blocks.
 
-ADW also counts the wording tests in each project folder at session start. While that count is above zero, the rule `wording_debt_lock` passes a test write only when it lowers the count. The write may add no more new test functions than the wording tests it removes. In such a project, first rewrite a wording test into a behavior test, or delete it when it checks only text. The lock binds every agent, and the timed test window does not open it.
+ADW counts existing wording tests at session start. The `wording_debt_lock` rule reports that debt without blocking test work. Every agent must check behavior when adding or changing assertions.
 
 ### Bad example
 

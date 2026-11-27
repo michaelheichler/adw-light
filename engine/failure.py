@@ -6,9 +6,9 @@ import time
 from dataclasses import dataclass
 from typing import TypedDict
 
-from lib import payloads, session_state, unread_guard
+from lib import payloads, session_state
 from lib.config import StorageRoots
-from lib.hookio import read_payload, stop_block, system_message, write_payload
+from lib.hookio import read_payload, system_message, write_payload
 from lib.mcp_health import (
     MAX_TIMESTAMP,
     MCP_HEALTH_KEY,
@@ -28,7 +28,6 @@ from lib.payloads import exact_string_dict
 from lib.reporting import record_decision, run_with_ledger
 
 FAILURE_EVENT = "PostToolUseFailure"
-UNREAD_FAILURE = "The unread-script check failed. Check access to the session state and project files before retrying."
 FAILURE_STREAKS_KEY = "failure_streaks"
 GUIDANCE_THRESHOLD = 3
 MCP_BASE_BACKOFF_SECONDS = 30
@@ -324,23 +323,6 @@ def _run_failure(context: FailureRunContext) -> dict:
 
 
 def run(payload: dict, config: dict | None = None, now: float | None = None) -> dict:
-    result = _checked_run(payload, config, now)
-    try:
-        notice = unread_guard.after_tool(payload, config, credit=False)
-    except Exception as exc:
-        try:
-            cwd = payloads.cwd(payload)
-            location = f" in {cwd}" if cwd else ""
-            reason = f"{UNREAD_FAILURE} Cause{location}: {exc}"
-        except Exception:
-            return stop_block(UNREAD_FAILURE)
-        return {**result, **stop_block(reason)}
-    if not notice:
-        return result
-    return {**result, **system_message(unread_guard.join_notices(result.get("systemMessage"), notice))}
-
-
-def _checked_run(payload: dict, config: dict | None, now: float | None) -> dict:
     try:
         trusted_payload = normalize_payload(payload)
         if not trusted_payload["session_id"]:

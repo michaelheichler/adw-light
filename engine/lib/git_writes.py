@@ -34,8 +34,6 @@ def worktree_rewrite(command: str, rest: list[str], directory: str) -> bool:
         return not rest or rest[0].startswith("-") or rest[0] in STASH_REWRITES
     if command == "sparse-checkout":
         return rest[:1] != ["list"]
-    if command == "worktree":
-        return rest[:1] == ["add"]
     return command in BRANCH_COMMANDS and _moves_branch(command, rest, directory)
 
 
@@ -77,11 +75,27 @@ def written_paths(command: str, rest: list[str]) -> list[str]:
 
 
 def clone_paths(rest: list[str]) -> list[str]:
-    positional = [word for word in rest if not word.startswith("-")]
+    values = {"--depth", "--branch", "-b", "--origin", "-o", "--reference", "--reference-if-able",
+              "--shallow-since", "--shallow-exclude", "--filter", "--jobs", "-j", "--config", "-c",
+              "--upload-pack", "-u", "--separate-git-dir", "--template", "--revision"}
+    positional: list[str] = []
+    locations: list[str] = []
+    operands = iter(rest)
+    for word in operands:
+        if word == "--":
+            positional.extend(operands)
+            break
+        name, separator, value = word.partition("=")
+        if name in values:
+            location = value if separator else next(operands, "")
+            if name == "--separate-git-dir" and location:
+                locations.append(location)
+        elif not word.startswith("-"):
+            positional.append(word)
     if len(positional) == 1:
-        name = os.path.basename(positional[0].rstrip("/"))
-        return [*positional, name.removesuffix(CLONE_SUFFIX)]
-    return positional
+        name = os.path.basename(positional[0].rstrip("/")).rsplit(":", 1)[-1]
+        locations.append(name.removesuffix(CLONE_SUFFIX))
+    return locations + positional[1:]
 
 
 def relocated(command: str, options: list[str]) -> bool:
@@ -91,5 +105,5 @@ def relocated(command: str, options: list[str]) -> bool:
     return any(word.startswith(RELOCATING_FLAGS) for word in options) or any(key.startswith(RELOCATING_KEYS) for key in keyed)
 
 
-def aliased(options: list[str]) -> bool:
-    return any(word == "-c" and following.lower().startswith(ALIAS_KEY) for word, following in pairwise(options))
+def aliased(options: list[str], verb: str) -> bool:
+    return any(word == "-c" and following.partition("=")[0].lower() == ALIAS_KEY + verb.lower() for word, following in pairwise(options))

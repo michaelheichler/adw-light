@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 try:
-    from .archive_commands import STDIN, home_expanded, patch_plan, stdin_source, tar_read, unzip_read
+    from .archive_commands import STDIN, absolute_tar_read, ditto_reads, home_expanded, patch_plan, stdin_source, tar_read, unzip_read
+    from .archive_members import ArchiveRead
     from .shell_parse import _bare
     from .shell_syntax import _without_redirects
     from .gated_targets import GatedTargets, NO_TARGETS, UNRESOLVED, _read_targets
 except ImportError:
-    from archive_commands import STDIN, home_expanded, patch_plan, stdin_source, tar_read, unzip_read
+    from archive_commands import STDIN, absolute_tar_read, ditto_reads, home_expanded, patch_plan, stdin_source, tar_read, unzip_read
+    from archive_members import ArchiveRead
     from shell_parse import _bare
     from shell_syntax import _without_redirects
     from gated_targets import GatedTargets, NO_TARGETS, UNRESOLVED, _read_targets
@@ -17,6 +19,7 @@ TAR_EXTRACT_FLAGS = frozenset({"--extract", "--get"})
 TAR_VERBS = frozenset({"tar", "bsdtar", "gtar"})
 ARCHIVE_VERBS = TAR_VERBS | {"unzip"}
 PAX_VERB = "pax"
+DITTO_VERB = "ditto"
 TAR_STDOUT_FLAG = "--to-stdout"
 TAR_COMMAND_FLAG = "--to-command"
 
@@ -33,6 +36,18 @@ def _archive_targets(verb: str, raw: list[str]) -> GatedTargets:
             return NO_TARGETS
         return _read_targets(tar_read(words, stdin_source(raw) or STDIN))
     return NO_TARGETS if _unzip_reads(words) else _read_targets(unzip_read(words))
+
+
+def config_archive_reads(verb: str, raw: list[str], found: ArchiveRead | None) -> list[ArchiveRead]:
+    if found is not None:
+        return [found]
+    words = [_bare(home_expanded(token)) for token in _without_redirects(raw)]
+    if verb == DITTO_VERB:
+        return ditto_reads(words)
+    if verb not in TAR_VERBS or not _tar_extracts(words) or _tar_to_stdout(words):
+        return []
+    read = absolute_tar_read(words, stdin_source(raw) or STDIN)
+    return [] if read is None else [read]
 
 
 def _pax_reads(raw: list[str]) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 try:
     from ..brace_functions import masked_code
@@ -98,8 +99,12 @@ def _chain_start(code: str, start: int, closers: dict[int, int]) -> int:
 
 
 def lexed_shapes(unit: Unit) -> tuple[Shape, ...]:
-    body = unit.body
-    code = masked_code(body, javascript=unit.language == JAVASCRIPT)
+    parse = _cached_shapes if len(unit.body) <= 4096 else _shapes
+    return parse(unit.body, unit.language == JAVASCRIPT, unit.offset)
+
+
+def _shapes(body: str, javascript: bool, offset: int) -> tuple[Shape, ...]:
+    code = masked_code(body, javascript=javascript)
     pairs = _pairs(code)
     closers = {closing: opening for opening, closing in pairs.items()}
     shapes: list[Shape] = []
@@ -113,11 +118,14 @@ def lexed_shapes(unit: Unit) -> tuple[Shape, ...]:
         start = _chain_start(code, found.start(), closers)
         name = SPACE_RE.sub("", body[start:found.end()]).replace("!", "")
         operands = tuple(
-            literal_operand(body[first:last], first + unit.offset, last + unit.offset)
+            literal_operand(body[first:last], first + offset, last + offset)
             for first, last in _argument_spans(code, body, opening, closing, pairs)
         )
-        shapes.append(Shape(Role.CALL, start + unit.offset, closing + 1 + unit.offset, name, start + unit.offset, (), operands))
+        shapes.append(Shape(Role.CALL, start + offset, closing + 1 + offset, name, start + offset, (), operands))
     return tuple(shapes)
+
+
+_cached_shapes = lru_cache(maxsize=4096)(_shapes)
 
 
 def lexed_bindings(text: str) -> tuple[Shape, ...]:

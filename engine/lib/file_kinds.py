@@ -9,6 +9,7 @@ try:
         MIXED_LANGUAGE_EXTS,
         PROSE_EXTS,
         _sniff_prose,
+        is_json_lines,
     )
 except ImportError:
     import scan_input
@@ -17,6 +18,7 @@ except ImportError:
         MIXED_LANGUAGE_EXTS,
         PROSE_EXTS,
         _sniff_prose,
+        is_json_lines,
     )
 
 
@@ -48,5 +50,7 @@ def _is_config(path: str) -> bool:
 def _code_file(path: str, text: str) -> bool:
     suffix = PurePath(path.lower()).suffix
     if scan_input.is_binary_content(path, text):
+        return False
+    if suffix == ".jsonl" and is_json_lines(text):
         return False
     return (not _is_prose(path, text) and not _is_config(path)) or suffix in MIXED_LANGUAGE_EXTS

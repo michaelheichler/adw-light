@@ -22,7 +22,7 @@ try:
     from . import families, german_punctuation, german_rules, shell_units, test_rules
     from .german_document_rules import scan_german_document
     from .prose_language import ENGLISH, GERMAN, ParagraphLanguage, allowed_languages, paragraph_languages
-    from .config import calibrated_findings, effective_config, family_enabled
+    from .config import DEFAULTS, calibrated_findings, contract_strings, effective_config, family_enabled
     from .findings import finding_row, spanning
     from .markup import (
         CONFIG_EXTS,
@@ -75,7 +75,7 @@ except ImportError:
     import test_rules
     from german_document_rules import scan_german_document
     from prose_language import ENGLISH, GERMAN, ParagraphLanguage, allowed_languages, paragraph_languages
-    from config import calibrated_findings, effective_config, family_enabled
+    from config import DEFAULTS, calibrated_findings, contract_strings, effective_config, family_enabled
     from findings import finding_row, spanning
     from markup import (
         CONFIG_EXTS,
@@ -118,6 +118,7 @@ try:
     )
     from .scan_lines import _SourceLine, _line_or_blank
     from .punctuation_scan import (
+        ColonCount,
         BAD_DASH_RE,
         DASH_BREAK_RE,
         DECADE_APOS_RE,
@@ -173,6 +174,7 @@ except ImportError:
     )
     from scan_lines import _SourceLine, _line_or_blank
     from punctuation_scan import (
+        ColonCount,
         BAD_DASH_RE,
         DASH_BREAK_RE,
         DECADE_APOS_RE,
@@ -267,7 +269,7 @@ def _python_tree(path: str, text: str) -> ast.Module | None:
         return None
     try:
         return ast.parse(text)
-    except SyntaxError:
+    except (SyntaxError, MemoryError, RecursionError):
         return None
 
 def _unconditional_findings(context: _ScanContext, comment_text: str) -> list[dict]:
@@ -370,20 +372,23 @@ def _mask_hidden_ranges(text: str, hidden_ranges: tuple[tuple[int, int], ...]) -
     return "".join(visible)
 
 
-def _scan_line_families(source_line: _SourceLine, sources: _LineSources, context: _ScanContext) -> list[dict]:
+def _scan_line_families(
+    source_line: _SourceLine, sources: _LineSources, context: _ScanContext, colons: ColonCount | None,
+) -> list[dict]:
     findings: list[dict] = []
     if "punctuation" in context.active_families:
         number = source_line.number
         scan_line = _PunctuationLine(_line_or_blank(sources.punctuation, number), _line_or_blank(sources.prose_dash, number))
         language = _line_or_blank(sources.languages, number) or ENGLISH
-        heading = _markdown_heading(context, number)
-        findings.extend(_scan_punctuation(source_line, scan_line, context.prose, language, heading))
+        if colons is not None and _markdown_heading(context, number):
+            colons = None
+        findings.extend(_scan_punctuation(source_line, scan_line, context.prose, language, colons))
     german = _line_or_blank(sources.languages, source_line.number) == GERMAN
     if "english" in context.active_families and context.prose and not german:
         scan_line = _line_or_blank(sources.english, source_line.number)
         findings.extend(_scan_english(source_line, scan_line))
     if context.code_file:
-        findings.extend(_scan_code_line(source_line, sources.comment, context.active_families))
+        findings.extend(_scan_code_line(source_line, sources.comment, context))
     return findings
 
 
@@ -393,10 +398,10 @@ def _markdown_heading(context: _ScanContext, number: int) -> bool:
     return number in heading_line_numbers(context.text)
 
 
-def _scan_code_line(source_line: _SourceLine, comment_lines: list[str], active: frozenset[str]) -> list[dict]:
+def _scan_code_line(source_line: _SourceLine, comment_lines: list[str], context: _ScanContext) -> list[dict]:
     scan_line = _line_or_blank(comment_lines, source_line.number)
-    findings = scan_comment_line(source_line.path, source_line.number, scan_line, active)
-    if "code" in active:
+    findings = scan_comment_line(source_line.path, source_line.number, scan_line, context.active_families)
+    if context.tree is None and "code" in context.active_families:
         findings.extend(_hollow_test_line_findings(source_line.path, source_line.number, scan_line))
     return findings
 
@@ -438,6 +443,7 @@ def scan_all(
     text: str,
     config: dict | None = None,
     *,
+    document: bool = True,
     hidden_ranges: tuple[tuple[int, int], ...] = (),
 ) -> list[dict]:
     if scan_input.is_binary_content(path, text):
@@ -448,16 +454,24 @@ def scan_all(
     regions = extract_regions(path, text)
     source = CommentSource(path, text, regions, PurePath(path.lower()).suffix in MIXED_LANGUAGE_EXTS)
     views = comment_views(source) if context.code_file else (comment_scan_source(source),)
-    findings = _view_findings(context, source, views[0], hidden_ranges)
+    findings = _view_findings(context, source, views[0], hidden_ranges, document)
     for view in views[1:]:
-        findings = merged_findings(findings, _view_findings(context, source, view, hidden_ranges))
+        findings = merged_findings(findings, _view_findings(context, source, view, hidden_ranges, document))
     if context.code_file and "code" in context.active_families and not _is_exempt(path, context.config):
         findings.extend([] if program_output.exempt_output(path, text) else path_findings(path, text))
     return findings
 
 
+def _colon_count(context: _ScanContext, document: bool) -> ColonCount | None:
+    if document and PurePath(context.path.lower()).suffix in MARKDOWN_EXTS:
+        return None
+    limit = context.config["prose_colon_limit"]
+    return ColonCount(limit if type(limit) is int and limit >= 0 else DEFAULTS["prose_colon_limit"])
+
+
 def _view_findings(
     context: _ScanContext, source: CommentSource, comment_source: str, hidden_ranges: tuple[tuple[int, int], ...],
+    document: bool,
 ) -> list[dict]:
     findings = _unconditional_findings(context, comment_source)
     if _is_exempt(context.path, context.config):
@@ -470,9 +484,12 @@ def _view_findings(
     sources = _line_sources(context, masked, comment_source)
     if "code" in context.active_families and context.code_file:
         findings.extend(_scan_code_file(context, comment_source))
+    colons = _colon_count(context, document)
     for number, line in enumerate(context.lines, 1):
         source_line = _SourceLine(path=context.path, number=number, text=line)
-        findings.extend(_scan_line_families(source_line, sources, context))
+        findings.extend(_scan_line_families(source_line, sources, context, colons))
+    if colons is not None:
+        findings.extend(colons.findings())
     findings.extend(_scan_document_families(context, masked, sources))
     if context.code_file:
         findings = shape_passed_removed(context.path, comment_source, context.text, findings)
@@ -484,7 +501,7 @@ def _scan_code_file(context: _ScanContext, text: str) -> list[dict]:
     lines = text.splitlines()
     findings = _function_length_findings(context)
     findings.extend(_hollow_test_findings(context, lines))
-    findings.extend(test_rules.check_file(context.path, context.text))
+    findings.extend(test_rules.check_file(context.path, context.text, contracts=contract_strings(context.config)))
     return findings
 
 

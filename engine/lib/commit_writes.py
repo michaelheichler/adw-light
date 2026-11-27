@@ -153,6 +153,8 @@ def read_only_git_metadata(words: list[str], variables: dict[str, str]) -> bool:
     if sub and not (sub == 2 and args[0] == "-C"):
         return False
     query = args[sub:]
+    if query[:1] in (["status"], ["diff"], ["log"], ["show"]):
+        return not written_paths(query[0], query[1:]) and not {"--ext-diff", "--textconv"}.intersection(query)
     if query[:1] in (["branch"], ["ls-files"]):
         return _git_query(query)
     return query in (

@@ -35,7 +35,7 @@ def owned(handler, root, legacy_only, preserve_legacy):
         script = next((word for word in args if not re.fullmatch(r"-[ISBE]+", word)), "")
         return not preserve_legacy and Path(script).name == "adw_light.py"
     path = Path(words[0])
-    return not legacy_only and path.name == "run.sh" and path.parent.name == "hooks" and (
+    return not legacy_only and path.name in {"run.sh", "adw-config"} and path.parent.name == "hooks" and (
         (root is not None and path.parent.parent == root) or adw_tree(path.parent.parent)
     )
 
@@ -99,5 +99,6 @@ def install(hooks, root, codex):
         for group in groups:
             for handler in group["hooks"]:
                 prefix = "ADW_CODEX_HOOK=1 " if codex else ""
-                handler["command"] = prefix + shlex.quote(str(root / "hooks/run.sh")) + " " + event
+                script = "adw-config" if "/hooks/adw-config" in handler["command"] else "run.sh"
+                handler["command"] = prefix + shlex.quote(str(root / "hooks" / script)) + " " + event
         hooks.setdefault(event, []).extend(groups)

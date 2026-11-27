@@ -183,5 +183,5 @@ def file_rows(path, text):
     return _set_findings(RULE_SET, unit, text)
 
 
-RULE_SET = RuleSet((Rule(REPO, "Test creates or changes a Git repository", "Pass repository input in memory.", "enforce"),
-                    Rule(TREE, "Setup writes files into a temporary directory", "Keep setup data in memory.")), check)
+RULE_SET = RuleSet((Rule(REPO, "Test creates or changes a Git repository", "Pass repository input in memory.", "off"),
+                    Rule(TREE, "Setup writes files into a temporary directory", "Keep setup data in memory.", "off")), check)

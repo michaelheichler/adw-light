@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 import re
 import subprocess
 import sys
@@ -27,6 +28,7 @@ try:
     )
     from .language_operands import OperandReader
     from .language_shapes import Outline, Role, Shape
+    from .path_policy import real_path
 except ImportError:
     import config_roots
     from language_model import (
@@ -42,6 +44,7 @@ except ImportError:
     )
     from language_operands import OperandReader
     from language_shapes import Outline, Role, Shape
+    from path_policy import real_path
 try:
     from .tree_layer_walk import (
         BODY_SUFFIXES,
@@ -161,11 +164,21 @@ GRAMMARS = {
 PYTHON_SUFFIXES = frozenset({".py", ".pyi"})
 
 
+def _fetch_timeout() -> float:
+    try:
+        seconds = float(os.environ.get("ADW_FETCH_SECONDS", ""))
+    except ValueError:
+        return FETCH_SECONDS
+    return seconds if 0 < seconds < FETCH_SECONDS else FETCH_SECONDS
+
+
+_FETCH_TIMEOUT = _fetch_timeout()
+
+
 class _Parser(Protocol):
     def parse(self, source: bytes, /) -> Any: ...
 
 
-_parsers: dict[str, tuple[_Parser | None, str]] = {}
 _logged: set[tuple[str, str, str]] = set()
 
 
@@ -187,7 +200,7 @@ class _Budget:
 
     def fetch_seconds(self) -> float:
         if self.fetch_deadline is None:
-            self.fetch_deadline = time.monotonic() + FETCH_SECONDS
+            self.fetch_deadline = time.monotonic() + _FETCH_TIMEOUT
         return max(0.0, self.fetch_deadline - time.monotonic())
 
 
@@ -219,30 +232,30 @@ def pins() -> dict[str, str]:
 
 
 def layer_for(path: str, language: str, text: str) -> Layer:
-    layer = parse(language, text)
+    layer = parse(language, text, config_roots.grammar_cache_root())
     if not layer.precise:
         log_reduced_precision(path, language, layer.reason)
     return layer
 
 
 @lru_cache(maxsize=8)
-def parse(language: str, text: str) -> Layer:
+def parse(language: str, text: str, cache_root: Path) -> Layer:
     if language == PYTHON:
         return python_layer(text)
-    parser, reason = _parser(language)
+    parser, reason = _parser(language, cache_root)
     if parser is None:
         return lexer_layer(language, reason)
-    return _budgeted_layer(language, text, parser)
+    return _budgeted_layer(language, text, cache_root)
 
 
-def _budgeted_layer(language: str, text: str, parser) -> Layer:
+def _budgeted_layer(language: str, text: str, cache_root: Path) -> Layer:
     if not _budget.charge(text):
         return lexer_layer(language, SIZE_BUDGET)
     if _budget.seconds <= 0:
         return lexer_layer(language, TIME_BUDGET)
     started = time.monotonic()
     try:
-        return _tree_layer(language, text, _syntax_tree(language, text), started + _budget.seconds)
+        return _tree_layer(language, text, _syntax_tree(language, text, cache_root), started + _budget.seconds)
     except _OverBudget:
         return lexer_layer(language, TIME_BUDGET)
     except Exception:
@@ -258,29 +271,29 @@ def outline_for(path: str, language: str, text: str) -> Outline | None:
     if not layer.precise:
         return None
     try:
-        return Outline(_outline(language, text), bool(layer.errors))
+        return Outline(_outline(language, text, config_roots.grammar_cache_root()), bool(layer.errors))
     except Exception:
         log_reduced_precision(path, language, PARSER_FAILED)
         return None
 
 
 @lru_cache(maxsize=4)
-def _syntax_tree(language: str, text: str):
-    parser, reason = _parser(language)
+def _syntax_tree(language: str, text: str, cache_root: Path) -> Any:
+    parser, reason = _parser(language, cache_root)
     if parser is None:
         raise LookupError(reason)
     return parser.parse(text.encode("utf-8", "replace"))
 
 
 @lru_cache(maxsize=4)
-def _outline(language: str, text: str) -> tuple[Shape, ...]:
+def _outline(language: str, text: str, cache_root: Path) -> tuple[Shape, ...]:
     walk = _OutlineWalk(language, text, _Offsets(text))
-    walk.collect(_syntax_tree(language, text).root_node)
+    walk.collect(_syntax_tree(language, text, cache_root).root_node)
     return tuple(sorted(walk.shapes, key=lambda shape: (shape.start, -shape.end)))
 
 
 def log_reduced_precision(path: str, language: str, reason: str) -> None:
-    key = (path, language, reason)
+    key = (str(real_path(path)), language, reason)
     if key in _logged:
         return
     _logged.add(key)
@@ -294,23 +307,21 @@ def log_reduced_precision(path: str, language: str, reason: str) -> None:
         print(f"ADW Lite scanned {path} with the fallback lexer ({reason}): {error}", file=sys.stderr)
 
 
-def _parser(language: str) -> tuple[_Parser | None, str]:
-    if language not in _parsers:
-        try:
-            _parsers[language] = _load_parser(language)
-        except Exception:
-            _parsers[language] = (None, PARSER_FAILED)
-    return _parsers[language]
+@lru_cache(maxsize=64)
+def _parser(language: str, cache_root: Path) -> tuple[_Parser | None, str]:
+    try:
+        return _load_parser(language, cache_root)
+    except Exception:
+        return None, PARSER_FAILED
 
 
-def _load_parser(language: str) -> tuple[_Parser | None, str]:
+def _load_parser(language: str, cache_root: Path) -> tuple[_Parser | None, str]:
     pack = _pack()
     if pack is None:
         return None, LIBRARY_MISSING
     if not _pinned():
         return None, VERSION_MISMATCH
-    cache = config_roots.grammar_cache_root()
-    reason = _grammar_state(pack, cache, language)
+    reason = _grammar_state(pack, cache_root, language)
     return (pack.get_parser(language), "") if not reason else (None, reason)
 
 

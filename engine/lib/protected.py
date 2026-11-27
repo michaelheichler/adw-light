@@ -4,6 +4,7 @@ import json
 import os
 import re
 import stat
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,23 +16,33 @@ except ImportError:
     from protected_files import AGENT_FILE_SUFFIXES, CLIENT_HOME_DIRS, WIRING_FILES, _protected_identities, _identity_stamp, _existing_metadata
 
 try:
-    from . import families
-    from .config import ALWAYS_BLOCKING_RULES, flatten_settings
+    from .config import (
+        CONFIG_NAME, CONTRACT_STRINGS_KEY, DEFAULTS, MAX_PROJECT_CONFIG_BYTES,
+        _parse_project_config, load_project_config, project_config_path,
+    )
     from .findings import finding_row
-    from .payloads import exact_string_dict
+    from .path_policy import PROJECT_MARKERS, exited_project, marked_project
     from .regular_file import read_regular_text
+    from .temp_scope import cwd_forms, outside_project_temp, scratch_session
 except ImportError:
-    import families
-    from config import ALWAYS_BLOCKING_RULES, flatten_settings
+    from config import (
+        CONFIG_NAME, CONTRACT_STRINGS_KEY, DEFAULTS, MAX_PROJECT_CONFIG_BYTES,
+        _parse_project_config, load_project_config, project_config_path,
+    )
     from findings import finding_row
-    from payloads import exact_string_dict
+    from path_policy import PROJECT_MARKERS, exited_project, marked_project
     from regular_file import read_regular_text
+    from temp_scope import cwd_forms, outside_project_temp, scratch_session
 
-CONFIG_SEAL_BASENAME = ".agent-discipline.json"
-TESTS_POLICY_KEYS = ("tests", "tests_allow_until")
+restore_check = ContextVar("config_restore", default=None)
+CONFIG_SEAL_BASENAME = CONFIG_NAME
+SEAL_MARKERS = PROJECT_MARKERS - {CONFIG_NAME}
+POLICY_KEYS = (DEFAULTS.keys() - {"max_rows", "list_item_cap", "prose_colon_limit", "adw_model"}) | {
+    CONTRACT_STRINGS_KEY, "function_block_lines", "ledger_root", "max_scan_bytes", "protected_paths_authorized",
+    "state_root", "stop_stall_limit", "tests_allow_until",
+}
 TEST_WRITER_STEM = "adw-test-writer"
 AUTH_ENV = "ADW_ALLOW_PROTECTED_EDIT"
-AUTH_SETTING = "protected_paths_authorized"
 TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 WATCHER_NAME_PREFIX = ("agent-discipline", "adw-light")
@@ -51,8 +62,7 @@ WIRING_ACTION = (
     "Keep the agent-discipline-watcher hook entries in place. Edit this file around them, "
     "or reinstall to change how the watcher is wired."
 )
-SEAL_ACTION = "Fix the reported finding instead of changing the gate config."
-POLICY_ACTION = "The user sets this policy. Ask the human to run adw-config in a terminal."
+POLICY_ACTION = "The user sets this policy. Use /adw-light:config in Claude Code or $adw-config in Codex."
 STATE_ACTION = "Leave watcher state under host control and repair the reported finding."
 DEFINITION_ACTION = (
     "The test gate trusts this agent file, so the user owns it. Ask the human to edit it in a terminal."
@@ -61,18 +71,12 @@ SWITCH_ACTION = (
     "Keep the watcher plugin enabled, its hooks on, and the escape variable out of these "
     "settings. Ask the human to make this change in a terminal."
 )
-GRANT_ACTION = (
-    "The config key no longer grants anything. Ask the human to export "
-    + AUTH_ENV
-    + " in the hook environment, which is the only supported escape."
-)
-
-
 @dataclass(frozen=True, slots=True)
 class ProtectedWrite:
     path: str
     home: str | os.PathLike[str] | None
     content: str | None
+    cwd: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,74 +98,10 @@ def authorized(config: dict | None = None) -> bool:
     return _env_authorized()
 
 
-def grants_escape(text: str | None) -> bool:
-    if not text:
-        return False
-    try:
-        settings = flatten_settings(json.loads(text))
-    except (ValueError, TypeError):
-        return False
-    if settings.get(AUTH_SETTING):
-        return True
-    gates = exact_string_dict(settings.get("rule_gates"))
-    if any(rule in ALWAYS_BLOCKING_RULES and state != "enforce" for rule, state in gates.items()):
-        return True
-    if "state_root" in settings or "ledger_root" in settings:
-        return True
-    return _silences_every_family(settings)
-
-
-UNIVERSAL_GLOBS = frozenset({"*", "**", "*/*", "**/*", "*/**", "**/**", "/**", "./**"})
-
-
-def _silences_every_family(settings: dict) -> bool:
-    return (
-        _gated_off_everywhere(settings)
-        or _killed_everywhere(settings)
-        or _exempted_everywhere(settings)
-    )
-
-
-def _gated_off(settings: dict, family_gates: dict, leaf: str) -> bool:
-    names = families.scope(leaf)
-    for name in names:
-        if name in family_gates:
-            return family_gates[name] != "enforce"
-    return any(settings.get(name) is False for name in names)
-
-
-def _gated_off_everywhere(settings: dict) -> bool:
-    family_gates = exact_string_dict(settings.get("gates"))
-    return all(_gated_off(settings, family_gates, leaf) for leaf in families.LEAVES)
-
-
-def _killed_everywhere(settings: dict) -> bool:
-    switches = exact_string_dict(settings.get("kill_switches"))
-    return all(
-        any(bool(switches.get(name)) for name in families.scope(leaf)) for leaf in families.LEAVES
-    )
-
-
-def _exempted_everywhere(settings: dict) -> bool:
-    paths = settings.get("exempt_paths")
-    if isinstance(paths, list) and any(
-        isinstance(entry, str) and entry.strip() in UNIVERSAL_GLOBS for entry in paths
-    ):
-        return True
-    exemptions = exact_string_dict(settings.get("exempt_families"))
-    for glob, listed in exemptions.items():
-        if glob.strip() not in UNIVERSAL_GLOBS or not isinstance(listed, list):
-            continue
-        named = (entry for entry in listed if isinstance(entry, str))
-        if families.leaves_of(named) == frozenset(families.LEAVES):
-            return True
-    return False
-
-
 def _protected_write(path: str, values: tuple[object, ...], fields: dict[str, object]) -> ProtectedWrite:
     if len(values) > 3:
         raise TypeError("path_findings accepts at most four legacy arguments")
-    names = ("config", "home", "content")
+    names = ("config", "home", "content", "cwd")
     legacy = dict(zip(names, values, strict=False))
     for name, value in fields.items():
         if name not in names or name in legacy:
@@ -173,7 +113,10 @@ def _protected_write(path: str, values: tuple[object, ...], fields: dict[str, ob
         raise TypeError("path_findings home must be a path or None")
     if content is not None and not isinstance(content, str):
         raise TypeError("path_findings content must be a string or None")
-    return ProtectedWrite(path, home, content)
+    cwd = legacy.get("cwd")
+    if cwd is not None and not isinstance(cwd, (str, os.PathLike)):
+        raise TypeError("path_findings cwd must be a path or None")
+    return ProtectedWrite(path, home, content, Path(cwd) if cwd is not None else None)
 
 
 def path_findings(write: ProtectedWrite | str, *values: object, **fields: object) -> list[dict]:
@@ -217,7 +160,7 @@ def _hardlink_findings(write: ProtectedWrite, resolved: Path) -> list[dict]:
             return [finding_row(family="self_protection", rule="test_writer_definition", line=1, detail="Test writer definition in " + write.path, snippet=write.path.strip()[:180], action=DEFINITION_ACTION)]
         home = config_paths.home_root(write.home)
         candidates = _protected_identities(home, _identity_stamp(home)).get(identity, ())
-        candidates = (*candidates, *_seal_aliases(resolved, identity))
+        candidates = (*candidates, *_seal_aliases(write.cwd or Path.cwd(), identity))
     except OSError:
         return _identity_refusal(write)
     return _alias_findings(write, resolved, candidates)
@@ -232,26 +175,28 @@ def _alias_findings(write: ProtectedWrite, resolved: Path, candidates: tuple[Pat
         normalized = Path(os.path.realpath(candidate))
         if normalized == resolved:
             continue
-        alias = ProtectedWrite(str(candidate), write.home, write.content)
+        alias = ProtectedWrite(str(candidate), write.home, write.content, write.cwd)
         findings = _resolved_findings(alias, normalized)
         if findings:
             return findings
     return []
 
 
-def _seal_aliases(target: Path, identity: tuple[int, int]) -> tuple[Path, ...]:
-    candidates = []
-    for parent in set((*target.parents, Path.cwd(), *Path.cwd().parents)):
-        candidate = parent / CONFIG_SEAL_BASENAME
+def _seal_aliases(cwd: Path, identity: tuple[int, int]) -> tuple[Path, ...]:
+    start = cwd.resolve()
+    aliases = []
+    for folder in (start, *start.parents):
+        candidate = folder / CONFIG_NAME
         metadata = _existing_metadata(candidate)
         if metadata is not None and (metadata.st_dev, metadata.st_ino) == identity:
-            candidates.append(candidate)
-    return tuple(candidates)
+            aliases.append(candidate)
+    return tuple(aliases)
 
 
 def _definition_findings(write: ProtectedWrite, resolved: Path) -> list[dict]:
     literal = _literal(write.path, write.home)
-    if not (_is_test_writer_definition(literal, write.content, write.home) or _is_test_writer_definition(resolved, write.content, write.home)):
+    cwd = (write.cwd or Path.cwd()).absolute()
+    if not any(_is_test_writer_definition(path, write.content, write.home, cwd) for path in (literal, resolved)):
         return []
     return [finding_row(family="self_protection", rule="test_writer_definition", line=1, detail="Test writer definition in " + write.path, snippet=write.path.strip()[:180], action=DEFINITION_ACTION)]
 
@@ -267,21 +212,17 @@ def _write_target_findings(write: ResolvedProtectedWrite) -> list[dict]:
     path = write.requested.path
     home = write.requested.home
     content = write.requested.content
-    if _is_gate_config(resolved) and grants_escape(content):
-        return [finding_row(family="self_protection", rule="config_seal", line=1, detail="Self-granted gate escape in " + path, snippet=path.strip()[:180], action=GRANT_ACTION)]
-    if _is_gate_config(resolved) and _changes_tests_policy(resolved, content):
-        return [finding_row(family="self_protection", rule="config_seal", line=1, detail="Tests policy edit in " + path, snippet=path.strip()[:180], action=POLICY_ACTION)]
+    if is_config_target(_literal(path, home), resolved, write.requested.cwd or Path.cwd()):
+        policy = _config_write_findings(resolved, path, content)
+        if policy:
+            return policy
     if _is_state_path(resolved, home):
         return [finding_row(family="self_protection", rule="state_mutation", line=1, detail="Watcher state path in " + path, snippet=path.strip()[:180], action=STATE_ACTION)]
     if _reaches_install_surface(_literal(path, home), resolved, home):
         return [finding_row(family="self_protection", rule="watcher_install_surface", line=1, detail="Live watcher install path in " + path, snippet=path.strip()[:180], action=INSTALL_ACTION)]
     if _unwires_watcher(resolved, Path(os.path.realpath(config_paths.home_root(home))), content):
         return [finding_row(family="self_protection", rule="watcher_wiring_removal", line=1, detail="Write drops the watcher hooks from " + path, snippet=path.strip()[:180], action=WIRING_ACTION)]
-    return (
-        [finding_row(family="self_protection", rule="config_seal", line=1, detail="Gate config edit in " + path, snippet=path.strip()[:180], action=SEAL_ACTION)]
-        if _is_unreadable_config_write(resolved, content)
-        else []
-    )
+    return []
 
 
 def is_install_surface_path(
@@ -404,39 +345,91 @@ def _has_watcher_wiring(path: Path) -> bool:
         return True
 
 
-def _tests_value(text: str | None) -> object:
-    try:
-        settings = flatten_settings(json.loads(text or "{}"))
-    except (ValueError, TypeError):
-        return None
-    return tuple(settings.get(key) for key in TESTS_POLICY_KEYS)
+def is_config_target(literal: Path | None, resolved: Path, cwd: Path) -> bool:
+    folders = {path.parent.resolve() for path in (literal, resolved) if path is not None and path.name.casefold() == CONFIG_NAME}
+    if folders:
+        scratch = scratch_session(cwd)
+        start = cwd.resolve()
+        root = exited_project(cwd.absolute()) or marked_project(start) or cwd.absolute()
+        project = () if scratch else cwd_forms(root)
+        for folder in folders:
+            if not scratch and start.is_relative_to(folder):
+                return True
+            if not outside_project_temp(folder, cwd.absolute(), project=project) or _inside_marked_project(folder):
+                return True
+    chosen = project_config_path(cwd)
+    return resolved == chosen.resolve() and (chosen.exists() or not scratch_session(cwd))
 
 
-def _changes_tests_policy(path: Path, content: str | None) -> bool:
-    if content is None:
+def _inside_marked_project(folder: Path) -> bool:
+    return any(
+        (parent / ".git").exists() or any((parent / name).is_file() for name in SEAL_MARKERS)
+        for parent in (folder, *folder.parents)
+    )
+
+
+def same_enforcement(path: Path, before: str | None, after: str | None) -> bool:
+    if before is None or after is None:
         return False
     try:
-        current = read_regular_text(path)
-    except FileNotFoundError:
-        current = None
-    except (OSError, UnicodeDecodeError):
+        settings = [_parse_project_config(path, text.encode("utf-8")).settings for text in (before, after)
+                    if len(text.encode("utf-8")) <= MAX_PROJECT_CONFIG_BYTES]
+    except ValueError:
+        return False
+    return len(settings) == 2 and all(settings[0].get(key) == settings[1].get(key) for key in POLICY_KEYS)
+
+
+def _config_write_action(path: Path, content: str | None) -> str | None:
+    if content is None or len(content) > MAX_PROJECT_CONFIG_BYTES:
+        return POLICY_ACTION
+    try:
+        current = load_project_config(path)
+        raw = content.encode("utf-8")
+        if len(raw) > MAX_PROJECT_CONFIG_BYTES:
+            return POLICY_ACTION
+        pending = _parse_project_config(path, raw)
+    except (OSError, ValueError):
+        return POLICY_ACTION
+    if current.exists and all(current.settings.get(key) == pending.settings.get(key) for key in POLICY_KEYS):
+        return None
+    return POLICY_ACTION
+
+
+def _config_write_findings(resolved: Path, path: str, content: str | None) -> list[dict]:
+    action = _config_write_action(resolved, content)
+    check = restore_check.get()
+    if action is None or (check is not None and check(resolved, content)):
+        return []
+    return [finding_row(family="self_protection", rule="config_seal", line=1, detail="Project config write in " + path, snippet=path.strip()[:180], action=action)]
+
+
+def _is_installed_agent_location(path: Path, home: str | os.PathLike[str] | None, cwd: Path) -> bool:
+    base = config_paths.home_root(home)
+    for anchor in cwd_forms(base):
+        home_parts = _relative_parts(path, anchor)
+        if home_parts and home_parts[0] in CLIENT_HOME_DIRS and home_parts[1:2] != ["worktrees"]:
+            return True
+    if any(path.is_relative_to(root) for root in cwd_forms(config_paths.adw_home(base))):
         return True
-    return _tests_value(content) != _tests_value(current)
-
-
-def _is_installed_agent_location(path: Path, home: str | os.PathLike[str] | None) -> bool:
-    if any(part.lower() in CLIENT_HOME_DIRS for part in path.parent.parts):
+    if _reaches_install_surface(path, path.resolve(), home):
         return True
-    adw_home = config_paths.adw_home(home)
-    return path.is_relative_to(adw_home) or path.is_relative_to(Path(os.path.realpath(adw_home)))
+    root = exited_project(cwd) or marked_project(cwd.resolve()) or cwd
+    if outside_project_temp(path, cwd, project=cwd_forms(root)):
+        return False
+    return any(
+        directory.parent.name.lower() in CLIENT_HOME_DIRS and directory.name.lower() in {"agent", "agents", "plugins"}
+        for directory in path.parents
+    )
 
 
-def _is_test_writer_definition(path: Path | None, content: str | None, home: str | os.PathLike[str] | None) -> bool:
+def _is_test_writer_definition(
+    path: Path | None, content: str | None, home: str | os.PathLike[str] | None, cwd: Path,
+) -> bool:
     if path is None or path.suffix.lower() not in AGENT_FILE_SUFFIXES:
         return False
     if not any(part.lower() == "agents" for part in path.parent.parts):
         return False
-    if not _is_installed_agent_location(path, home):
+    if not _is_installed_agent_location(path, home, cwd):
         return False
     if path.stem.lower() == TEST_WRITER_STEM or TEST_WRITER_NAME_RE.search(content or ""):
         return True
@@ -452,28 +445,19 @@ def _declares_test_writer_on_disk(path: Path) -> bool:
         return True
 
 
-def _is_gate_config(path: Path) -> bool:
-    return path.name.lower() == CONFIG_SEAL_BASENAME
+def _state_roots(home: str | os.PathLike[str] | None) -> tuple[Path, ...]:
+    return tuple({root.resolve() for root in _named_state_roots(home)})
+
+
+def _named_state_roots(home: str | os.PathLike[str] | None) -> tuple[Path, ...]:
+    base = config_paths.home_root(home)
+    return (config_paths.state_root(home=base), config_paths.data_root(base), config_paths.legacy_data_root(base))
+
+
+def state_root_forms(home: str | os.PathLike[str] | None) -> tuple[Path, ...]:
+    roots = _named_state_roots(home)
+    return tuple(dict.fromkeys(form for root in roots for form in (Path(os.path.abspath(root)), root.resolve())))
 
 
 def _is_state_path(path: Path, home: str | os.PathLike[str] | None) -> bool:
-    base = config_paths.home_root(home)
-    if path.is_relative_to(Path(os.path.realpath(config_paths.install_root(base)))):
-        return False
-    for root in (config_paths.state_root(home=base), config_paths.data_root(base), config_paths.adw_home(base),
-                 config_paths.legacy_data_root(base), base / ".adw", base / ".agent-discipline"):
-        try:
-            path.relative_to(Path(os.path.realpath(root)))
-        except ValueError:
-            continue
-        return True
-    return False
-
-
-def _is_unreadable_config_write(path: Path, content: str | None) -> bool:
-    if not _is_gate_config(path) or (content is not None and content.strip()):
-        return False
-    try:
-        return path.exists()
-    except OSError:
-        return True
+    return any(path.is_relative_to(root) for root in _state_roots(home))

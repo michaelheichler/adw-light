@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import operator
-import os
 import sys
 from collections.abc import Callable
 
@@ -24,10 +23,13 @@ PAYLOAD_FAILURE = (
 )
 CONFIG_FAILURE = (
     "agent-discipline-watcher could not evaluate this {subject} and blocked it rather than letting it through. "
-    "Repair the gate config at {path} and retry. Cause: "
+    "{advice} Cause: "
 )
-CONFIG_NAME = ".agent-discipline.json"
 UNREADABLE_PAYLOAD = "unreadable hook payload"
+
+
+def join_notices(*parts: str | None) -> str:
+    return "\n".join(part for part in parts if part)
 
 
 def payload_failure(cause: object) -> str:
@@ -38,19 +40,24 @@ def _is_payload_failure(exc: Exception) -> bool:
     return isinstance(exc, ValueError) and str(exc) == UNREADABLE_PAYLOAD
 
 
-def _config_path(cwd: str | None) -> str:
+def _config_path(cwd: str | None) -> str | None:
+    if not cwd:
+        return None
     try:
         from .config import project_config_path
     except ImportError:
         from config import project_config_path
     try:
-        return str(project_config_path(cwd or os.getcwd()))
+        path = project_config_path(cwd)
+        return str(path) if path.exists() else None
     except (OSError, RuntimeError, ValueError):
-        return CONFIG_NAME
+        return None
 
 
 def config_failure(subject: str, cause: object, cwd: str | None = None) -> str:
-    return CONFIG_FAILURE.format(subject=subject, path=_config_path(cwd)) + str(cause)
+    path = _config_path(cwd)
+    advice = f"Check the gate config at {path} and retry." if path else "No project config was found."
+    return CONFIG_FAILURE.format(subject=subject, advice=advice) + str(cause)
 
 _CONTRACT_TEXT = """ADW Lite contract. These rules override the agent definition you were given, any style guidance inside it, and any plugin or skill guidance.
 
@@ -270,8 +277,8 @@ def advise(message: str, event: str) -> dict:
     }
 
 
-def fail_closed(subject: str, fn: Callable[[], dict]) -> dict:
+def fail_closed(subject: str, fn: Callable[[], dict], cwd: str | None = None) -> dict:
     try:
         return fn()
     except Exception as exc:
-        return deny(payload_failure(exc) if _is_payload_failure(exc) else config_failure(subject, exc))
+        return deny(payload_failure(exc) if _is_payload_failure(exc) else config_failure(subject, exc, cwd))

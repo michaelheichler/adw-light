@@ -17,8 +17,10 @@ EDITABLE_KEYS = (
     *config.GATE_FAMILIES,
     "max_rows",
     "list_item_cap",
+    "prose_colon_limit",
     "adw_model",
     "exempt_paths",
+    config.CONTRACT_STRINGS_KEY,
     "exempt_families",
     "baseline",
     "gates",
@@ -35,7 +37,7 @@ PROTECTED_POLICY_KEYS = frozenset({
     "ledger_root",
     "protected_paths_authorized",
 })
-THRESHOLD_KEYS = ("max_rows", "list_item_cap")
+THRESHOLD_KEYS = ("max_rows", "list_item_cap", "prose_colon_limit")
 MAPPING_MERGE_KEYS = frozenset({
     "gates", "rule_gates", "kill_switches", "exempt_families", "data_boundary",
 })
@@ -90,8 +92,9 @@ def _thresholds(fields: dict[str, object]) -> None:
         if key not in fields:
             continue
         value = fields[key]
-        if type(value) is not int or isinstance(value, bool) or not 1 <= value <= 10000:
-            raise ConfigureError("invalid_value", f"{key} must be an integer from 1 through 10000")
+        minimum = 0 if key == "prose_colon_limit" else 1
+        if type(value) is not int or not minimum <= value <= 10000:
+            raise ConfigureError("invalid_value", f"{key} must be an integer from {minimum} through 10000")
 
 
 def _judge_model(fields: dict[str, object]) -> None:
@@ -218,8 +221,9 @@ def validate_policy_values(values: object) -> dict[str, object]:
     _family_booleans(fields, "values")
     for validator in _VALIDATORS:
         validator(fields)
-    if "exempt_paths" in fields:
-        fields["exempt_paths"] = string_list(fields["exempt_paths"], "values.exempt_paths")
+    for key in ("exempt_paths", config.CONTRACT_STRINGS_KEY):
+        if key in fields:
+            fields[key] = string_list(fields[key], f"values.{key}")
     return fields
 
 

@@ -7,16 +7,19 @@ from itertools import islice
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-from . import payloads, session_state
+from . import path_policy, payloads, scan_cache, session_state
 
 KEY = "unresolved_blockers"
 REPORT_LINE_RE = re.compile(r"\nFull report: .*?(?=\n|$)")
 RECORD_ERROR_KEY = "<record-error>"
 BATCH_KEY = "<batch>"
+AFTER_RUN_KEY = "<after-run>"
 BATCH_ERROR_KEY = "<batch-error>"
 STALL_KEY = "stall"
+DEFERRED_STALL_KEY = "deferred_stall"
 DROPPED_KEY = "dropped_paths"
 HELD_KEY = "held_files"
+TOUCHED_KEY = "touched_at"
 MAX_SCOPE_PATHS = 500
 RESCAN_RELEASED_KEYS = frozenset({RECORD_ERROR_KEY})
 
@@ -74,19 +77,52 @@ def _normalized_bucket(bucket: dict) -> tuple[dict[str, str], list[str], int]:
     return pending, paths, revision
 
 
-def _update(scope: BlockerScope, mutate: Callable[[dict], dict]) -> None:
-    if not scope.session_id:
+def _marks(bucket: dict) -> dict[str, int] | None:
+    stored = bucket.get(TOUCHED_KEY)
+    if not isinstance(stored, dict):
+        return None
+    return {key: value for key, value in stored.items() if isinstance(key, str) and type(value) is int}
+
+
+def _marked(bucket: dict, keys: list[str]) -> dict:
+    revision = _normalized_bucket(bucket)[2] + 1
+    return {**bucket, TOUCHED_KEY: {**(_marks(bucket) or {}), **dict.fromkeys((key for key in keys if key), revision)}}
+
+
+def _pruned(bucket: dict) -> dict:
+    pending, paths, _revision = _normalized_bucket(bucket)
+    live = {*pending, *paths}
+    return {**bucket, TOUCHED_KEY: {key: value for key, value in (_marks(bucket) or {}).items() if key in live}}
+
+
+def _touched_since(bucket: dict, revision: int) -> set[str]:
+    pending, paths, current = _normalized_bucket(bucket)
+    if current == revision:
+        return set()
+    marks = _marks(bucket)
+    if marks is None:
+        return {*pending, *paths}
+    return {key for key, value in marks.items() if value > revision}
+
+
+def _update_many(session_id: str, root: str | Path | None, mutations: dict[str, Callable[[dict], dict]]) -> None:
+    if not session_id:
         raise ValueError("blocker_state requires a non-empty session_id")
 
     def change(state: dict) -> dict:
         scopes = state.get(KEY)
         scopes = dict(scopes) if isinstance(scopes, dict) else {}
-        bucket = _bucket(state, scope.agent_id)
-        _pending, _paths, revision = _normalized_bucket(bucket)
-        scopes[scope.agent_id] = {**mutate(bucket), "revision": revision + 1}
+        for agent_id, mutate in mutations.items():
+            bucket = _bucket(state, agent_id)
+            _pending, _paths, revision = _normalized_bucket(bucket)
+            scopes[agent_id] = {**mutate(bucket), "revision": revision + 1}
         return {**state, KEY: scopes}
 
-    session_state.update_state_strict(scope.session_id, change, scope.root)
+    session_state.update_state_strict(session_id, change, root)
+
+
+def _update(scope: BlockerScope, mutate: Callable[[dict], dict]) -> None:
+    _update_many(scope.session_id, scope.root, {scope.agent_id: mutate})
 
 
 def set_pending(scope: BlockerScope | str, *values: object) -> None:
@@ -98,8 +134,8 @@ def set_pending(scope: BlockerScope | str, *values: object) -> None:
 
     def mutate(bucket: dict) -> dict:
         pending, _paths, _revision = _normalized_bucket(bucket)
-        pending[path or "<turn>"] = REPORT_LINE_RE.sub("", reason)
-        return {**bucket, "pending": pending}
+        pending[path or "<turn>"] = reason if path == AFTER_RUN_KEY else REPORT_LINE_RE.sub("", reason)
+        return _marked({**bucket, "pending": pending}, [path or "<turn>"])
 
     _update(scope, mutate)
 
@@ -132,20 +168,26 @@ def touch_paths(scope: BlockerScope | str, *values: object) -> None:
 
     def mutate(bucket: dict) -> dict:
         current, existing, _revision = _normalized_bucket(bucket)
-        return _capped(bucket, current, _joined(existing, paths))
+        return _pruned(_capped(_marked(bucket, paths), current, _joined(existing, paths)))
 
     _update(scope, mutate)
 
 
 def _joined(existing: list[str], paths: list[str]) -> list[str]:
-    known = set(existing)
-    added = [path for path in dict.fromkeys(paths) if path and path not in known]
-    return existing + added
+    touched = dict.fromkeys(path for path in paths if path)
+    return [path for path in existing if path not in touched] + list(touched)
 
 
 def _capped(bucket: dict, pending: dict[str, str], paths: list[str]) -> dict:
     excess = max(len(paths) - MAX_SCOPE_PATHS, 0)
-    gone = set(islice((path for path in paths if path not in pending), excess))
+    if not excess:
+        return {**bucket, "pending": pending, "paths": paths}
+    directory = _scan_directory(bucket.get("scan_directory"))
+    cursor = bucket.get("scan_cursor")
+    marks = (*pending, *scan_cache.stamps(bucket.get("scan_stamps")), *([cursor] if isinstance(cursor, str) and cursor else []))
+    protected = {path_policy.anchored(path, directory) for path in marks}
+    removable = paths[:max(len(_normalized_bucket(bucket)[1]), excess)]
+    gone = set(islice((path for path in removable if path_policy.anchored(path, directory) not in protected), excess))
     if not gone:
         return {**bucket, "pending": pending, "paths": paths}
     count = bucket.get(DROPPED_KEY)
@@ -163,7 +205,8 @@ def apply_paths(scope: BlockerScope, paths: list[str], pending: dict[str, str | 
                 current.pop(key or "<turn>", None)
             else:
                 current[key or "<turn>"] = REPORT_LINE_RE.sub("", reason)
-        return _capped(bucket, current, _joined(existing, paths))
+        keys = [*paths, *(key or "<turn>" for key, reason in pending.items() if reason is not None)]
+        return _pruned(_capped(_marked(bucket, keys), current, _joined(existing, paths)))
 
     _update(scope, mutate)
 
@@ -191,6 +234,23 @@ def stall(scope: BlockerScope, key: str = STALL_KEY) -> dict:
 
 def note_stall(scope: BlockerScope, record: dict, key: str = STALL_KEY) -> None:
     _update(scope, lambda bucket: {**bucket, key: record})
+
+
+def stalls(session_id: str, root: str | Path | None, key: str = STALL_KEY) -> dict[str, dict]:
+    scopes = session_state.read_state_strict(session_id, root).get(KEY)
+    if not isinstance(scopes, dict):
+        return {}
+    return {
+        agent_id: dict(bucket[key]) for agent_id, bucket in scopes.items()
+        if isinstance(agent_id, str) and isinstance(bucket, dict) and isinstance(bucket.get(key), dict)
+    }
+
+
+def note_stalls(session_id: str, root: str | Path | None, records: dict[str, dict], key: str = STALL_KEY) -> None:
+    def stamped(record: dict) -> Callable[[dict], dict]:
+        return lambda bucket: {**bucket, key: record}
+
+    _update_many(session_id, root, {agent_id: stamped(record) for agent_id, record in records.items()})
 
 
 def _unscanned_paths(payload: dict) -> list[str]:
@@ -243,35 +303,92 @@ def reconcile(scope: BlockerScope | str, *values: object) -> None:
     revision, pending_keys, paths = values
 
     def mutate(bucket: dict) -> dict:
-        if bucket.get("revision") != revision:
-            return bucket
+        touched = _touched_since(bucket, revision)
         pending, existing, _revision = _normalized_bucket(bucket)
-        for key in pending_keys:
+        for key in set(pending_keys) - touched:
             pending.pop(key, None)
-        removed = set(paths)
-        return {**bucket, "pending": pending, "paths": [path for path in existing if path not in removed]}
+        removed = set(paths) - touched
+        findings, stamps = _stored_scan(bucket, _anchored_forms(bucket.get("scan_directory"), touched))
+        return _pruned({**bucket, "pending": pending, "paths": [path for path in existing if path not in removed],
+                        "scan_findings": findings, "scan_cursor": "", "scan_stamps": stamps, "scan_pause": []})
 
     _update(scope, mutate)
+
+
+def _scan_directory(location: object) -> Path:
+    return Path(location if isinstance(location, str) else ".").absolute()
+
+
+def _anchored_forms(location: object, paths: set[str]) -> set[str]:
+    directory = _scan_directory(location)
+    return {str(path_policy.anchored(path, directory)) for path in paths}
+
+
+def _stored_scan(bucket: dict, held: set[str]) -> tuple[list[dict], dict[str, str]]:
+    rows = [row for row in scan_cache.rows(bucket.get("scan_findings")) if row["path"] in held]
+    stamps = {path: stamp for path, stamp in scan_cache.stamps(bucket.get("scan_stamps")).items() if path in held}
+    return rows, stamps
+
+
+class ScanState(NamedTuple):
+    pending: dict[str, str]
+    paths: list[str]
+    revision: int
+    findings: list[dict]
+    stamps: dict[str, str]
+    pause: list[str]
+
+
+def scan_state(scope: BlockerScope) -> ScanState:
+    bucket = _bucket(session_state.read_state_strict(scope.session_id, scope.root), scope.agent_id)
+    pending, paths, revision = _normalized_bucket(bucket)
+    cursor = bucket.get("scan_cursor")
+    at = paths.index(cursor) if cursor in paths else 0
+    return ScanState(pending, paths[at:] + paths[:at], revision, scan_cache.rows(bucket.get("scan_findings")),
+                     scan_cache.stamps(bucket.get("scan_stamps")), bucket["scan_pause"] if _is_string_list(bucket.get("scan_pause")) else [])
 
 
 class PartialScan(NamedTuple):
     clean: list[str]
-    cut: str
+    cursor: str
+    findings: list[dict]
+    stamps: dict[str, str]
+    pause: list[str]
+    directory: str
 
 
 def settle_partial(scope: BlockerScope, revision: int, partial: PartialScan) -> None:
 
-    def mutate(bucket: dict) -> dict:
-        if bucket.get("revision") != revision:
-            return bucket
-        pending, existing, _revision = _normalized_bucket(bucket)
-        gone = {*partial.clean, partial.cut}
-        for key in partial.clean:
+    def change(state: dict) -> dict:
+        bucket = _bucket(state, scope.agent_id)
+        scopes = dict(state[KEY]) if isinstance(state.get(KEY), dict) else {}
+        pending, existing, current = _normalized_bucket(bucket)
+        touched = _touched_since(bucket, revision)
+        gone = set(partial.clean) - touched
+        for key in gone:
             pending.pop(key, None)
-        kept = [path for path in existing if path not in gone]
-        return {**bucket, "pending": pending, "paths": kept + ([partial.cut] if partial.cut in existing else [])}
+        findings, stamps = _merged_scan(bucket, partial, touched)
+        scopes[scope.agent_id] = _pruned({
+            **bucket, "pending": pending, "paths": [path for path in existing if path not in gone],
+            "scan_cursor": partial.cursor, "scan_findings": scan_cache.compact(findings, _row_limit(scopes, scope.agent_id)),
+            "scan_directory": partial.directory, "scan_stamps": stamps,
+            "scan_pause": [path for path in partial.pause if path not in touched], "revision": current + 1,
+        })
+        return {**state, KEY: scopes}
 
-    _update(scope, mutate)
+    session_state.update_state_strict(scope.session_id, change, scope.root)
+
+
+def _merged_scan(bucket: dict, partial: PartialScan, touched: set[str]) -> tuple[list[dict], dict[str, str]]:
+    fresh = {row["path"] for row in partial.findings} | partial.stamps.keys()
+    rows, stamps = _stored_scan(bucket, _anchored_forms(partial.directory, touched) - fresh)
+    return [*partial.findings, *rows], {**stamps, **partial.stamps}
+
+
+def _row_limit(scopes: dict, agent_id: str) -> int:
+    used = sum(len(scan_cache.rows(other.get("scan_findings"))) for agent, other in scopes.items()
+               if agent != agent_id and isinstance(other, dict))
+    return max(0, min(scan_cache.SCOPE_LIMIT, scan_cache.SESSION_LIMIT - used))
 
 
 def snapshot(session_id: str, agent_id: str, root=None) -> tuple[list[str], list[str]]:
@@ -320,7 +437,22 @@ def held_files(session_id: str, root=None) -> dict[str, dict[str, dict[str, str]
     return {agent: held for agent, held in found.items() if held}
 
 
-def scope_ids(session_id: str, root=None) -> list[str]:
-    state = session_state.read_state_strict(session_id, root)
-    scopes = state.get(KEY)
-    return [key for key in scopes if isinstance(key, str)] if isinstance(scopes, dict) else []
+class QueuedScope(NamedTuple):
+    paths: list[object]
+    has_pending: bool
+
+
+def _queued_scope(bucket: dict) -> QueuedScope:
+    paths = bucket.get("paths")
+    pending = bucket.get("pending")
+    return QueuedScope(paths if isinstance(paths, list) else [], isinstance(pending, dict) and bool(pending))
+
+
+def queued_scopes(session_id: str, root: str | Path | None) -> dict[str, QueuedScope]:
+    scopes = session_state.read_state_strict(session_id, root).get(KEY)
+    if not isinstance(scopes, dict):
+        return {}
+    return {
+        agent_id: _queued_scope(bucket) for agent_id, bucket in scopes.items()
+        if isinstance(agent_id, str) and isinstance(bucket, dict)
+    }

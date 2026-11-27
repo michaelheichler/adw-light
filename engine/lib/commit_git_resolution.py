@@ -9,15 +9,15 @@ from typing import NamedTuple
 
 try:
     from . import git_port
-    from .commit_command_words import DYNAMIC_PROGRAM, _payload_command_index
-    from .commit_inputs import PLAIN_COMMIT, UnreadableCommit, is_dynamic
+    from .commit_command_words import _payload_command_index
+    from .commit_inputs import PLAIN_COMMIT, InvalidCommitFolder, RelocatedCommit, UnreadableCommit, is_dynamic
     from .commit_segments import is_assignment as _is_assignment
     from .path_policy import anchored
     from .shell_syntax import WRAPPER_COMMANDS, _basename
 except ImportError:
     import git_port
-    from commit_command_words import DYNAMIC_PROGRAM, _payload_command_index
-    from commit_inputs import PLAIN_COMMIT, UnreadableCommit, is_dynamic
+    from commit_command_words import _payload_command_index
+    from commit_inputs import PLAIN_COMMIT, InvalidCommitFolder, RelocatedCommit, UnreadableCommit, is_dynamic
     from commit_segments import is_assignment as _is_assignment
     from path_policy import anchored
     from shell_syntax import WRAPPER_COMMANDS, _basename
@@ -37,6 +37,9 @@ LOCATION_OVERRIDE = (
 )
 DYNAMIC_INDEX = "The commit gate cannot establish which GIT_INDEX_FILE this command uses. Set a literal index path directly on git commit."
 DIRECTORY_MOVE = "env -C or sudo -D moves the commit into another directory. Run cd in its own step, then commit."
+RELOCATING_FLAGS = frozenset({"--git-dir", "--work-tree"})
+INIT_VALUE_FLAGS = frozenset({"-b", "--initial-branch", "--separate-git-dir", "--template", "--object-format", "--ref-format"})
+RELOCATING_FLAG = "--git-dir or --work-tree moves the commit to another repository or index. Commit without them."
 DYNAMIC_DIRECTORY = f"This command moves into a folder named by a variable or substitution, so the commit gate cannot tell which repository commits. {PLAIN_COMMIT}"
 
 
@@ -46,6 +49,12 @@ class GitCall(NamedTuple):
     args: list[str]
     stdin: str | None = None
     index_file: Path | None = None
+    new_folder: bool = False
+    parent_repo: Path | None = None
+    index_only: bool = False
+
+    def repo(self) -> Path | None:
+        return self.parent_repo or git_port.view().toplevel(self.cwd, strict=True)
 
 
 def _git_payloads(call: GitCall) -> list[str]:
@@ -71,14 +80,17 @@ class _GitContext:
     cwd: Path
     prefix: list[str]
     depth: int = 0
+    created: frozenset[Path] = frozenset()
+    initialized: frozenset[Path] = frozenset()
 
 
-def _git_call(words: list[str], cwd: Path) -> GitCall | None:
+def _git_call(words: list[str], cwd: Path, created: frozenset[Path] = frozenset(),
+              initialized: frozenset[Path] = frozenset()) -> GitCall | None:
     index = _payload_command_index(words)
     if index >= len(words) or _basename(words[index]) != "git":
         return None
     prefix = words[:index]
-    call = _resolved(words[index:], _GitContext(cwd, prefix))
+    call = _resolved(words[index:], _GitContext(cwd, prefix, created=created, initialized=initialized))
     if call is not None and call.verb == "commit":
         indexes = [word.partition("=")[2] for word in prefix if word.startswith("GIT_INDEX_FILE=")]
         _refuse_location_override([word for word in prefix if not word.startswith("GIT_INDEX_FILE=")])
@@ -88,7 +100,7 @@ def _git_call(words: list[str], cwd: Path) -> GitCall | None:
             direct = all(_is_assignment(word) or word == "env" for word in prefix)
             relocated = any(word.partition("=")[0] in {"--git-dir", "--work-tree"} for word in words[index + 1:])
             if not literal or not direct or relocated or len(indexes) != 1:
-                raise UnreadableCommit(DYNAMIC_INDEX)
+                raise UnreadableCommit(DYNAMIC_INDEX, call.cwd)
             call = call._replace(index_file=call.cwd / value)
     return call
 
@@ -100,7 +112,16 @@ def _resolved(git_words: list[str], context: _GitContext) -> GitCall | None:
     location, cursor = located
     verb, args, flags = git_words[cursor], git_words[cursor + 1:], git_words[1:cursor]
     if is_dynamic(verb):
-        raise UnreadableCommit(DYNAMIC_PROGRAM)
+        return None
+    if verb == "commit" and any(flag.partition("=")[0] in RELOCATING_FLAGS for flag in flags):
+        raise RelocatedCommit(RELOCATING_FLAG)
+    if verb == "commit" and location.resolve() in context.initialized and not _own_repo(location.resolve()):
+        return GitCall(location.resolve(), verb, args, new_folder=True)
+    if context.created and location.resolve() in context.created and not location.exists():
+        location = location.resolve()
+        repo = _parent_repo(location)
+        if verb == "commit" or (repo is not None and verb in BUILTIN_VERBS):
+            return GitCall(location, verb, args, new_folder=verb == "commit" and repo is None, parent_repo=repo)
     if verb == "commit" or verb not in BUILTIN_VERBS:
         _require_folder(location)
         if verb not in BUILTIN_VERBS and location != context.cwd:
@@ -109,10 +130,40 @@ def _resolved(git_words: list[str], context: _GitContext) -> GitCall | None:
     if alias is None:
         return GitCall(location, verb, args)
     if alias.startswith("!"):
-        return GitCall(location, _shell_alias(verb, alias), args)
+        return GitCall(location, SHELL_ALIAS, args)
     if context.depth >= MAX_ALIAS_DEPTH:
-        raise UnreadableCommit(f"git {verb} expands through more aliases than the commit gate follows. {PLAIN_COMMIT}")
-    return _resolved(["git", *flags, *_alias_words(verb, alias), *args], replace(context, depth=context.depth + 1))
+        return None
+    try:
+        body = shlex.split(alias)
+    except ValueError:
+        return None
+    return _resolved(["git", *flags, *body, *args], replace(context, depth=context.depth + 1)) if body else None
+
+
+def _parent_repo(folder: Path) -> Path | None:
+    ancestor = next((parent for parent in folder.parents if parent.is_dir()), None)
+    return git_port.view().toplevel(ancestor, strict=True) if ancestor is not None else None
+
+
+def init_folders(calls: list[GitCall]) -> frozenset[Path]:
+    folders = set()
+    for call in calls:
+        if call.verb != "init":
+            continue
+        operands, skip = [], False
+        for word in call.args:
+            if skip or word.startswith("-"):
+                skip = not skip and word in INIT_VALUE_FLAGS
+                continue
+            operands.append(word)
+        if operands and is_dynamic(operands[0]):
+            continue
+        folders.add((anchored(operands[0], call.cwd) if operands else call.cwd).resolve())
+    return frozenset(folders)
+
+
+def _own_repo(folder: Path) -> bool:
+    return folder.is_dir() and git_port.view().toplevel(folder, strict=True) == folder
 
 
 def _require_folder(folder: Path) -> None:
@@ -120,8 +171,8 @@ def _require_folder(folder: Path) -> None:
         raise UnreadableCommit(DYNAMIC_DIRECTORY)
     if not folder.is_dir():
         if folder.exists():
-            raise UnreadableCommit(f"The path {folder} is not a folder.")
-        raise UnreadableCommit(f"The commit folder {folder} does not exist. Create it before running the commit.")
+            raise InvalidCommitFolder(f"The path {folder} is not a folder.")
+        raise InvalidCommitFolder(f"The commit folder {folder} does not exist. Create it before running the commit.")
 
 
 def _located_verb(git_words: list[str], cwd: Path) -> tuple[Path, int] | None:
@@ -162,8 +213,8 @@ def _flag_cwd(flag: str, current: Path, value: str) -> Path:
 def _alias(verb: str, flags: list[str], context: _GitContext) -> str | None:
     try:
         return git_port.view().config_value(context.cwd, f"alias.{verb}", flags=flags, env=_alias_env(verb, context.prefix))
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise UnreadableCommit(f"The commit gate could not check whether git {verb} is an alias: {exc}. {PLAIN_COMMIT}") from exc
+    except (OSError, subprocess.SubprocessError, UnreadableCommit):
+        return None
 
 
 def _alias_env(verb: str, prefix: list[str]) -> dict[str, str]:
@@ -173,23 +224,10 @@ def _alias_env(verb: str, prefix: list[str]) -> dict[str, str]:
     return {**os.environ, **assigned}
 
 
-def _shell_alias(verb: str, alias: str) -> str:
-    if "commit" in alias:
-        raise UnreadableCommit(f"git {verb} is a shell alias that runs commit, so the commit gate cannot read it. {PLAIN_COMMIT}")
-    return SHELL_ALIAS
-
-
-def _alias_words(verb: str, alias: str) -> list[str]:
-    try:
-        return shlex.split(alias)
-    except ValueError as exc:
-        raise UnreadableCommit(f"The commit gate cannot read the quoting of the git {verb} alias. {PLAIN_COMMIT}") from exc
-
-
 def _refuse_location_override(prefix: list[str]) -> None:
     reason = _location_override(prefix)
     if reason is not None:
-        raise UnreadableCommit(reason)
+        raise (UnreadableCommit if reason == DYNAMIC_INDEX else RelocatedCommit)(reason)
 
 
 def _location_override(prefix: list[str]) -> str | None:

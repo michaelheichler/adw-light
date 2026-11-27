@@ -24,7 +24,8 @@ def _process_key(payload: str, child: _Walk) -> tuple[object, ...]:
     alternates = tuple(sorted((name, tuple(function.body for function in bodies)) for name, bodies in child.alternates.items()))
     return (
         payload, str(child.cwd), child.shell, functions, alternates, tuple(sorted(child.exported_functions)),
-        child.relocated, child.commit_variable, child.unseen_writes, child.run.git_configured, bool(child.touched),
+        child.relocated, child.unseen_writes, child.run.git_configured, bool(child.touched), child.created,
+        child.initialized,
     )
 
 
@@ -32,15 +33,17 @@ def _function_key(walk: _Walk, function: Function, inputs: dict[int, Input], arg
     return (
         function, tuple(args), walk.cwd, frozenset(walk.variables.items()), frozenset(walk.functions.items()),
         frozenset(walk.aliases.items()), frozenset(walk.exported_functions), frozenset(walk.alternates.items()),
-        walk.function_stack, walk.depth, walk.relocated, walk.commit_variable, walk.unseen_writes, walk.physical,
-        walk.shell, frozenset(inputs.items()), walk.run.git_configured, bool(walk.touched),
+        walk.function_stack, walk.depth, walk.relocated, walk.unseen_writes, walk.physical,
+        walk.shell, frozenset(inputs.items()), walk.run.git_configured, bool(walk.touched), walk.created,
+        walk.initialized,
     )
 
 
 def _left_state(walk: _Walk) -> tuple[object, ...]:
     return (
         walk.cwd, walk.functions, walk.aliases, walk.exported_functions, walk.alternates,
-        walk.relocated, walk.physical, walk.fds if walk.fds_replaced else None,
+        walk.relocated, walk.physical, walk.fds if walk.fds_replaced else None, walk.created,
+        walk.initialized,
     )
 
 

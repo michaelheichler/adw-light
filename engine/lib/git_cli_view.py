@@ -3,7 +3,9 @@ from __future__ import annotations
 import functools
 import glob
 import os
+import re
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -14,6 +16,20 @@ NO_REPOSITORY = "not a git repository"
 NO_REPOSITORY_EXIT = 128
 GREP_REVISION = "HEAD"
 SNAPSHOT_SECONDS = 5
+OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+TIP_FORMAT = "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype) %(refname)"
+ROOT_REFS = [True]
+
+
+def _commit_tips(text: str) -> dict[str, str]:
+    tips = {}
+    for line in text.splitlines():
+        fields = line.split(" ", 4)
+        if len(fields) == 5 and fields[1] == "commit":
+            tips[fields[4]] = fields[0]
+        elif len(fields) == 5 and fields[3] == "commit":
+            tips[fields[4]] = fields[2]
+    return tips
 
 
 @functools.lru_cache(maxsize=512)
@@ -38,6 +54,26 @@ def _git_list(arguments: list[str], directory: Path, timeout: int = LIST_SECONDS
     except (OSError, subprocess.SubprocessError):
         return None
     return [path for path in listed.stdout.split("\0") if path] if listed.returncode == 0 else None
+
+
+def _batch_blobs(data: bytes, paths: list[str]) -> dict[str, bytes]:
+    blobs, offset = {}, 0
+    for path in paths:
+        end = data.find(b"\n", offset)
+        if end < 0:
+            break
+        header = data[offset:end]
+        offset = end + 1
+        if header.endswith((b" missing", b" ambiguous")):
+            continue
+        fields = header.split(b" ")
+        if len(fields) != 3 or not fields[2].isdigit():
+            break
+        size = int(fields[2])
+        if fields[1] == b"blob":
+            blobs[path] = data[offset:offset + size]
+        offset += size + 1
+    return blobs
 
 
 def _tree_blob(entry: str) -> tuple[str, str]:
@@ -70,7 +106,26 @@ def _optional(root: Path, *args: str, timeout: int = 30, errors: str = "replace"
     return done.stdout if done.returncode == 0 else None
 
 
-def _baseline(root: Path, args: list[str], until: float | None) -> str | None:
+def _bounded_bytes(root: Path, args: list[str], until: float | None) -> bytes | None:
+    timeout = LIST_SECONDS if until is None else min(LIST_SECONDS, until - time.monotonic())
+    if timeout <= 0:
+        return None
+    try:
+        result = subprocess.run(["git", *args], cwd=root, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _optional_bytes(root: Path, *args: str) -> bytes | None:
+    try:
+        result = subprocess.run(["git", *args], cwd=root, capture_output=True, timeout=LIST_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _baseline(root: Path, args: list[str], until: float | None, stdin: str | None = None) -> str | None:
     try:
         from .baseline import GIT_TIMEOUT_SECONDS, remaining
     except ImportError:
@@ -79,7 +134,7 @@ def _baseline(root: Path, args: list[str], until: float | None) -> str | None:
     timeout = GIT_TIMEOUT_SECONDS if left is None else min(GIT_TIMEOUT_SECONDS, left)
     try:
         result = subprocess.run(
-            ["git", *args], cwd=str(root), text=True, capture_output=True,
+            ["git", *args], cwd=str(root), text=True, capture_output=True, input=stdin,
             check=True, timeout=timeout, errors="replace",
         )
     except subprocess.TimeoutExpired:
@@ -88,6 +143,24 @@ def _baseline(root: Path, args: list[str], until: float | None) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout
+
+
+def _ancestry(root: Path, revision: str, head: str, until: float | None) -> bool | None:
+    try:
+        from .baseline import GIT_TIMEOUT_SECONDS, remaining
+    except ImportError:
+        from baseline import GIT_TIMEOUT_SECONDS, remaining
+    left = remaining(until)
+    timeout = GIT_TIMEOUT_SECONDS if left is None else min(GIT_TIMEOUT_SECONDS, left)
+    try:
+        done = subprocess.run(["git", "merge-base", "--is-ancestor", revision, head], cwd=str(root),
+                              capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        remaining(until)
+        return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {0: True, 1: False}.get(done.returncode)
 
 
 def _not_repository(reason: str) -> Exception:
@@ -167,6 +240,45 @@ class CliGitView:
     def disk_paths(self, root: Path) -> list[str] | None:
         return _listing(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
 
+    def porcelain_status(self, root: Path, *, until: float | None = None) -> list[str] | None:
+        args = ["--no-optional-locks", "status", "--porcelain", "-z", "-uall", "--no-renames"]
+        data = _bounded_bytes(root, args, until)
+        return None if data is None else [os.fsdecode(row) for row in data.split(b"\0") if row]
+
+    def head_bytes(self, root: Path, path: str) -> bytes | None:
+        return _optional_bytes(root, "show", f"HEAD:{path}")
+
+    def head_blobs(self, root: Path, paths: Sequence[str], *, until: float | None = None) -> dict[str, bytes] | None:
+        return self.revision_blobs(root, "HEAD", paths, until=until)
+
+    def tree_changes(self, root: Path, old: str, new: str, *, until: float | None = None) -> list[str] | None:
+        if not OBJECT_ID.fullmatch(old) or not OBJECT_ID.fullmatch(new):
+            return None
+        raw = _bounded_bytes(root, ["diff-tree", "-r", "--no-renames", "--name-only", "-z", old, new, "--"], until)
+        return None if raw is None else [os.fsdecode(name) for name in raw.split(b"\0") if name]
+
+    def revision_blobs(self, root: Path, revision: str, paths: Sequence[str], *,
+                       until: float | None = None) -> dict[str, bytes] | None:
+        if revision != "HEAD" and not OBJECT_ID.fullmatch(revision):
+            return None
+        plain = [path for path in dict.fromkeys(paths) if "\n" not in path and "\r" not in path]
+        left = SNAPSHOT_SECONDS if until is None else min(SNAPSHOT_SECONDS, until - time.monotonic())
+        if left <= 0:
+            return None
+        request = b"".join(revision.encode() + b":" + os.fsencode(path) + b"\n" for path in plain)
+        try:
+            done = subprocess.run(["git", "cat-file", "--batch"], cwd=root, input=request, capture_output=True,
+                                  timeout=left, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode != 0:
+            return None
+        blobs = _batch_blobs(done.stdout, plain)
+        for path in paths:
+            if path not in plain and (content := _optional_bytes(root, "show", f"{revision}:{path}")) is not None:
+                blobs[path] = content
+        return blobs
+
     def clean_blob_ids(self, root: Path) -> dict[str, str] | None:
         dirty = _git_list(["status", "--porcelain=v1", "-z", "--untracked-files=no", "--no-renames"], root, SNAPSHOT_SECONDS)
         if dirty is None:
@@ -179,16 +291,20 @@ class CliGitView:
         listed = _git_list(["ls-files", "-s", "-z"], root, SNAPSHOT_SECONDS)
         return None if listed is None else {path: meta for meta, _, path in (entry.partition("\t") for entry in listed)}
 
-    def ignored_files(self, root: Path) -> list[str] | None:
-        return _git_list(["ls-files", "-z", "--others", "--ignored", "--exclude-standard"], root, SNAPSHOT_SECONDS)
+    def ignored_files(self, root: Path, *, config_only: bool = False, directory: bool = False,
+                      timeout: float = 2) -> list[str] | None:
+        spec = ["--", ":(glob,icase)**/.agent-discipline.json"] if config_only else []
+        folded = ["--directory"] if directory else []
+        return _git_list(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", *folded, *spec], root, timeout)
 
     def index_paths(self, root: Path, index_file: Path | None = None) -> list[str] | None:
         return _listing(root, ["ls-files", "-z"], index_file)
 
-    def tree_paths(self, root: Path, tree: str, pathspecs: Sequence[str]) -> list[str] | None:
+    def tree_paths(self, root: Path, tree: str, pathspecs: Sequence[str], *, until: float | None = None) -> list[str] | None:
         if tree.startswith("-"):
             return None
-        return _git_list(["ls-tree", "-r", "-z", "--name-only", tree, "--", *pathspecs], root)
+        raw = _bounded_bytes(root, ["ls-tree", "-r", "-z", "--name-only", tree, "--", *pathspecs], until)
+        return None if raw is None else [os.fsdecode(name) for name in raw.split(b"\0") if name]
 
     def matched_paths(self, root: Path, pathspecs: Sequence[str]) -> list[str] | None:
         expanded = [match for pattern in pathspecs for match in glob.glob(pattern, root_dir=root, recursive=True, include_hidden=True)]
@@ -226,9 +342,9 @@ class CliGitView:
             return None
         return _git_list(["diff", "--name-only", "-z", "--no-renames", *spans, "--"], root)
 
-    def commit_parents(self, root: Path, ref: str) -> list[str] | None:
-        rows = _git_list(["rev-list", "--parents", "-n", "1", "--end-of-options", ref, "--"], root)
-        return rows[0].split()[1:] if rows and len(rows) == 1 else None
+    def commit_parents(self, root: Path, ref: str, *, until: float | None = None) -> list[str] | None:
+        text = _baseline(root, ["rev-list", "--parents", "-n", "1", "--end-of-options", ref, "--"], until)
+        return text.split()[1:] if text else None
 
     def head_text(
         self, root: Path, path: str, revision: str = "HEAD", *, until: float | None = None,
@@ -256,6 +372,76 @@ class CliGitView:
             return self.index_bytes(root, path, index_file).decode("utf-8", "replace")
         except (OSError, subprocess.SubprocessError):
             return None
+
+    def commit_bytes(self, root: Path, revision: str, path: str, *, until: float | None = None) -> bytes | None:
+        if revision.startswith("-"):
+            return None
+        return _bounded_bytes(root, ["cat-file", "blob", f"{revision}:{path}"], until)
+
+    def commit_head(self, root: Path, *, until: float | None = None) -> str | None:
+        text = _baseline(root, ["rev-parse", "--revs-only", "--verify", "HEAD"], until)
+        if text is not None:
+            return text.strip()
+        ref = _baseline(root, ["symbolic-ref", "--quiet", "HEAD"], until)
+        return "" if ref and _baseline(root, ["for-each-ref", ref.strip()], until) == "" else None
+
+    def head_tips(self, root: Path, *, until: float | None = None) -> tuple[str, dict[str, str]] | None:
+        if ROOT_REFS:
+            text = _baseline(root, ["for-each-ref", "--include-root-refs", TIP_FORMAT], until)
+            if text is not None:
+                tips = _commit_tips(text)
+                return tips.get("HEAD", ""), {name: tip for name, tip in tips.items() if name.startswith("refs/")}
+            ROOT_REFS.clear()
+        head = self.commit_head(root, until=until)
+        tips = self.ref_tips(root, until=until) if head is not None else None
+        return None if head is None or tips is None else (head, tips)
+
+    def ref_tips(self, root: Path, *, until: float | None = None) -> dict[str, str] | None:
+        text = _baseline(root, ["for-each-ref", TIP_FORMAT], until)
+        return None if text is None else _commit_tips(text)
+
+    def new_commits(self, root: Path, tips: Sequence[str], known: Sequence[str], *, since: int, limit: int,
+                    until: float | None = None) -> list[str] | None:
+        if not all(OBJECT_ID.fullmatch(name) for name in (*tips, *known)):
+            return None
+        if not tips:
+            return []
+        lines = [*tips, *("^" + name for name in known)]
+        args = ["rev-list", f"--max-count={limit}", *([f"--max-age={since}"] if since > 0 else []), "--stdin"]
+        text = _baseline(root, args, until, "\n".join(lines) + "\n")
+        return None if text is None else text.split()
+
+    def commit_reachable(self, root: Path, revision: str, *, until: float | None = None) -> bool | None:
+        if not OBJECT_ID.fullmatch(revision):
+            return None
+        branches = _baseline(root, ["for-each-ref", "--count=1", f"--contains={revision}", "--format=%(refname)", "refs/heads"], until)
+        if branches is None:
+            return None
+        if branches.strip():
+            return True
+        head = self.commit_head(root, until=until)
+        if not head:
+            return None if head is None else False
+        return _ancestry(root, revision, head, until)
+
+    def commit_message(self, root: Path, revision: str, *, until: float | None = None) -> str | None:
+        args = ["show", "--no-notes", "--no-show-signature", "-s", "--pretty=format:%B", "--end-of-options", revision, "--"]
+        raw = _bounded_bytes(root, args, until)
+        return None if raw is None else raw.decode("utf-8", "replace")
+
+    def commit_paths(self, root: Path, revision: str, *, until: float | None = None) -> list[str] | None:
+        args = ["diff-tree", "--root", "--diff-merges=first-parent", "--no-commit-id", "--no-renames", "-r", "--raw", "-z", "--diff-filter=AMT", "--end-of-options", revision, "--"]
+        raw = _bounded_bytes(root, args, until)
+        if raw is None:
+            return None
+        fields = iter(raw.rstrip(b"\0").split(b"\0"))
+        return [os.fsdecode(name) for meta, name in zip(fields, fields) if meta.split()[1] != b"160000"]
+
+    def commit_removed_paths(self, root: Path, revision: str, *, until: float | None = None) -> list[str] | None:
+        args = ["diff-tree", "--root", "--diff-merges=first-parent", "--no-commit-id", "--no-renames", "-r", "--name-only",
+                "-z", "--diff-filter=D", "--end-of-options", revision, "--"]
+        raw = _bounded_bytes(root, args, until)
+        return None if raw is None else [os.fsdecode(name) for name in raw.split(b"\0") if name]
 
     def commit_time(self, root: Path, commit: str) -> int | None:
         text = None if commit.startswith("-") else _optional(root, "show", "-s", "--format=%ct", commit)

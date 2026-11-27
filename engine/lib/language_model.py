@@ -167,6 +167,6 @@ def python_layer(text: str) -> Layer:
         walk.failure(error)
     try:
         ast.parse(text)
-    except (SyntaxError, ValueError) as error:
+    except (SyntaxError, ValueError, MemoryError, RecursionError) as error:
         walk.failure(error)
     return Layer(PYTHON, True, tuple(sorted(walk.nodes, key=lambda node: (node.start, -node.end))))

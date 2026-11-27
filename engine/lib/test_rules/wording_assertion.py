@@ -3,10 +3,10 @@ from __future__ import annotations
 import ast
 import re
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 
 try:
-    from . import Hit, Rule, RuleSet, Unit, module_scopes, module_tree
+    from . import Hit, Rule, RuleSet, Unit, file_lines, module_scopes, module_tree
     from ._captures import EXCEPTION, LOG, captures
     from ._expectations import ASSERTED, COMPUTED, Bindings, Expected, Scope, dotted, expected_texts, text_of
     from ._layer_wording import LOCATOR, is_layer_transformation, layer_expectations
@@ -16,7 +16,7 @@ try:
     from ._ui_locators import LINK_TEXT_CONSTANTS, is_locator, selector_text, selects
     from ..test_units import PYTHON
 except ImportError:
-    from test_rules import Hit, Rule, RuleSet, Unit, module_scopes, module_tree
+    from test_rules import Hit, Rule, RuleSet, Unit, file_lines, module_scopes, module_tree
     from test_rules._captures import EXCEPTION, LOG, captures
     from test_rules._expectations import ASSERTED, COMPUTED, Bindings, Expected, Scope, dotted, expected_texts, text_of
     from test_rules._layer_wording import LOCATOR, is_layer_transformation, layer_expectations
@@ -62,13 +62,19 @@ def _assigned(node: ast.AST) -> ast.expr | None:
     return node.target if isinstance(node, ast.AnnAssign) else None
 
 
-def _string_assignments(nodes: list[ast.AST]) -> Iterator[tuple[str, str]]:
+def _bound_text(value: object) -> str | ast.JoinedStr | None:
+    if isinstance(value, ast.JoinedStr):
+        return value
+    return value.value if isinstance(value, ast.Constant) and isinstance(value.value, str) else None
+
+
+def _string_assignments(nodes: list[ast.AST]) -> Iterator[tuple[str, str | ast.JoinedStr]]:
     for root in nodes:
         for node in ast.walk(root):
             target = _assigned(node)
-            value = getattr(node, "value", None)
-            if isinstance(target, ast.Name) and isinstance(value, ast.Constant) and isinstance(value.value, str):
-                yield target.id, value.value
+            bound = _bound_text(getattr(node, "value", None))
+            if isinstance(target, ast.Name) and bound is not None:
+                yield target.id, bound
 
 
 def _single_bindings(nodes: list[ast.AST]) -> Bindings:
@@ -107,11 +113,17 @@ def _sentence(found: Expected) -> str:
     return " ".join(LOCATION_RE.sub(" ", found.text).split())
 
 
-def _verdicts(found: Expected, transforms: Transforms, path: str) -> Iterator[tuple[str, str | None]]:
+def _is_contract(found: Expected, contracts: Collection[str]) -> bool:
+    return found.kind == ASSERTED and bool(found.contract) and found.contract in contracts
+
+
+def _verdicts(
+    found: Expected, transforms: Transforms, path: str, contracts: Collection[str],
+) -> Iterator[tuple[str, str | None]]:
     if _typed_location(found.typed):
         yield LOCATION_RULE, None
     sentence = _sentence(found)
-    if not is_prose(sentence):
+    if _is_contract(found, contracts) or not is_prose(sentence):
         return
     location = _location(sentence, path)
     if location is None and found.kind == ASSERTED and transforms(sentence):
@@ -119,16 +131,16 @@ def _verdicts(found: Expected, transforms: Transforms, path: str) -> Iterator[tu
     yield KIND_RULES[found.kind], location
 
 
-def _flagged(found: Expected, transforms: Transforms, path: str) -> bool:
+def _flagged(found: Expected, transforms: Transforms, path: str, contracts: Collection[str]) -> bool:
     if _typed_location(found.typed):
         return True
     sentence = _sentence(found)
-    if not is_prose(sentence):
+    if _is_contract(found, contracts) or not is_prose(sentence):
         return False
     return found.kind != ASSERTED or not transforms(sentence) or locate(sentence, path) is not None
 
 
-def _written(lines: list[str], line: int, fallback: str) -> str:
+def _written(lines: tuple[str, ...], line: int, fallback: str) -> str:
     return lines[line - 1].strip() if line <= len(lines) else fallback
 
 
@@ -178,23 +190,23 @@ def _scoped(unit: Unit, text: str) -> tuple[list[Expected], Transforms] | None:
     return layered.found, lambda sentence: is_layer_transformation(layered.inputs, sentence)
 
 
-def wording_lines(unit: Unit, text: str) -> list[tuple[int, str]]:
+def wording_lines(unit: Unit, text: str, contracts: Collection[str] = ()) -> list[tuple[int, str]]:
     scoped = _scoped(unit, text)
     if scoped is None:
         return []
     found, transforms = scoped
-    return [(item.line, item.text) for item in found if _flagged(item, transforms, unit.path)]
+    return [(item.line, item.text) for item in found if _flagged(item, transforms, unit.path, contracts)]
 
 
-def check(unit: Unit, text: str) -> list[Hit]:
+def check(unit: Unit, text: str, contracts: Collection[str] = ()) -> list[Hit]:
     scoped = _scoped(unit, text)
     if scoped is None:
         return []
     expectations, transforms = scoped
-    lines = text.splitlines()
+    lines = file_lines(text)
     hits: dict[tuple[int, str], Hit] = {}
     for found in expectations:
-        for rule, location in _verdicts(found, transforms, unit.path):
+        for rule, location in _verdicts(found, transforms, unit.path, contracts):
             hits.setdefault((found.line, rule), Hit(rule, found.line, _written(lines, found.line, found.text), location))
     return [hits[key] for key in sorted(hits)]
 

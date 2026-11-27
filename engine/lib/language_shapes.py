@@ -5,6 +5,10 @@ from enum import StrEnum
 from typing import NamedTuple
 
 DART_TEST_CALLS = frozenset({"test", "testWidgets"})
+JS_TEST_HOOKS = frozenset({
+    "before", "after", "beforeEach", "afterEach", "beforeAll", "afterAll", "setup", "teardown",
+    "suiteSetup", "suiteTeardown", "aroundEach", "aroundAll", "onTestFailed", "onTestFinished",
+})
 SELF_ROOTS = frozenset({"this", "self", "$this", "static", "parent", "super"})
 ASSERT_PREFIXES = ("assert", "expect", "xctassert", "refute", "should", "must_", "wont_")
 ASSERT_ROOTS = frozenset({"assert", "Assert", "Assertions", "require", "expect", "XCTAssert", "Truth"})

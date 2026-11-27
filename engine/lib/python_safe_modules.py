@@ -56,7 +56,8 @@ HASH_FUNCTIONS = ("blake2b", "blake2s", "file_digest", "md5", "sha1", "sha224", 
 DATETIME_FACTORIES = ("fromisoformat", "fromtimestamp", "now", "strptime", "today", "utcnow")
 
 IMPORTABLE = frozenset({
-    "ast", "collections", "datetime", "hashlib", "html", "itertools", "math", "os.path", "pathlib", "re", "tomllib", "yaml",
+    "ast", "collections", "datetime", "hashlib", "html", "itertools", "math", "os.path", "pathlib", "re", "tempfile",
+    "tomllib", "yaml",
 })
 INERT_MODULES = frozenset({
     "base64", "binascii", "bisect", "copy", "decimal", "difflib", "enum", "fnmatch", "fractions", "functools", "heapq",
@@ -73,6 +74,7 @@ FUNCTIONS: dict[str, Kind] = {
     **{f"math.{name}": "value" for name in MATH_FUNCTIONS},
     "collections.Counter": "counter", "collections.OrderedDict": "dict",
     **{f"hashlib.{name}": "hash" for name in HASH_FUNCTIONS},
+    "tempfile.gettempdir": "text",
     "tomllib.load": "json", "tomllib.loads": "json",
     "yaml.safe_load": "json", "yaml.safe_load_all": ("sequence", ("json",)),
     "ast.parse": "ast_tree", "ast.dump": "text", "ast.literal_eval": "json",

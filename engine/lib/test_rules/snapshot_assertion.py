@@ -5,11 +5,11 @@ import re
 from collections.abc import Iterator
 
 try:
-    from . import Hit, Rule, RuleSet, module_scopes, module_tree
+    from . import Hit, Rule, RuleSet, file_lines, module_scopes, module_tree
     from ..brace_functions import masked_code
     from ..test_units import JAVASCRIPT, PYTHON, Unit, javascript_assertions
 except ImportError:
-    from test_rules import Hit, Rule, RuleSet, module_scopes, module_tree
+    from test_rules import Hit, Rule, RuleSet, file_lines, module_scopes, module_tree
     from brace_functions import masked_code
     from test_units import JAVASCRIPT, PYTHON, Unit, javascript_assertions
 
@@ -158,7 +158,7 @@ def _lines_for(unit: Unit, text: str) -> set[int]:
 
 
 def check(unit: Unit, text: str) -> list[Hit]:
-    written = text.splitlines()
+    written = file_lines(text)
     return [
         Hit(RULE, line, written[line - 1].strip() if line <= len(written) else unit.name)
         for line in sorted(_lines_for(unit, text))

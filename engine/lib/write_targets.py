@@ -72,7 +72,7 @@ from lib.git_targets import (
     _is_directory_pathspec,
 )
 from lib.inplace_targets import sed_reads_only, sed_script_known
-from lib.shell_expansion import Expansions
+from lib.shell_expansion import Expansions, _link_pairs
 from lib.shell_parse import (
     _bare,
     _basename,
@@ -118,8 +118,23 @@ def writes_by_verb(segment: list[str]) -> bool:
 
 
 def mutation_targets(segment: list[str], expansions: Expansions) -> list[str]:
+    expansions = _without_new_link_aliases(segment, expansions)
     paths = [_expand_home(path) for path in _mutation_words(segment, expansions).paths if _is_file_target(path)]
     return paths + [alias for path in paths for alias in expansions.aliases(path)]
+
+
+def _without_new_link_aliases(segment: list[str], expansions: Expansions) -> Expansions:
+    index = _command_word_index(segment)
+    if index < len(segment) and _basename(segment[index]) == "ln":
+        args = _without_redirects(segment[index + 1:])
+        words = [expansions.path(arg) for arg in args]
+        if None not in words and any(word == "--symbolic" or (word.startswith("-") and not word.startswith("--") and "s" in word) for word in words):
+            created = {os.path.normpath(link) for link, _ in _link_pairs(words)}
+            expansions = expansions._replace(links=tuple(pair for pair in expansions.links if pair[0] not in created))
+    return expansions
+
+
+protected_mutation_targets = mutation_targets
 
 
 def unknown_targets(segment: list[str], expansions: Expansions) -> list[str]:
@@ -158,10 +173,10 @@ def _verb_words(segment: list[str], expansions: Expansions) -> list[tuple[str, s
         gated = _copy_gate(verb, args, expansions)
         if not gated.unresolved:
             return [(path, path) for path in gated.paths]
-    known = [word for word in words if word is not None]
-    slots: list[Slot] = _destination_slots(verb, known) if len(known) == len(words) else []
+    operands = [word if word is not None else "" for word in words]
+    slots = _destination_slots(verb, operands)
     for slot in slots:
-        value = known[slot.position] if verb in DESTINATION_ALL_ARGS_VERBS else expansions.path(args[slot.position])
+        value = words[slot.position] if verb in DESTINATION_ALL_ARGS_VERBS else expansions.path(args[slot.position])
         found.append((args[slot.position], None if value is None else value[len(slot.prefix):]))
     return found
 
@@ -191,7 +206,7 @@ def _merge_words(args: list[str], expansions: Expansions) -> list[tuple[str, str
     return [(raw, None if path is None else os.path.join(base, path))]
 
 
-def callback_writes(segment: list[str], expansions: Expansions) -> list[str]:
+def callback_writes(segment: list[str], expansions: Expansions, *, safe_feed: bool = False) -> list[str]:
     index = _command_word_index(segment)
     verb = _basename(segment[index]) if index < len(segment) else ""
     args = [_bare(token) for token in _without_redirects(segment[index + 1:])]
@@ -202,7 +217,7 @@ def callback_writes(segment: list[str], expansions: Expansions) -> list[str]:
         return [f"{verb} {call[0]}" for call in readers if not _reads_only(call, hazards, fed=False)]
     if verb == "xargs":
         call = _xargs_call(args)
-        return [] if not call or _reads_only(call, hazards, fed=True) else [f"xargs {call[0]}"]
+        return [] if not call or _reads_only(call, hazards, fed=not safe_feed) else [f"xargs {call[0]}"]
     return _find_writes(args, hazards) if verb == "find" else []
 
 
@@ -268,12 +283,48 @@ def gated_test_targets(segment: list[str], expansions: Expansions) -> GatedTarge
     return _patch_targets(segment[index + 1:]) if verb == "patch" else NO_TARGETS
 
 
+def worktree_add(segment: list[str], expansions: Expansions) -> bool:
+    index = _command_word_index(segment)
+    if index >= len(segment) or _basename(segment[index]) != "git":
+        return False
+    args = _without_redirects(segment[index + 1:])
+    _, subcommand = _git_base([_bare(word) for word in args])
+    return [expansions.pattern(word) for word in args[subcommand:subcommand + 2]] == ["worktree", "add"]
+
+
 def _copy_or_git(segment: list[str], index: int, expansions: Expansions) -> GatedTargets:
     verb = _basename(segment[index])
+    if verb == "git" and worktree_add(segment, expansions):
+        return NO_TARGETS
     args = _without_redirects(segment[index + 1:])
-    words = [word for word in (expansions.pattern(token) for token in args) if word is not None]
+    if verb == "git":
+        bare = [_bare(token) for token in args]
+        _, position = _git_base(bare)
+        command = bare[position:position + 1]
+        if command in (["merge"], ["revert"], ["cherry-pick"]):
+            return NO_TARGETS
+        if command == ["stash"] and bare[position + 1:position + 2] in (["pop"], ["apply"]):
+            return NO_TARGETS
+    resolved = (token if verb == "git" and token in {"--source=stash@{0}", "stash@{0}"} else expansions.pattern(token)
+                for token in args)
+    words = [word for word in resolved if word is not None]
     if len(words) != len(args):
         return UNRESOLVED if verb in COPY_VERBS or _git_changes_paths(args, expansions) else NO_TARGETS
     if verb == "git":
-        return _git_targets(words, _GitSource(plain_call=index == 0, stdin=stdin_source(segment[index + 1:]), cwd=expansions.cwd))
+        based = _with_env_worktree(segment[:index], words, expansions)
+        return _git_targets(based, _GitSource(plain_call=index == 0, stdin=stdin_source(segment[index + 1:]), cwd=expansions.cwd))
     return _copy_gate(verb, args, expansions)
+
+
+def _with_env_worktree(prefix: list[str], words: list[str], expansions: Expansions) -> list[str]:
+    base, subcommand = _git_base(words)
+    if any(word == "--work-tree" or word.startswith(WORK_TREE_PREFIX) for word in words[:subcommand]):
+        return words
+    settings = [word.partition("=")[2] for word in prefix if word.startswith("GIT_WORK_TREE=")]
+    root = expansions.path(settings[-1]) if settings else None
+    if not root or not os.path.isabs(root):
+        return words
+    directory = os.path.abspath(os.path.join(expansions.cwd or ".", base))
+    if os.path.commonpath((directory, root)) == os.path.normpath(root):
+        return words
+    return [*words[:subcommand], WORK_TREE_PREFIX + root, *words[subcommand:]]

@@ -5,6 +5,7 @@ import re
 BRACE_SKIP_RE = re.compile(r"""[$`'"\\*?\[]|^[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=""", re.ASCII)
 LOOP_VALUE_RE = re.compile(r"[\w./@%+,:=-]+", re.ASCII)
 NAME_RE = re.compile(r"[A-Za-z_]\w*", re.ASCII)
+SPLITTER_RE = re.compile(r"\bIFS\b")
 REDIRECT_TAIL_RE = re.compile(r"(?:[<>]|>[&|])$")
 MAX_WORDS = 128
 MAX_BRACE_WORD = 512
@@ -18,12 +19,12 @@ REBINDING_WORDS = frozenset({
 })
 
 
-def unfolded(tokens: list[str]) -> list[str]:
+def unfolded(tokens: list[str], unroll: bool = True) -> list[str]:
     words: list[str] = []
     for position, token in enumerate(tokens):
         redirected = "<" in token or ">" in token or (position and REDIRECT_TAIL_RE.search(tokens[position - 1]))
         words += [token] if redirected else brace_words(token)
-    return _unrolled(words)
+    return _unrolled(words) if unroll and not any(SPLITTER_RE.search(word) for word in words) else words
 
 
 def brace_words(token: str) -> list[str]:

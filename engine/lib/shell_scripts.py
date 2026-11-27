@@ -5,7 +5,7 @@ import unicodedata
 from pathlib import Path
 from typing import NamedTuple
 
-from lib.opaque_write import _bare_interpreter_name, _execution_contexts, _interpreter_run
+from lib.opaque_write import _bare_interpreter_name
 from lib.shell_expansion import Expansions
 from lib.shell_parse import _bare, _basename, _command_word_index, line_segments, write_paths
 from lib.write_targets import _without_redirects, mutation_targets, unknown_targets
@@ -45,7 +45,7 @@ GUARD_FORMS = (
     GUARD_LEAD + r"if\s+{test}\s*;\s*(?=then\b)(?:(?!\b(?:else|elif|fi)\b)[\s\S])*?" + GUARD_LEAD + GUARDED_CALL,
 )
 QUOTED_KINDS = frozenset({"single", "double"})
-HIDDEN_KINDS = frozenset({"escape", "backtick", "subst", "procsub"})
+HIDDEN_KINDS = frozenset({"escape", "ansi", "backtick", "subst", "procsub"})
 DYNAMIC_WRITE_MARKS = ("$", "`", "/proc/", "/dev/fd/")
 
 
@@ -105,7 +105,7 @@ def changed_script_inputs(command: str, cwd: Path):
         if index >= len(segment):
             continue
         name = _basename(segment[index])
-        if name not in {"sh", "bash", "python3", "node"}:
+        if name not in {"sh", "bash"}:
             continue
         args = _without_redirects(segment[index + 1:])
         word = _file_operand(name, args)
@@ -120,26 +120,8 @@ def changed_script_inputs(command: str, cwd: Path):
             continue
         if path is not None and not path.exists() and _guarded(command, name, _bare(word)) and not _may_write(command, path, directory):
             continue
-        prefix = [*segment[:index + 1], *options, "-c"]
-        contexts = _execution_contexts(command, cwd).get(tuple(segment), [])
-        roots = [*contexts, str(path.parent)] if contexts and path else contexts
-        run = _interpreter_run(name, script_text(path) if path is not None else None, prefix, {tuple(prefix): roots})
-        yield run, directory
-
-
-def unresolved_shell_script(command: str, cwd: Path) -> bool:
-    expansions = command_expansions(command, cwd)
-    for segment, _directory in _segment_cwds(command, cwd, None):
-        index = _payload_command_index(segment)
-        if index >= len(segment) or _basename(segment[index]) not in {"sh", "bash"}:
-            continue
-        args = _without_redirects(segment[index + 1:])
-        word = _file_operand(_basename(segment[index]), args)
-        if word is None or word == "-" or interpreter_invocation([segment[index], *args[:args.index(word)], word]):
-            continue
-        if not expansions.path(resolve_literal_directories(word, command)):
-            return True
-    return False
+        if path is not None and (body := script_text(path)) is not None:
+            yield body, directory
 
 
 def _guarded(command: str, name: str, word: str) -> bool:

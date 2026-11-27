@@ -13,6 +13,7 @@ from .find_matches import find_calls
 from .folder_trees import folder_trees
 from .shell_expansion import Expansions, expansions_for
 from .shell_lines import command_lines
+from .shell_unfold import SPLITTER_RE
 from .shell_operators import REDIRECT_HEAD_RE
 from .shell_text import SCRIPT_READERS, ShellBody, _substitutions, shell_tokens
 from .xargs_feed import fed_calls
@@ -108,7 +109,8 @@ def write_targets(command: str) -> list[tuple[str, str]]:
 
 def literal_writes(command: str) -> list[LiteralWrite]:
     expansions = command_expansions(command)
-    rows = [write for line, bodies, _ in _logical_lines(command) for write in _line_writes(line, bodies)]
+    lines = _logical_lines(command, physical=False)
+    rows = [write for line, bodies, _ in lines for write in _line_writes(line, bodies)]
     return [write._replace(path=path) for write in rows if (path := expansions.path(write.path)) is not None]
 
 
@@ -173,13 +175,14 @@ def _fed(producer: list[str], consumer: list[str]) -> tuple[tuple[str, ...], ...
 
 
 def line_segments(command: str) -> list[list[str]]:
-    return [segment for line in command_lines(command) for segment in _segments(line.text)]
+    unroll = SPLITTER_RE.search(command) is None
+    return [segment for line in command_lines(command) for segment in _segments(line.text, unroll)]
 
 
-def _logical_lines(command: str) -> list[tuple[str, list[str | None], list[str]]]:
+def _logical_lines(command: str, *, physical: bool = True) -> list[tuple[str, list[str | None], list[str]]]:
     rows: list[tuple[str, list[str | None], list[str]]] = []
     start = 0
-    for token in shell_tokens(command, physical=True):
+    for token in shell_tokens(command, physical=physical):
         match = token.match
         if match is not None and not (match.lastgroup == "separator" and match.group() == "\n"):
             continue
@@ -409,7 +412,10 @@ def _producer_words(args: list[str]) -> list[str] | None:
             continue
         if DYNAMIC_RE.search(token) and not (token.startswith("'") and token.endswith("'")):
             return None
-        words.append(_bare(token))
+        value = _bare(token)
+        if token.startswith('"') and _is_quoted(token):
+            value = re.sub(r'\\(["\\])', r'\1', value)
+        words.append(value)
     return words
 
 

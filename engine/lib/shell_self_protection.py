@@ -1,132 +1,78 @@
 from __future__ import annotations
 
+import fnmatch
 import os
-import re
-from collections.abc import Callable
 from pathlib import Path
 
 try:
+    from .find_matches import NAME_TESTS, PATH_TESTS, PLACEHOLDER, Node, Unsupported, _plan, deletion_starts
     from .findings import Finding, Rule
+    from .folder_trees import _split_operands, recursive_operands
     from .opaque_write import MUTATING_VERB_RE
     from .policy_cli_guard import mutates_policy
-    from .protected import POLICY_ACTION, authorized, is_install_surface_path
+    from .protected import (
+        POLICY_ACTION, _is_state_path, _literal, _resolve, _state_roots, authorized, is_install_surface_path, state_root_forms,
+    )
     from .shell_expansion import Expansions
     from .shell_parse import (
         _basename,
         _command_word_index,
-        _is_quoted,
-        _leading_assignments,
         _redirect_paths,
         _segment_text,
         _segments,
-        _words,
+        _without_redirects,
         command_expansions,
         executable_text,
         line_segments,
     )
-    from .update_policy import _segment_contexts, untrusted_update
-    from .write_targets import mutation_targets, writes_by_verb
+    from .update_policy import _segment_contexts
+    from .write_targets import mutation_targets, protected_mutation_targets, writes_by_verb
 except ImportError:
+    from lib.find_matches import NAME_TESTS, PATH_TESTS, PLACEHOLDER, Node, Unsupported, _plan, deletion_starts
     from findings import Finding, Rule
+    from lib.folder_trees import _split_operands, recursive_operands
     from opaque_write import MUTATING_VERB_RE
     from policy_cli_guard import mutates_policy
-    from protected import POLICY_ACTION, authorized, is_install_surface_path
+    from protected import (
+        POLICY_ACTION, _is_state_path, _literal, _resolve, _state_roots, authorized, is_install_surface_path, state_root_forms,
+    )
     from shell_expansion import Expansions
     from shell_parse import (
         _basename,
         _command_word_index,
-        _is_quoted,
-        _leading_assignments,
         _redirect_paths,
         _segment_text,
         _segments,
-        _words,
+        _without_redirects,
         command_expansions,
         executable_text,
         line_segments,
     )
-    from update_policy import _segment_contexts, untrusted_update
-    from write_targets import mutation_targets, writes_by_verb
+    from update_policy import _segment_contexts
+    from write_targets import mutation_targets, protected_mutation_targets, writes_by_verb
 
-INSTALLER_NAMES = frozenset({
-    "install.sh", "merge-claude-settings.py", "merge-codex-config.py", "merge-codex-hooks.py",
-})
-CAP_VARS = frozenset({
-    "CLEANCODER_FUNC_BLOCK_LINES", "ADW_FUNC_BLOCK_LINES",
-    "ADW_SENTENCE_WORD_CAP", "ADW_LIST_ITEM_CAP",
-    "ADW_MAX_SCAN_BYTES", "ADW_ALLOW_PROTECTED_EDIT",
-})
-NO_VERIFY_FLAGS = frozenset({"--no-verify", "-n"})
 STATE_DELETE_VERBS = frozenset({"rm", "unlink", "shred"})
-STATE_TARGET_RE = re.compile(r"\.adw\b|\.agent-discipline\b|agent-discipline/(?:state|ledger)|adw-unread-markers\b")
-WRITE_OR_EDIT_ACTION = "Use the Write or Edit tool for file content."
-SAVE_THEN_RUN_ACTION = "Save the script with Write or Edit, then run the file."
+GLOB_MARKS = frozenset("*?[")
+RECURSIVE_GLOB = "**"
+PARENT_PART = ".."
+MAX_BRACE_WORDS = 256
+UNBOUNDED_DEPTH = 1 << 30
 RULES: dict[str, Rule] = {
-    "install_without_sandbox_home": Rule(
-        detail="Installer or updater lacks a trusted installation route",
-        action=(
-            "Run the updater as one plain command, with the absolute path and host flags only, "
-            "for example the full home folder path followed by /.adw/bin/adw update --claude --codex --omp. "
-            "Write no ~, $HOME, variable, pipe, redirect, or second command in it. "
-            "To install from a checkout, ask the user to run ./install.sh in Terminal. "
-            "Test installers only in an isolated HOME."
-        ),
-    ),
-    "commit_gate_bypass": Rule(
-        detail="Commit skips the pre-commit gate",
-        action="Drop the no-verify flag and repair the reported finding.",
-    ),
-    "cap_override": Rule(
-        detail="Discipline cap or escape overridden on the command line",
-        action="Fix the code shape instead of raising the cap.",
-    ),
     "state_deletion": Rule(
-        detail="Watcher state or gate config deleted",
+        detail="Watcher state deleted",
         action="Leave the state in place and repair the reported finding.",
     ),
     "state_mutation": Rule(
-        detail="Watcher state or gate config mutated",
+        detail="Watcher state mutated",
         action="Leave watcher state under host control and repair the reported finding.",
     ),
     "config_seal": Rule(
-        detail="Shell command changes the project policy through adw-config",
+        detail="Shell command changes project policy",
         action=POLICY_ACTION,
     ),
     "watcher_install_surface": Rule(
         detail="Shell command mutates the live watcher install",
         action="Change the repo source and reinstall instead of editing the live install.",
-    ),
-    "inline_interpreter_write": Rule(
-        detail="Inline interpreter payload can write or is unreadable",
-        action=WRITE_OR_EDIT_ACTION,
-    ),
-    "shell_payload_block": Rule(
-        detail="Shell -c payload is unreadable or nested past one level",
-        action=WRITE_OR_EDIT_ACTION,
-    ),
-    "interpreter_heredoc_write": Rule(
-        detail="Heredoc or pipe feeding an interpreter's stdin can write or is unreadable",
-        action=SAVE_THEN_RUN_ACTION,
-    ),
-    "dynamic_heredoc_write": Rule(
-        detail="Dynamic or unterminated heredoc aimed at a file",
-        action=WRITE_OR_EDIT_ACTION,
-    ),
-    "decode_pipe_write": Rule(
-        detail="Decode pipe ends in a file write",
-        action=WRITE_OR_EDIT_ACTION,
-    ),
-    "inplace_edit_write": Rule(
-        detail="In-place editor mutates a file outside the Edit tool",
-        action=WRITE_OR_EDIT_ACTION,
-    ),
-    "opaque_source_write": Rule(
-        detail="Opaque copy source feeds a file write",
-        action=WRITE_OR_EDIT_ACTION,
-    ),
-    "dynamic_write_target": Rule(
-        detail="Shell write destination is unknown before the command runs",
-        action="Use an absolute literal destination, or the Write or Edit tool for file content.",
     ),
 }
 
@@ -134,20 +80,9 @@ RULES: dict[str, Rule] = {
 def command_findings(command: str, config: dict | None = None, home: str | os.PathLike[str] | None = None, cwd: str | os.PathLike[str] | None = None) -> list[dict]:
     if not command or authorized(config):
         return []
-    segments = _command_segments(command)
     contexts = _segment_cwds(command, cwd, home)
-    hits = []
-    if any(
-        (_runs_installer(segment) and not _sets_home(segment)) or untrusted_update(segment, home, segment_cwd)
-        for segment, segment_cwd in contexts
-    ):
-        hits.append("install_without_sandbox_home")
-    if any(_skips_commit_gate(segment) for segment in segments):
-        hits.append("commit_gate_bypass")
-    if any(_overrides_cap(segment) for segment in segments):
-        hits.append("cap_override")
     expansions = command_expansions(command, cwd)
-    hits += _protected_target_hits(segments, expansions)
+    hits = _protected_target_hits(contexts, expansions, home)
     if any(_mutates_install_surface(segment, home, expansions, folder) for segment, folder in contexts):
         hits.append("watcher_install_surface")
     if any(mutates_policy(segment, segment_cwd) for segment, segment_cwd in contexts):
@@ -155,13 +90,193 @@ def command_findings(command: str, config: dict | None = None, home: str | os.Pa
     return [_finding(rule, command) for rule in hits]
 
 
-def _protected_target_hits(segments: list[list[str]], expansions: Expansions) -> list[str]:
-    hits = []
-    if any(_deletes_state(segment, expansions) for segment in segments):
-        hits.append("state_deletion")
-    elif any(_mutates_state(segment, expansions) for segment in segments):
-        hits.append("state_mutation")
-    return hits
+def _protected_target_hits(contexts, expansions: Expansions, home) -> list[str]:
+    mutation = False
+    for segment, cwd in contexts:
+        if _deletes_state_tree(segment, expansions, home, cwd):
+            return ["state_deletion"]
+        if not _is_mutating(segment):
+            continue
+        for target in protected_mutation_targets(segment, expansions):
+            resolved = _resolve(_session_path(target, cwd), home)
+            if resolved is None or not _is_state_path(resolved, home):
+                continue
+            index = _command_word_index(segment)
+            if index < len(segment) and _basename(segment[index]) in STATE_DELETE_VERBS:
+                return ["state_deletion"]
+            mutation = True
+    return ["state_mutation"] if mutation else []
+
+
+def _deletes_state_tree(segment: list[str], expansions: Expansions, home, cwd: Path) -> bool:
+    for start in deletion_starts(segment, expansions.pattern):
+        resolved = _resolve(_session_path(start, cwd), home)
+        if resolved is not None and any(
+            resolved.is_relative_to(root) or resolved == root.parent for root in _state_roots(home)
+        ):
+            return True
+    for operand, follow in recursive_operands(segment):
+        target = expansions.path(operand)
+        if target is None:
+            continue
+        path = _literal(_session_path(target, cwd), home)
+        if path is None or (not follow and path.is_symlink()):
+            continue
+        resolved = path.resolve()
+        if any(root.is_relative_to(resolved) for root in _state_roots(home)):
+            return True
+    roots = state_root_forms(home)
+    patterns = [_literal(_session_path(word, cwd), home) for word in _removed_patterns(segment, expansions)]
+    if any(path is not None and _pattern_reaches_root(path, roots) for path in patterns):
+        return True
+    return _find_reaches_root(segment, expansions, home, cwd, roots)
+
+
+def _removed_patterns(segment: list[str], expansions: Expansions) -> list[str]:
+    index = _command_word_index(segment)
+    verb = _basename(segment[index]) if index < len(segment) else ""
+    if verb in STATE_DELETE_VERBS:
+        words = _split_operands(verb, _without_redirects(segment[index + 1:]))[1]
+    else:
+        words = [raw for raw, _ in recursive_operands(segment)]
+    spelled = [expansions.pattern(alternative) for word in words for alternative in _brace_words(word)]
+    return [pattern for pattern in spelled if pattern is not None and GLOB_MARKS.intersection(pattern)]
+
+
+def _brace_words(word: str) -> list[str]:
+    found = _brace_group(word)
+    if found is None:
+        return [word]
+    head, choices, tail = found
+    words: list[str] = []
+    for choice in choices:
+        words.extend(_brace_words(head + choice + tail))
+        if len(words) > MAX_BRACE_WORDS:
+            return [head + "*" + tail]
+    return words
+
+
+def _brace_group(word: str) -> tuple[str, list[str], str] | None:
+    depth, start, cuts, quote, escaped = 0, 0, [], "", False
+    for position, char in enumerate(word):
+        if escaped or (quote and char != quote):
+            escaped = False
+            continue
+        if char == "\\" or char in "'\"":
+            escaped = char == "\\"
+            quote = "" if quote or escaped else char
+        elif char == "{":
+            start, cuts = (position, []) if depth == 0 else (start, cuts)
+            depth += 1
+        elif char == "," and depth == 1:
+            cuts.append(position)
+        elif char == "}" and depth:
+            depth -= 1
+            inner = word[start + 1:position]
+            if depth == 0 and (cuts or ".." in inner):
+                bounds = [start, *cuts, position]
+                choices = [word[left + 1:right] for left, right in zip(bounds, bounds[1:])] if cuts else ["*"]
+                return word[:start], choices, word[position + 1:]
+    return None
+
+
+def _pattern_reaches_root(path: Path, roots: tuple[Path, ...]) -> bool:
+    parts = path.parts
+    split = next((index for index, part in enumerate(parts) if GLOB_MARKS.intersection(part)), len(parts))
+    folder, tail = Path(*parts[:split]), parts[split:]
+    if PARENT_PART in tail:
+        folder = Path(os.path.abspath(folder.joinpath(*[PARENT_PART] * tail.count(PARENT_PART))))
+        tail = ()
+    places = {Path(os.path.abspath(folder)), folder.resolve()}
+    return any(_names_reach(place, root, tail) for place in places for root in roots)
+
+
+def _names_reach(place: Path, root: Path, tail: tuple[str, ...]) -> bool:
+    if place.is_relative_to(root):
+        return True
+    if not root.is_relative_to(place):
+        return False
+    names = root.relative_to(place).parts
+    if RECURSIVE_GLOB in tail:
+        cut = tail.index(RECURSIVE_GLOB)
+        rest = tail[cut + 1:]
+        return _matches_prefix(names, tail[:cut]) and (
+            not rest or any(_glob_match(name, rest[0]) for name in names[cut:])
+        )
+    return _matches_prefix(names, tail)
+
+
+def _matches_prefix(names: tuple[str, ...], patterns: tuple[str, ...]) -> bool:
+    return all(_glob_match(name, pattern) for name, pattern in zip(names, patterns))
+
+
+def _glob_match(name: str, pattern: str, *, folded: bool = False) -> bool:
+    spelled = pattern.replace("[^", "[!")
+    return fnmatch.fnmatchcase(name.lower(), spelled.lower()) if folded else fnmatch.fnmatchcase(name, spelled)
+
+
+def _find_reaches_root(segment: list[str], expansions: Expansions, home, cwd: Path, roots: tuple[Path, ...]) -> bool:
+    index = _command_word_index(segment)
+    if index >= len(segment) or _basename(segment[index]) != "find":
+        return False
+    words = [PLACEHOLDER if token == PLACEHOLDER else expansions.pattern(token) for token in _without_redirects(segment[index + 1:])]
+    if None in words:
+        return False
+    try:
+        plan = _plan(words)
+    except Unsupported:
+        return False
+    branches = _deleting_branches(plan.tree)
+    depths = range(plan.limits.get("-mindepth", 0), plan.limits.get("-maxdepth", UNBOUNDED_DEPTH) + 1)
+    return bool(branches) and any(
+        _find_start_reaches(start, _literal(_session_path(start, cwd), home), branches, depths, roots) for start in plan.starts
+    )
+
+
+def _deleting_branches(node: Node) -> list[list[tuple[str, str]]]:
+    if node.kind == "-delete" or (node.kind == "exec" and _basename(node.parts[0][0]) in STATE_DELETE_VERBS):
+        return [[]]
+    if node.kind == "or":
+        return _deleting_branches(node.parts[0]) + _deleting_branches(node.parts[1])
+    if node.kind == "and":
+        left, right = node.parts
+        guards = _name_guards(left)
+        return _deleting_branches(left) + [guards + branch for branch in _deleting_branches(right)]
+    return []
+
+
+def _name_guards(node: Node) -> list[tuple[str, str]]:
+    if node.kind == "test" and (node.parts[0] in NAME_TESTS or node.parts[0] in PATH_TESTS):
+        return [node.parts]
+    if node.kind == "and":
+        return _name_guards(node.parts[0]) + _name_guards(node.parts[1])
+    return []
+
+
+def _find_start_reaches(
+    start: str, path: Path | None, branches: list[list[tuple[str, str]]], depths: range, roots: tuple[Path, ...],
+) -> bool:
+    if path is None:
+        return False
+    shown = str(path) if start.startswith("~") else start
+    for place in {Path(os.path.abspath(path)), path.resolve()}:
+        for root in roots:
+            if place.is_relative_to(root):
+                return True
+            if not root.is_relative_to(place):
+                continue
+            names = root.relative_to(place).parts
+            chain = [os.path.join(shown, *names[:depth]) for depth in range(len(names) + 1) if depth in depths]
+            if any(all(_find_test_matches(test, shown_path) for test in branch) for branch in branches for shown_path in chain):
+                return True
+    return False
+
+
+def _find_test_matches(test: tuple[str, str], shown: str) -> bool:
+    name, pattern = test
+    folded = name in {"-iname", "-ipath", "-iwholename"}
+    subject = (os.path.basename(shown.rstrip(os.sep)) or shown) if name in NAME_TESTS else shown
+    return _glob_match(subject, pattern, folded=folded)
 
 
 def _segment_views(command: str) -> list[list[list[str]]]:
@@ -185,48 +300,6 @@ def _session_path(path: str, cwd: str | os.PathLike[str] | None) -> str:
     if cwd is None or path.startswith("~") or os.path.isabs(path):
         return path
     return os.path.join(cwd, path)
-
-
-def _finding_factory(command: str) -> Callable[[str], dict]:
-    def make_finding(rule: str) -> dict:
-        return _finding(rule, command)
-    return make_finding
-
-
-def _sets_home(segment: list[str]) -> bool:
-    return "HOME" in _leading_assignments(segment)
-
-
-def _overrides_cap(segment: list[str]) -> bool:
-    return any(name in CAP_VARS for name in _leading_assignments(segment))
-
-
-def _runs_installer(segment: list[str]) -> bool:
-    index = _command_word_index(segment)
-    return index < len(segment) and _basename(segment[index]) in INSTALLER_NAMES
-
-
-def _skips_commit_gate(segment: list[str]) -> bool:
-    words = _words(segment)
-    if "git" not in words or "commit" not in words:
-        return False
-    if words.index("git") > words.index("commit"):
-        return False
-    return any(token in NO_VERIFY_FLAGS for token in segment if not _is_quoted(token))
-
-
-def _deletes_state(segment: list[str], expansions: Expansions) -> bool:
-    if not any(_basename(word) in STATE_DELETE_VERBS for word in _words(segment)):
-        return False
-    return _targets_state(segment, expansions)
-
-
-def _mutates_state(segment: list[str], expansions: Expansions) -> bool:
-    return _is_mutating(segment) and _targets_state(segment, expansions)
-
-
-def _targets_state(segment: list[str], expansions: Expansions) -> bool:
-    return any(STATE_TARGET_RE.search(target) for target in mutation_targets(segment, expansions))
 
 
 def _is_mutating(segment: list[str]) -> bool:

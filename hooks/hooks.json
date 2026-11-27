@@ -111,6 +111,18 @@
           }
         ]
       }
+    ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "^adw-light:config$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/adw-config UserPromptExpansion",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

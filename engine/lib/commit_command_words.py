@@ -4,15 +4,11 @@ import re
 from functools import lru_cache
 
 try:
-    from .commit_inputs import PLAIN_COMMIT, UnreadableCommit, is_dynamic
     from .commit_segments import is_assignment as _is_assignment
-    from .shell_syntax import _basename
     from .shell_syntax import _payload_command_index as _command_index
     from .shell_text import heredoc_value
 except ImportError:
-    from commit_inputs import PLAIN_COMMIT, UnreadableCommit, is_dynamic
     from commit_segments import is_assignment as _is_assignment
-    from shell_syntax import _basename
     from shell_syntax import _payload_command_index as _command_index
     from shell_text import heredoc_value
 
@@ -22,13 +18,7 @@ FILE_NEUTRAL_VERBS = frozenset({
     "read", "sleep", "date", "uname", "id", "whoami", "fi", "done", "esac", "}", "then", "else",
 })
 DECLARERS = frozenset({"export", "declare", "typeset", "local", "readonly"})
-COMMAND_RUNNERS = frozenset({
-    "caffeinate", "doas", "find", "flock", "ionice", "parallel", "setsid", "stdbuf", "unbuffer", "watch", "xargs",
-})
-POSITIONAL_RE = re.compile(r"\$(?:[@*]|\d|\{(?:[@*]|\d+)[^}]*\})")
 VARIABLE_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
-HIDDEN_COMMIT = f"This command runs git commit through another program, so the commit gate cannot scan it. {PLAIN_COMMIT}"
-DYNAMIC_PROGRAM = f"This command takes its program or git subcommand from a variable or substitution, so the commit gate cannot see whether it commits. {PLAIN_COMMIT}"
 
 
 def _payload_command_index(words: list[str]) -> int:
@@ -80,16 +70,3 @@ def _assignments(words: list[str]) -> list[tuple[str, str]]:
     else:
         return []
     return [(name, value) for name, separator, value in (word.partition("=") for word in declared) if separator]
-
-
-def _refuse_hidden_commit(words: list[str], commit_variable: bool) -> None:
-    names = [_basename(word) for word in words[_payload_command_index(words):]]
-    if not names:
-        return
-    if POSITIONAL_RE.search(words[_payload_command_index(words)]):
-        raise UnreadableCommit(DYNAMIC_PROGRAM)
-    if is_dynamic(names[0]) and ("commit" in names or commit_variable):
-        raise UnreadableCommit(DYNAMIC_PROGRAM)
-    programs = [index for index, name in enumerate(names) if name == "git" or is_dynamic(name)]
-    if names[0] in COMMAND_RUNNERS and programs and "commit" in names[programs[0]:]:
-        raise UnreadableCommit(HIDDEN_COMMIT)

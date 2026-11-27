@@ -7,6 +7,7 @@ import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
+from itertools import islice
 from pathlib import Path
 
 
@@ -93,14 +94,14 @@ def _repo(data):
         data[key] = _tree(data.get(key, {}))
     for key in ("parents", "state"):
         data[key] = {k: _texts(v) for k, v in _map(data.get(key, {})).items()}
-    for key in ("refs", "config"):
+    for key in ("refs", "config", "messages"):
         data[key] = {k: _text(v) for k, v in _map(data.get(key, {})).items()}
     _validate_metadata(data)
     return data
 
 
 def _validate_metadata(data):
-    known = {"index", "indexes", "disk", "revisions", "parents", "refs", "times", "state", "config", "config_files", "ignore", "common_dir"}
+    known = {"index", "indexes", "disk", "revisions", "parents", "refs", "times", "messages", "state", "config", "config_files", "ignore", "common_dir"}
     if data.keys() - known:
         raise ValueError("Unknown repository fixture field")
     _text(data.get("common_dir", ".git"))
@@ -117,6 +118,14 @@ def _validate_metadata(data):
             raise ValueError("Invalid ignore rule")
         _text(rule.get("source"))
         _text(rule.get("pattern"))
+
+
+def _status_column(before: dict, after: dict, path: str) -> str:
+    if before.get(path) == after.get(path):
+        return " "
+    if path not in before:
+        return "A"
+    return "M" if path in after else "D"
 
 
 class FakeGitView:
@@ -190,6 +199,44 @@ class FakeGitView:
         disk = self._scoped(root, self._state(root)["disk"])
         return sorted(set(tracked) | (disk.keys() - self.ignored_paths(root, list(disk))))
 
+    def head_bytes(self, root: Path, path: str) -> bytes | None:
+        return (self._revision(root, "HEAD") or {}).get(path)
+
+    def head_blobs(self, root: Path, paths: Sequence[str], *, until: float | None = None) -> dict[str, bytes] | None:
+        return self.revision_blobs(root, "HEAD", paths, until=until)
+
+    def revision_blobs(self, root: Path, revision: str, paths: Sequence[str], *,
+                       until: float | None = None) -> dict[str, bytes] | None:
+        if not self._state(root):
+            return None
+        tree = self._revision(root, revision) or {}
+        return {path: tree[path] for path in paths if path in tree}
+
+    def tree_changes(self, root: Path, old: str, new: str, *, until: float | None = None) -> list[str] | None:
+        _deadline(until)
+        before, after = self._revision(root, old), self._revision(root, new)
+        if before is None or after is None:
+            return None
+        return sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+
+    def porcelain_status(self, root: Path, *, until: float | None = None) -> list[str] | None:
+        state = self._state(root)
+        if not state:
+            return None
+        index, disk = state["index"], state["disk"]
+        head = self._revision(root, "HEAD") or {}
+        rows = []
+        for path in sorted(head.keys() | index.keys() | disk.keys()):
+            if path not in head and path not in index:
+                if not self.ignore_match(root, path):
+                    rows.append("?? " + path)
+                continue
+            staged = _status_column(head, index, path)
+            unstaged = _status_column(index, disk, path)
+            if staged != " " or unstaged != " ":
+                rows.append(staged + unstaged + " " + path)
+        return rows
+
     def clean_blob_ids(self, root: Path) -> dict[str, str] | None:
         head = self._scoped(root, self._revision(root, "HEAD")) or {}
         index = self._scoped(root, self._listed_index(root)) or {}
@@ -199,15 +246,21 @@ class FakeGitView:
     def index_entries(self, root: Path) -> dict[str, str] | None:
         return {path: _blob_id(blob) for path, blob in self._scoped(root, self._listed_index(root)).items()}
 
-    def ignored_files(self, root: Path) -> list[str] | None:
+    def ignored_files(self, root: Path, *, config_only: bool = False, directory: bool = False,
+                      timeout: float = 2) -> list[str] | None:
         disk = self._scoped(root, self._state(root)["disk"])
         tracked = self._scoped(root, self._listed_index(root))
-        return sorted(self.ignored_paths(root, [path for path in disk if path not in tracked]))
+        paths = [path for path in disk if path not in tracked and (not config_only or Path(path).name.casefold() == ".agent-discipline.json")]
+        ignored = sorted(self.ignored_paths(root, paths))
+        if directory:
+            return sorted({path.split("/")[0] + "/" if "/" in path else path for path in ignored})
+        return ignored
 
     def index_paths(self, root: Path, index_file: Path | None = None) -> list[str] | None:
         return sorted(self._scoped(root, self._listed_index(root, index_file)))
 
-    def tree_paths(self, root: Path, tree: str, pathspecs: Sequence[str]) -> list[str] | None:
+    def tree_paths(self, root: Path, tree: str, pathspecs: Sequence[str], *, until: float | None = None) -> list[str] | None:
+        _deadline(until)
         return _paths(self._scoped(root, self._revision(root, tree)), [":(literal)" + spec for spec in pathspecs])
 
     def matched_paths(self, root: Path, pathspecs: Sequence[str]) -> list[str] | None:
@@ -283,7 +336,8 @@ class FakeGitView:
             return None
         return sorted(p for p in left.keys() | right.keys() if left.get(p) != right.get(p))
 
-    def commit_parents(self, root: Path, ref: str) -> list[str] | None:
+    def commit_parents(self, root: Path, ref: str, *, until: float | None = None) -> list[str] | None:
+        _deadline(until)
         name = self.resolve_commit(root, ref)
         return None if name is None else self._state(root)["parents"].get(name, []).copy()
 
@@ -303,6 +357,54 @@ class FakeGitView:
     def index_text(self, root: Path, path: str, index_file: Path | None = None) -> str | None:
         blob = (self._index(root, index_file) or {}).get(path)
         return None if blob is None else blob.decode("utf-8", "replace")
+
+    def commit_bytes(self, root: Path, revision: str, path: str, *, until: float | None = None) -> bytes | None:
+        _deadline(until)
+        return (self._revision(root, revision) or {}).get(path)
+
+    def commit_head(self, root: Path, *, until: float | None = None) -> str | None:
+        _deadline(until)
+        return (self.resolve_commit(root, "HEAD") or "") if self._state(root) else None
+
+    def head_tips(self, root: Path, *, until: float | None = None) -> tuple[str, dict[str, str]] | None:
+        head = self.commit_head(root, until=until)
+        tips = self.ref_tips(root, until=until) if head is not None else None
+        return None if head is None or tips is None else (head, tips)
+
+    def ref_tips(self, root: Path, *, until: float | None = None) -> dict[str, str] | None:
+        _deadline(until)
+        refs = self._state(root).get("refs", {}) if self._state(root) else None
+        return None if refs is None else {name: commit for name, commit in refs.items() if name.startswith("refs/")}
+
+    def new_commits(self, root: Path, tips: Sequence[str], known: Sequence[str], *, since: int, limit: int,
+                    until: float | None = None) -> list[str] | None:
+        _deadline(until)
+        seen = {rev for name in known for rev in self._lineage(root, name)}
+        times = self._state(root).get("times", {})
+        fresh = (rev for name in tips for rev in self._lineage(root, name) if rev not in seen)
+        return list(islice(dict.fromkeys(rev for rev in fresh if times.get(rev, since) >= since), limit))
+
+    def commit_reachable(self, root: Path, revision: str, *, until: float | None = None) -> bool | None:
+        _deadline(until)
+        heads = [name for name in self._state(root).get("refs", {}) if name.startswith("refs/heads/")]
+        return any(self.is_ancestor(root, revision, name) for name in (*heads, "HEAD"))
+
+    def commit_message(self, root: Path, revision: str, *, until: float | None = None) -> str | None:
+        _deadline(until)
+        name = self.resolve_commit(root, revision)
+        return self._state(root)["messages"].get(name, "") if name else None
+
+    def commit_paths(self, root: Path, revision: str, *, until: float | None = None) -> list[str] | None:
+        _deadline(until)
+        tree = self._revision(root, revision)
+        prior = self._revision(root, revision + "^") or {}
+        return sorted(p for p in tree if tree[p] != prior.get(p)) if tree is not None else None
+
+    def commit_removed_paths(self, root: Path, revision: str, *, until: float | None = None) -> list[str] | None:
+        _deadline(until)
+        tree = self._revision(root, revision)
+        prior = self._revision(root, revision + "^") or {}
+        return sorted(path for path in prior if path not in tree) if tree is not None else None
 
     def commit_time(self, root: Path, commit: str) -> int | None:
         value = self._state(root).get("times", {}).get(self.resolve_commit(root, commit))

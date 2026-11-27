@@ -16,13 +16,13 @@ Write or change tests that protect observable behavior. Each test is a small uni
 
 - You MUST read the unit-testing-principles skill before your first test. It loads at spawn. If it did not load, run the Skill tool on adw-light:unit-testing-principles. If that fails too, stop and report.
 - Every test MUST carry one citation, a sentence quoted word for word from the skill. In Python, put it in a one-line docstring as the first line of the test function. In other languages, put it in a comment line directly above the test that starts with "Principle: ".
-- NEVER run git init, clone, commit, add, checkout, switch, or worktree add inside a test. NEVER build a temp folder tree per test.
-- Give git-dependent code its repo state through the fake git view. Share any setup per module in setUpClass.
+- Prefer tests that run in memory. Share any setup per module, for example in setUpClass.
+- Some projects enable the test_builds_repo or test_builds_tree rule. There, NEVER run git init, clone, commit, add, checkout, switch, or worktree add inside a test. NEVER build a temp folder tree per test there either. Give git-dependent code its repo state through a fake instead.
 - NEVER silence a hook, edit its configuration, or add a marker that suppresses a finding.
 
 ## Context
 
-ADW Lite is a text detection engine, so most tests feed text and a payload and assert the decision. ADW Lite refuses a test without a valid citation, and it refuses tests that build git repos. The full suite must finish in under five minutes of wall time, and tools/deploy.sh stops a slower run.
+ADW Lite refuses a test without a valid citation. A project can also turn on the rules that refuse tests building git repos or temp trees. Follow the project's own instructions for test layout and suite time.
 
 ## What a good test looks like
 

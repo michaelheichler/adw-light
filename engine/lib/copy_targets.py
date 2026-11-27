@@ -103,6 +103,6 @@ def _copy_targets(verb: str, words: list[str], slot: Slot | None, cwd: str | Non
     joined = [os.path.join(target_dir, PurePosixPath(source).name) for source in sources]
     dest = os.path.join(cwd or ".", _expand_home(target_dir))
     same = len(sources) == 1 and PurePosixPath(target_dir).name == PurePosixPath(sources[0]).name
-    if not os.path.isdir(dest) and (same or os.path.isfile(dest)):
+    if not os.path.isdir(dest) and (same or os.path.isfile(dest) or verb == "ln" and len(sources) == 1):
         joined = []
     return list(dict.fromkeys([target_dir, *joined, *(sources if verb == "mv" else [])]))

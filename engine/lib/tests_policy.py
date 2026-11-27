@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path, PurePath
 from typing import NamedTuple
 
@@ -19,6 +19,7 @@ try:
     )
     from .findings import Finding
     from .markup import MARKDOWN_EXTS
+    from .path_policy import anchored_identity, exited_project, marked_project
     from .protected import authorized
     from .regular_file import read_regular_text
 except ImportError:
@@ -32,6 +33,7 @@ except ImportError:
     import test_units
     from findings import Finding
     from markup import MARKDOWN_EXTS
+    from path_policy import anchored_identity, exited_project, marked_project
     from protected import authorized
     from regular_file import read_regular_text
 
@@ -39,7 +41,7 @@ TEST_WRITER = "adw-test-writer"
 TEST_WRITER_TYPES = frozenset({TEST_WRITER, "agent-discipline-watcher:" + TEST_WRITER, "adw-light:" + TEST_WRITER})
 RULE = "test_write_gate"
 WINDOW_KEY = "tests_allow_until"
-WINDOW_HINT = "adw-config tests allow --for 30m"
+WINDOW_HINT = "/adw-light:config tests allow --for 30m"
 FIXTURE_DIRS = frozenset({"testdata", "__snapshots__", "__fixtures__", "__mocks__"})
 TEST_DIRS = frozenset({"tests", "__tests__", "test", "spec"}) | FIXTURE_DIRS
 NESTED_FIXTURE_DIR = "fixtures"
@@ -59,11 +61,11 @@ _PYTHON_TEST_NAME_RE = re.compile(r"^(?:test_.+|.+_test)\.py$")
 _JAVA_TEST_RE = re.compile(r"^.+(?:Tests?|IT|Spec)\.(?:java|kt|kts|groovy|scala)$")
 AGENT_ACTION = (
     f"Delegate this test change to the {TEST_WRITER} agent. If the user wants it"
-    f" done here, ask them to run `{WINDOW_HINT}` in a terminal."
+    f" done here, ask them to run `{WINDOW_HINT}` in Claude Code or `$adw-config tests allow --for 30m` in Codex."
 )
 OMP_ACTION = (
     "OMP names no agent on tool calls, so only a timed window opens this gate."
-    f" Ask the user to run `{WINDOW_HINT}` in a terminal."
+    f" Ask the user to run `{WINDOW_HINT}` in Claude Code or `$adw-config tests allow --for 30m` in Codex."
 )
 
 
@@ -71,6 +73,7 @@ class PendingChange(NamedTuple):
     path: str
     before: str | None
     after: str | None
+    after_unknown: bool = False
 
 
 def project_root(cwd: str) -> str:
@@ -81,12 +84,53 @@ def project_root(cwd: str) -> str:
     return str(start)
 
 
+def _marked_test_root(directory: Path) -> Path | None:
+    for index, part in enumerate(directory.parts):
+        if part.casefold() in TEST_DIRS:
+            return marked_project(Path(*directory.parts[:index]))
+    return marked_project(directory)
+
+
+def _cwd_root(cwd: Path) -> Path:
+    here = cwd.resolve()
+    repository = Path(project_root(str(here)))
+    if (repository / PROJECT_MARKER).exists():
+        return repository
+    return marked_project(here) or repository
+
+
+def external_target_project(resolved: Path, cwd: Path) -> Path | None:
+    here = cwd.resolve()
+    if resolved.is_relative_to(here) or (Path(project_root(str(here))) / PROJECT_MARKER).exists():
+        return None
+    return marked_project(resolved.parent, all_ancestors=True)
+
+
+def scratch_write(path: Path, cwd: Path) -> bool:
+    return temp_scope.outside_project_temp(path, cwd) and external_target_project(anchored_identity(path, cwd), cwd) is None
+
+
+def target_root(path: Path, cwd: Path) -> str:
+    resolved = anchored_identity(path, cwd)
+    if (owner := external_target_project(resolved, cwd)) is not None:
+        return str(owner)
+    cwd_root = _cwd_root(cwd)
+    if resolved.is_relative_to(cwd_root):
+        return str(cwd_root)
+    owner = Path(project_root(str(resolved.parent)))
+    if (owner / PROJECT_MARKER).exists():
+        return str(owner)
+    return str(_marked_test_root(resolved.parent) or project_root(str(cwd)))
+
+
 def outside_project(path: str, cwd: str) -> bool:
     base = os.path.abspath(cwd or ".")
     found, here = on_disk(os.path.join(base, path)), on_disk(base)
     if found is None or here is None:
         return False
     real = Path(found)
+    if temp_scope.scratch_session(Path(base)) and temp_scope.scratch_session(real):
+        return True
     return not real.is_relative_to(here) and git_globs.outside_work_trees(real)
 
 
@@ -264,7 +308,7 @@ def touches_tests(change: PendingChange, root: str | None = None, removed: froze
         return False
     if change.after is None and is_test_path(change.path, root) and not _plain_module(change, root, removed):
         return True
-    if change.before == change.after:
+    if change.after_unknown or change.before == change.after:
         return False
     if _held_by_suite(change, root):
         return True
@@ -314,30 +358,46 @@ def _finding(path: str, detail: str = "Test write in ") -> dict:
     ).to_dict()
 
 
-def group_unresolved(rows: list[dict]) -> list[dict]:
-    dynamic = [row for row in rows if row.get("rule") == "dynamic_write_target"]
-    uncertain = [row for row in rows if row.get("rule") == RULE and row.get("detail", "").startswith(UNRESOLVED_DETAIL)]
-    uncertain = [row for row in uncertain if any(item["match"] in row["path"] for item in dynamic)]
-    if not dynamic or not uncertain:
-        return rows
-    tokens = list(dict.fromkeys(row["match"] for row in dynamic))
-    grouped = {**dynamic[0], "match": ", ".join(tokens), "action": "Use a literal loop list so the write and test gates can check each destination."}
-    return [row for row in rows if row not in dynamic and row not in uncertain] + [grouped]
-
-
 def findings(
     gate: Gate, changes: Iterable[PendingChange], unresolved: Iterable[str] = (), removed: frozenset[Path] = frozenset(),
+    *, settings_for: Callable[[str], dict] | None = None,
 ) -> list[dict]:
-    if gate_open(gate):
+    opened = gate_open(gate)
+    if opened and settings_for is None:
         return []
     cwd = Path(payloads.cwd(gate.payload) or ".")
-    root = project_root(str(cwd))
     untyped = bool(payloads.agent_id(gate.payload)) and not payloads.agent_type(gate.payload)
     detail = UNTYPED_DETAIL if untyped else "Test write in "
-    rows = [
-        _finding(change.path, detail) for change in changes
-        if not outside_project(change.path, str(cwd)) and not temp_scratch_repo(change.path, str(cwd))
-        and touches_tests(change._replace(path=str(payloads.resolved_path(change.path, cwd))), root, removed)
-    ]
-    unique = {row["path"].rstrip("/"): row for row in rows}
-    return [*unique.values(), *(_finding(command, UNRESOLVED_DETAIL) for command in unresolved)]
+    unique: dict[str, dict] = {}
+    for change in changes:
+        settings = gate.settings if settings_for is None else settings_for(change.path)
+        if (opened if settings is gate.settings else gate_open(gate._replace(settings=settings))):
+            continue
+        if _project_test_change(change, cwd, removed):
+            unique[change.path.rstrip("/")] = _finding(change.path, detail)
+    unnamed = [] if opened else [_finding(command, UNRESOLVED_DETAIL) for command in unresolved]
+    return [*unique.values(), *unnamed]
+
+
+def _project_test_change(change: PendingChange, cwd: Path, removed: frozenset[Path]) -> bool:
+    path = payloads.resolved_path(change.path, cwd)
+    resolved = anchored_identity(change.path, cwd)
+    exited = exited_project(cwd.absolute())
+    returns_to_project = exited is not None and resolved.is_relative_to(exited)
+    if not returns_to_project and external_target_project(resolved, cwd) is None:
+        if outside_project(change.path, str(cwd)) or temp_scratch_repo(change.path, str(cwd)):
+            return False
+    root = target_root(resolved, cwd)
+    return touches_tests(change._replace(path=str(path)), root, removed) or (
+        resolved != path and not _same_test_shape(path, resolved, root, removed)
+        and touches_tests(change._replace(path=str(resolved)), root, removed)
+    )
+
+
+def _same_test_shape(path: Path, resolved: Path, root: str, removed: frozenset[Path]) -> bool:
+    return (
+        path.name == resolved.name
+        and in_test_dir(str(path), root) == in_test_dir(str(resolved), root)
+        and in_fixture_dir(str(path), root) == in_fixture_dir(str(resolved), root)
+        and _deleted(str(path), removed) == _deleted(str(resolved), removed)
+    )

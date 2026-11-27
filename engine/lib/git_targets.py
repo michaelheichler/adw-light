@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 from typing import NamedTuple
 
 try:
@@ -39,6 +38,11 @@ GIT_DRY_APPLY_FLAGS =frozenset({"--check", "--stat", "--numstat", "--summary"})
 RESTORE_STAGED = frozenset({"--staged", "-S"})
 RESTORE_WORKTREE = frozenset({"--worktree", "-W", "-SW", "-WS"})
 RESTORE_PLAIN_FLAGS = frozenset({"--staged", "-S", "-q", "--quiet"})
+GIT_READING_COMMANDS = frozenset({"status", "log", "diff", "show", "rev-parse", "ls-files"})
+GIT_READING_PAIRS = frozenset({("worktree", "list"), ("config", "--get"), ("remote", "-v")})
+OUTPUT_FLAG = "--output"
+BRANCH_CHANGING_LETTERS = frozenset("dDmMcCf")
+BRANCH_CHANGING_FLAGS = ("--delete", "--move", "--copy", "--force")
 
 
 class _GitSource(NamedTuple):
@@ -77,13 +81,37 @@ def _merge_operands(rest: list[str]) -> list[str]:
 
 def _git_changes_paths(args: list[str], expansions: Expansions) -> bool:
     _, position = _git_base([_bare(token) for token in args])
+    head = args[:position]
+    if any(map(expansions.may_split, head)) or (expansions.splits_words and any(map(expansions.expands_bare, args))):
+        return True
     if position >= len(args):
         return False
-    if args[:1] == ["-C"] and position == 2 and args[2:] == ["worktree", "list"]:
-        if re.fullmatch(r'"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})"', args[1], re.ASCII):
-            return False
     subcommand = expansions.pattern(args[position])
+    unknown = [word for word in head if expansions.pattern(word) is None]
+    if unknown and _reads_only(subcommand, [_bare(token) for token in args[position + 1:]]):
+        return False
+    if any(map(expansions.expands_bare, unknown)):
+        return True
     return subcommand is None or subcommand in GIT_CHANGING_COMMANDS
+
+
+def _reads_only(subcommand: str | None, rest: list[str]) -> bool:
+    if subcommand in GIT_READING_COMMANDS:
+        return not any(_abbreviates(word, (OUTPUT_FLAG,)) for word in rest)
+    if subcommand == "branch":
+        return not any(_changes_branch(word) for word in rest)
+    return (subcommand, *rest[:1]) in GIT_READING_PAIRS and (subcommand != "remote" or len(rest) == 1)
+
+
+def _changes_branch(word: str) -> bool:
+    if word.startswith("--"):
+        return _abbreviates(word, BRANCH_CHANGING_FLAGS)
+    return word.startswith("-") and bool(BRANCH_CHANGING_LETTERS.intersection(word[1:]))
+
+
+def _abbreviates(word: str, flags: tuple[str, ...]) -> bool:
+    name = word.partition("=")[0]
+    return len(name) > 2 and name.startswith("--") and any(flag.startswith(name) for flag in flags)
 
 
 def _git_base(words: list[str]) -> tuple[str, int]:
@@ -119,9 +147,15 @@ def _git_command_targets(words: list[str], source: _GitSource) -> GatedTargets:
         return filter_targets(rest, base, source.cwd)
     if command == "submodule":
         return submodule_targets(rest, base, source.cwd)
+    indexable = source.plain_call and _directory_flags_only(words[:position])
+    if command == "stash" and rest[:1] == ["push"]:
+        stash = _GitCall(command, base, _stash_pathspec_args(rest[1:]), indexable)
+        options, _, _ = _split_pathspec_args(stash.rest)
+        if _pathspec_operands(stash, options) or any(word.startswith(PATHSPEC_FILE_FLAG) for word in options):
+            return _pathspec_targets(stash)
     rewrites = worktree_rewrite(command, rest, os.path.join(source.cwd or ".", base))
     if command in GIT_PATH_COMMANDS:
-        found = _pathspec_targets(_GitCall(command, base, rest, source.plain_call and _directory_flags_only(words[:position])))
+        found = _pathspec_targets(_GitCall(command, base, rest, indexable))
         return found._replace(worktree=base) if rewrites else found
     if command == "mv":
         return GatedTargets(tuple(_expand_home(os.path.join(base, path)) for path in _copy_targets("mv", rest, None, os.path.join(source.cwd or ".", base))), False)
@@ -131,6 +165,19 @@ def _git_command_targets(words: list[str], source: _GitSource) -> GatedTargets:
     if command == "stash" and rest[:1] in (["pop"], ["apply"]):
         return UNRESOLVED
     return GatedTargets((), False, worktree=base) if rewrites else NO_TARGETS
+
+
+def _stash_pathspec_args(args: list[str]) -> list[str]:
+    pathspec_args: list[str] = []
+    remaining = iter(args)
+    for word in remaining:
+        if word == "--":
+            return [*pathspec_args, word, *remaining]
+        if word in {"-m", "--message"}:
+            next(remaining, None)
+        else:
+            pathspec_args.append(word)
+    return pathspec_args
 
 
 def _based(read: ArchiveRead | None, base: str) -> ArchiveRead | None:
@@ -143,11 +190,18 @@ def _directory_flags_only(flags: list[str]) -> bool:
     return len(flags) % 2 == 0 and all(flag == "-C" for flag in flags[::2])
 
 
+def _split_pathspec_args(args: list[str]) -> tuple[list[str], bool, list[str]]:
+    if "--" not in args:
+        return args, False, []
+    separator = args.index("--")
+    return args[:separator], True, args[separator + 1:]
+
+
 def _pathspec_targets(call: _GitCall) -> GatedTargets:
-    options = call.rest[:call.rest.index("--")] if "--" in call.rest else call.rest
+    options, _, _ = _split_pathspec_args(call.rest)
     if _unstages_only(call, options):
         return NO_TARGETS
-    paths = call.rest[call.rest.index("--") + 1:] if "--" in call.rest else [word for word in call.rest if not word.startswith("-")]
+    paths = _pathspec_operands(call, options)
     tree = _source_tree(call, options)
     wide = [path for path in paths if GLOB_CHARS.intersection(path) or _is_directory_pathspec(path)]
     globbed = any(GLOB_CHARS.intersection(path) for path in paths)
@@ -158,6 +212,19 @@ def _pathspec_targets(call: _GitCall) -> GatedTargets:
     named = tuple(_expand_home(os.path.join(call.base, path)) for path in paths if path not in wide)
     lookup = GitLookup(call.base, tuple(paths), tree, call.command == "rm" or bool(wide))
     return GatedTargets(named, False, lookup, call.indexable)
+
+
+def _pathspec_operands(call: _GitCall, options: list[str]) -> list[str]:
+    if "--" in call.rest:
+        return call.rest[len(options) + 1:]
+    operands = iter(options)
+    paths: list[str] = []
+    for word in operands:
+        if call.command == "restore" and word in {"-s", "--source"}:
+            next(operands, None)
+        elif not word.startswith("-"):
+            paths.append(word)
+    return paths
 
 
 def _unstages_only(call: _GitCall, options: list[str]) -> bool:

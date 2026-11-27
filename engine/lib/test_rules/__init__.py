@@ -4,7 +4,7 @@ import ast
 import functools
 import importlib
 import pkgutil
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from pathlib import PurePath
 from typing import NamedTuple
 
@@ -40,11 +40,16 @@ class RuleSet(NamedTuple):
     check: Callable[[Unit, str], Iterable[Hit]]
 
 
+@functools.lru_cache(maxsize=8)
+def file_lines(text: str) -> tuple[str, ...]:
+    return tuple(text.splitlines())
+
+
 @functools.lru_cache(maxsize=32)
 def module_tree(text: str) -> ast.Module | None:
     try:
         return ast.parse(text)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
         return None
 
 
@@ -119,7 +124,9 @@ def unit_findings(unit: Unit, text: str, rule_sets: Iterable[RuleSet] | None = N
     return [row for rule_set in chosen for row in _set_findings(rule_set, unit, text)]
 
 
-def check_file(path: str, text: str, rule_sets: Iterable[RuleSet] | None = None) -> list[dict]:
+def check_file(
+    path: str, text: str, rule_sets: Iterable[RuleSet] | None = None, *, contracts: Collection[str] = (),
+) -> list[dict]:
     chosen = RULE_SETS if rule_sets is None else tuple(rule_sets)
     if not chosen:
         return []
@@ -127,6 +134,8 @@ def check_file(path: str, text: str, rule_sets: Iterable[RuleSet] | None = None)
 
     file_rows = repo_building.file_rows(path, text) if repo_building.RULE_SET in chosen else []
     chosen = tuple(group for group in chosen if group is not repo_building.RULE_SET)
+    if contracts:
+        chosen = _with_contracts(chosen, contracts)
     layer_units, merged_findings = _layer_tools()
     layered = layer_units(path, text)
     lexed = None if layered is not None and not layered.broken else extract(path, text)
@@ -136,6 +145,16 @@ def check_file(path: str, text: str, rule_sets: Iterable[RuleSet] | None = None)
     if layered.broken and not layered.units and not lexed:
         return rows + _broken_file_rows(path, text, chosen)
     return merged_findings(rows, _unit_rows(lexed, text, chosen)) if layered.broken else rows
+
+
+def _with_contracts(chosen: tuple[RuleSet, ...], contracts: Collection[str]) -> tuple[RuleSet, ...]:
+    from . import wording_assertion
+
+    return tuple(
+        group._replace(check=functools.partial(wording_assertion.check, contracts=contracts))
+        if group is wording_assertion.RULE_SET else group
+        for group in chosen
+    )
 
 
 def _broken_file_rows(path: str, text: str, chosen: tuple[RuleSet, ...]) -> list[dict]:

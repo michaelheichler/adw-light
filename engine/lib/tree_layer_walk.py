@@ -5,6 +5,7 @@ import re
 import time
 
 try:
+    from .language_shapes import JS_TEST_HOOKS
     from .language_model import (
         CodeUnit,
         Kind,
@@ -14,6 +15,7 @@ try:
         comment_kind,
     )
 except ImportError:
+    from language_shapes import JS_TEST_HOOKS
     from language_model import (
         CodeUnit,
         Kind,
@@ -237,5 +239,8 @@ def _test_call(node, text_of):
         return None
     callee = call.child_by_field_name("function")
     while callee is not None and callee.type == "member_expression":
+        member = callee.child_by_field_name("property")
+        if member is not None and text_of(member) in JS_TEST_HOOKS:
+            return None
         callee = callee.child_by_field_name("object")
     return call if callee is not None and text_of(callee) in JS_TEST_CALLS else None

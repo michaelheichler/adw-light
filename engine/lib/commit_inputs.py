@@ -45,6 +45,16 @@ STALE_SCRIPT = (
 
 
 class UnreadableCommit(Exception):
+    def __init__(self, reason: str = "", cwd: Path | None = None):
+        super().__init__(reason)
+        self.cwd = cwd
+
+
+class InvalidCommitFolder(UnreadableCommit):
+    pass
+
+
+class RelocatedCommit(UnreadableCommit):
     pass
 
 

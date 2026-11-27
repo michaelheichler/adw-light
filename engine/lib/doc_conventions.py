@@ -94,7 +94,7 @@ def comment_findings(context, source: str, scan_comment_contract, scan_all) -> l
     code = reference_source(context.text, context.path, context.tree)
     for doc in docs:
         rows.extend(unresolved_links(doc, code))
-        for row in scan_all("doc-comment.md", doc.body, context.config):
+        for row in scan_all("doc-comment.md", doc.body, context.config, document=False):
             if row["family"] in {"english", "punctuation"}:
                 located = dict(row, line=row["line"] + doc.line - 1)
                 if "end_line" in row:

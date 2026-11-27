@@ -5,9 +5,9 @@ import operator
 from collections.abc import Callable
 from typing import NamedTuple
 
-from lib import payloads, unread_guard
+from lib import payloads
 from lib.hookio import (
-    PARSE_FAILURE, UNREADABLE_PAYLOAD, allow, claude_pretool_response, config_failure, context, deny, payload_failure,
+    PARSE_FAILURE, UNREADABLE_PAYLOAD, join_notices, claude_pretool_response, config_failure, context, deny, payload_failure,
     read_payload, write_payload,
 )
 from lib.payloads import exact_string_dict
@@ -70,8 +70,8 @@ def _merge(responses: list[dict]) -> dict:
     ]
     if not messages and not system_messages:
         return {}
-    merged = context(unread_guard.join_notices(*dict.fromkeys(messages)), "PreToolUse") if messages else {}
-    return {**merged, "systemMessage": unread_guard.join_notices(*dict.fromkeys(system_messages))} if system_messages else merged
+    merged = context(join_notices(*dict.fromkeys(messages)), "PreToolUse") if messages else {}
+    return {**merged, "systemMessage": join_notices(*dict.fromkeys(system_messages))} if system_messages else merged
 
 
 Gate = Callable[[dict, "dict | None"], dict]
@@ -98,7 +98,10 @@ def _dispatch(payload: dict, config: dict | None, gates: Gates) -> dict:
     if name in DIRECT_WRITERS:
         return gates.write(payload, config)
     if name == "Bash":
-        return _merge([gates.bash(payload, config), gates.commit(payload, config)])
+        result = _merge([gates.bash(payload, config), gates.commit(payload, config)])
+        if not _is_denial(result):
+            import_module("lib.after_run").pre(payload, config)
+        return result
     if name in PYTHON_TOOLS:
         return gates.python(payload, config)
     if name.startswith("mcp__"):
@@ -108,15 +111,14 @@ def _dispatch(payload: dict, config: dict | None, gates: Gates) -> dict:
 
 def run(payload: dict, config: dict | None = None, *, gates: Gates = Gates()) -> dict:
     try:
-        if not _invalid_payload(payload):
-            decision = unread_guard.before_tool(payload, config)
-            if decision.kind == unread_guard.DENY:
-                return deny(decision.reason)
-            if decision.kind == unread_guard.ALLOW:
-                return allow()
+        if isinstance(payload, dict) and payloads.tool_name(payload) in {"Write", "Bash"}:
+            from lib import after_run_config
+
+            with after_run_config.restore_scope(payload, config):
+                return _dispatch(payload, config, gates)
         return _dispatch(payload, config, gates)
     except Exception as exc:
-        return deny(config_failure("tool call", exc))
+        return deny(config_failure("tool call", exc, payloads.cwd(payload)))
 
 
 if __name__ == "__main__":

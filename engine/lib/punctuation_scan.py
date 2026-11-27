@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import NamedTuple
 
 try:
@@ -12,7 +13,7 @@ try:
         HEADER_COMMENT_RE,
     )
     from .file_kinds import _is_config, _is_prose
-    from .findings import finding_row
+    from .findings import finding_row, spanning
     from .markup import (
         FencePolicy,
         _blank_keep_newlines,
@@ -31,7 +32,7 @@ except ImportError:
         HEADER_COMMENT_RE,
     )
     from file_kinds import _is_config, _is_prose
-    from findings import finding_row
+    from findings import finding_row, spanning
     from markup import (
         FencePolicy,
         _blank_keep_newlines,
@@ -52,7 +53,7 @@ WORD_JOIN_HYPHEN_RE = re.compile(r"(?<=\w)" + chr(0x2011) + r"(?=\w)")
 DASH_BREAK_RE = re.compile(r"\w-{2,} ?\w|\w -{2,} \w")
 SPACED_HYPHEN_RE = re.compile(r"\w +- +\w")
 PROSE_SEMICOLON_RE = re.compile(r";")
-PROSE_COLON_RE = re.compile(r"\w\s*:\s+\w")
+PROSE_COLON_RE = re.compile(r"(?<=\w)\s*:\s+(?=\w)")
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 PRONOUN_APOS_RE = re.compile(r"\b(your|their|her|our|its)'s\b", re.IGNORECASE)
 ITS_APOS_RE = re.compile(r"(?<![\w\"'])its" + chr(39) + r"(?!\w)", re.IGNORECASE)
@@ -76,8 +77,6 @@ PUNCTUATION_RULES = (
      "Spaced hyphen acts as a dash in ", "Use a comma, period, parentheses, or close up the hyphen."),
     ("semicolon", (PROSE_SEMICOLON_RE,), "prose_semicolon",
      "Semicolon appears in prose in ", "Use a comma, period, or parentheses."),
-    ("colon", (PROSE_COLON_RE,), "prose_colon",
-     "Colon appears inside a prose sentence in ", "Use a comma, period, or parentheses."),
     ("clean", (PRONOUN_APOS_RE, ITS_APOS_RE), "pronoun_apostrophe",
      "Possessive pronoun has an apostrophe in ", "Use the possessive pronoun without apostrophe."),
     ("clean", (DECADE_APOS_RE,), "decade_apostrophe",
@@ -89,6 +88,30 @@ GERMAN_PUNCTUATION_RULES = german_punctuation.german_rules(PUNCTUATION_RULES)
 class _PunctuationLine(NamedTuple):
     whole: str
     prose_dash: str
+
+
+@dataclass(slots=True)
+class ColonCount:
+    limit: int
+    total: int = 0
+    first: _SourceLine | None = None
+    last: int = 0
+
+    def count(self, source: _SourceLine, text: str) -> None:
+        hits = sum(1 for _ in PROSE_COLON_RE.finditer(text))
+        if hits:
+            self.total += hits
+            self.first = self.first or source
+            self.last = source.number
+
+    def findings(self) -> list[dict]:
+        if self.first is None or self.total <= self.limit:
+            return []
+        noun = "colon" if self.total == 1 else "colons"
+        row = finding_row("punctuation", "prose_colon", self.first.number,
+                          f"{self.total} sentence {noun} in {self.first.path} (limit {self.limit}).",
+                          self.first.text, "Replace excess colons with commas, periods, or parentheses.", match=":")
+        return [spanning(dict(row, occurrences=self.total), self.last)]
 
 
 def _config_quoted_view(text: str) -> str:
@@ -117,12 +140,12 @@ def _punctuation_texts(path: str, views: _PunctuationLine, prose: bool) -> dict[
 
 
 def _scan_punctuation(
-    source_line: _SourceLine, scan_line: _PunctuationLine, prose: bool, language: str = ENGLISH, heading: bool = False,
+    source_line: _SourceLine, scan_line: _PunctuationLine, prose: bool, language: str = ENGLISH, colons: ColonCount | None = None,
 ) -> list[dict]:
     rules = GERMAN_PUNCTUATION_RULES if language == GERMAN else PUNCTUATION_RULES
     texts = _punctuation_texts(source_line.path, _punctuation_views(source_line.path, scan_line, language), prose)
-    if heading:
-        texts["colon"] = ""
+    if colons is not None:
+        colons.count(source_line, texts["colon"])
     rows = []
     for target, regexes, rule, detail, action in rules:
         found = _first_match(regexes, texts[target])

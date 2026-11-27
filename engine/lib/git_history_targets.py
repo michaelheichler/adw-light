@@ -58,8 +58,9 @@ def filter_targets(rest: list[str], base: str, cwd: str | None) -> GatedTargets:
             continue
         if flag == "--subdirectory-filter":
             listed = tracked_paths(directory)
-            if not body or listed is None or any(is_test_path(p) and not Path(p).is_relative_to(body) for p in listed):
+            if not body or listed is None:
                 return UNRESOLVED
+            paths.extend(str(Path(base) / path) for path in listed if is_test_path(path) and not Path(path).is_relative_to(body))
         else:
             names = _removed(body) if flag in {"--tree-filter", "--index-filter"} else None
             if names is None:

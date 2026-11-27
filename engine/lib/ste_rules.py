@@ -79,7 +79,7 @@ def _row(path, rule, number, line, match, detail=None):
 def _phrasal(line, tokens, words):
     for index in range(1, len(words)):
         particle, verb = words[index], words[index - 1]
-        if particle not in PARTICLES or verb in AUX or verb in PARTICLES or verb in DET:
+        if particle not in PARTICLES or verb in AUX or verb in PARTICLES or verb in DET or verb in PREP:
             continue
         before = words[max(0, index - 3):index - 1]
         if any(word in AUX or word == 'not' for word in before) or before and before[-1] in DET:

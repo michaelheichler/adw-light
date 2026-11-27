@@ -21,6 +21,7 @@ except ImportError:
     from prose_language import GERMAN
 
 MAX_MATCH_BYTES = 80
+SHOWN_ROW_UNITS = 5
 MAX_EXPLANATION_WORDS = 80
 PRINCIPLE_LABEL = "Principle"
 PRINCIPLE_MAP = Path(__file__).with_name("principle_map.json")
@@ -154,6 +155,15 @@ def _title(item: dict, rule: str) -> str:
     return entry.title if entry is not None else catalog.rule_entry(rule).title
 
 
+def _units_note(item: dict) -> str:
+    units = item.get("units")
+    names = [_one_line(name) for name in units if isinstance(name, str)] if isinstance(units, (list, tuple)) else []
+    if not names:
+        return ""
+    more = f", and {len(names) - SHOWN_ROW_UNITS} more" if len(names) > SHOWN_ROW_UNITS else ""
+    return f", {len(names)} units: {', '.join(names[:SHOWN_ROW_UNITS])}{more}"
+
+
 def format_row(item: dict) -> str:
     path = _one_line(item.get("path") or item.get("file") or "<pending>")
     status = _one_line(item.get("status")) if item.get("status") else ""
@@ -164,7 +174,7 @@ def format_row(item: dict) -> str:
     quoted = f' "{clip(_one_line(match), MAX_MATCH_BYTES)}"' if isinstance(match, str) and match.strip() else ""
     line = _one_line(item.get("line"))
     action = _one_line(item.get("action"))
-    return f"{prefix}{path}:{line} {title}{quoted}. {action} ({rule})"
+    return f"{prefix}{path}:{line} {title}{_units_note(item)}{quoted}. {action} ({rule})"
 
 
 PrincipleLookup = Callable[[str], "principle_kb.Row | None"]
