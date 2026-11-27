@@ -12,6 +12,7 @@ TAP_STREAM = (
 )
 TAP_WITH_PROSE = "1..2\nok 1 - parses input\nThe cache was rebuilt, cleaned and saved.\nok 2 - cleans up\n"
 TAP_FINDINGS = (DENY, ["spaced_hyphen"])
+TAP_FINDINGS_NOTED = (None, ["spaced_hyphen", "ste_phrasal_verb"])
 OBSERVE_ONLY = {"ste_phrasal_verb"}
 NOT_BLOCKED = (None, set())
 PYTHON_TAP = "1..3\nok 1\n# Loop over the items and add them together.\n"
@@ -93,8 +94,9 @@ class TapStreams(FakeRepoCase):
     def test_tap_stream_saved_as_tap_in_an_ignored_folder_passes_without_blocking_findings(self):
         self.assertEqual(self.unblocked("out/results.tap", TAP_STREAM), NOT_BLOCKED)
 
-    def test_tap_stream_saved_as_tap_in_a_folder_that_is_not_ignored_keeps_its_findings(self):
-        self.assertEqual(self.verdict("report/results.tap", TAP_STREAM), TAP_FINDINGS)
+    def test_tap_stream_saved_as_tap_in_a_folder_that_is_not_ignored_is_allowed_and_keeps_its_findings(self):
+        """A test must verify what the code does for its client, never how it does it."""
+        self.assertEqual(self.verdict("report/results.tap", TAP_STREAM), TAP_FINDINGS_NOTED)
 
     def test_text_file_with_a_tap_plan_and_a_prose_line_keeps_its_prose_findings(self):
         self.assertEqual(self.verdict("out/run.txt", TAP_WITH_PROSE), (DENY, ["passive_voice", "spaced_hyphen"]))

@@ -279,13 +279,15 @@ class AuthoredContentRegressions(unittest.TestCase):
 
         self.assertNotIn("decision", stop)
 
-    def test_extensionless_prose_file_is_scanned(self):
+    def test_content_guessed_prose_file_is_allowed_with_its_findings_noted(self):
+        """Observable behavior is an operation or a state that helps a client reach one of its goals."""
         self.start_session()
 
         response = self.pre_tool("Write", file_path=str(self.root / "NOTES"), content=FLAGGED_PROSE)
 
-        self.assertIn("NOTES:1 ", self.deny_reason(response))
-        self.assertIn("(utilize)", self.deny_reason(response))
+        self.assertNotEqual("deny", response["hookSpecificOutput"].get("permissionDecision"))
+        self.assertIn(f"NOTES:{line_of(FLAGGED_PROSE, FLAGGED_WORD)} ", response["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("(utilize)", response["hookSpecificOutput"]["additionalContext"])
 
     def test_post_tool_batch_scans_written_files_in_the_first_turn_before_any_stop(self):
         path = self.root / "first-turn.md"
@@ -312,7 +314,7 @@ FOLDERS_BY_TEST = {
     "test_timestamp_prefixed_prose_written_by_the_agent_gets_prose_findings": "timeline",
     "test_docx_with_an_em_dash_in_its_document_body_blocks_stop": "docx",
     "test_malformed_docx_never_blocks_stop": "broken_docx",
-    "test_extensionless_prose_file_is_scanned": "notes",
+    "test_content_guessed_prose_file_is_allowed_with_its_findings_noted": "notes",
     "test_post_tool_batch_scans_written_files_in_the_first_turn_before_any_stop": "batch",
 }
 

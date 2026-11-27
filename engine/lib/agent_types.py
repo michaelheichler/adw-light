@@ -37,6 +37,10 @@ def type_of(payload: object, state_root: str | Path | None) -> str:
         return ""
 
 
+def known(state: dict) -> dict[str, str]:
+    return _known(state)
+
+
 def _known(state: dict) -> dict[str, str]:
     stored = state.get(STATE_KEY)
     if type(stored) is not dict:

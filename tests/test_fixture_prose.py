@@ -1,7 +1,8 @@
 import unittest
 
 from fixture_prose_home import (
-    EXEMPT, FLAGGED, FLAGGED_PROSE, NARRATED_CODE, PLAIN_PROSE, FixtureProseHome, referring_test, staged, untracked,
+    EXEMPT, FLAGGED, FLAGGED_PROSE, NARRATED_CODE, PLAIN_PROSE, PROSE_FAMILIES, FixtureProseHome, referring_test, staged,
+    untracked,
 )
 
 
@@ -76,8 +77,9 @@ class UnusedFixturesAtTheWriteGate(FixtureProseCases):
     def test_reference_inside_the_tests_readme_does_not_count(self):
         self.assertEqual(FLAGGED, self.write_verdict("in_readme", SAMPLE))
 
-    def test_extensionless_fixture_named_without_its_parent_is_flagged(self):
-        self.assertEqual(FLAGGED, self.write_verdict("by_bare_output", GOLDEN))
+    def test_extensionless_fixture_named_without_its_parent_is_reported_but_allowed(self):
+        """A test must verify what the code does for its client, never how it does it."""
+        self.assertEqual((None, set(PROSE_FAMILIES)), self.write_verdict("by_bare_output", GOLDEN))
 
     def test_longer_file_name_that_contains_the_fixture_name_does_not_count(self):
         self.assertEqual(FLAGGED, self.write_verdict("by_longer_name", SAMPLE))

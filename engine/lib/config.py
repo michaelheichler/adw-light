@@ -14,14 +14,14 @@ from typing import NamedTuple
 
 try:
     from . import families, german_rules, prose_language, test_rules
-    from .findings import Outcome
+    from .findings import Outcome, VerdictKind
     from .payloads import cwd as payload_cwd, exact_string_dict, session_id as payload_session_id
 except ImportError:
     import families
     import german_rules
     import prose_language
     import test_rules
-    from findings import Outcome
+    from findings import Outcome, VerdictKind
     from payloads import cwd as payload_cwd, exact_string_dict, session_id as payload_session_id
 
 
@@ -560,7 +560,13 @@ def resolve_outcome(finding: dict, config: dict | None = None) -> Outcome:
         return Outcome.BLOCK
     if rule in FIXED_OBSERVE_RULES:
         return Outcome.WOULD_BLOCK
-    cfg = effective_config(config)
+    outcome = _configured_outcome(finding, effective_config(config), rule)
+    severity = finding.get("severity") if isinstance(finding, dict) else None
+    severity_is_observe = severity == VerdictKind.OBSERVE.value
+    return Outcome.WOULD_BLOCK if severity_is_observe and outcome is Outcome.BLOCK else outcome
+
+
+def _configured_outcome(finding: dict, cfg: dict, rule: str) -> Outcome:
     surface = finding.get("surface") if isinstance(finding, dict) else None
     own = _rule_state_from(cfg, rule, surface if isinstance(surface, str) else None)
     if own is not None:

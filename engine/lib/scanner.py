@@ -23,7 +23,7 @@ try:
     from .german_document_rules import scan_german_document
     from .prose_language import ENGLISH, GERMAN, ParagraphLanguage, allowed_languages, paragraph_languages
     from .config import DEFAULTS, calibrated_findings, contract_strings, effective_config, family_enabled
-    from .findings import finding_row, spanning
+    from .findings import VerdictKind, finding_row
     from .markup import (
         CONFIG_EXTS,
         MARKDOWN_EXTS,
@@ -76,7 +76,7 @@ except ImportError:
     from german_document_rules import scan_german_document
     from prose_language import ENGLISH, GERMAN, ParagraphLanguage, allowed_languages, paragraph_languages
     from config import DEFAULTS, calibrated_findings, contract_strings, effective_config, family_enabled
-    from findings import finding_row, spanning
+    from findings import VerdictKind, finding_row
     from markup import (
         CONFIG_EXTS,
         MARKDOWN_EXTS,
@@ -112,9 +112,11 @@ except ImportError:
 try:
     from .file_kinds import (
         CONFIG_BASENAMES,
+        ProseBasis,
         _code_file,
         _is_config,
         _is_prose,
+        _prose_basis,
     )
     from .scan_lines import _SourceLine, _line_or_blank
     from .punctuation_scan import (
@@ -168,9 +170,11 @@ try:
 except ImportError:
     from file_kinds import (
         CONFIG_BASENAMES,
+        ProseBasis,
         _code_file,
         _is_config,
         _is_prose,
+        _prose_basis,
     )
     from scan_lines import _SourceLine, _line_or_blank
     from punctuation_scan import (
@@ -294,17 +298,20 @@ class _ScanContext(NamedTuple):
     prose: bool
     code_file: bool
     active_families: frozenset[str]
+    guessed_prose: bool = False
 
 
 def _scan_context(path: str, text: str, config: dict | None) -> _ScanContext:
     cfg = effective_config(config)
     tree, lines = _python_tree(path, text), text.splitlines() or [""]
     suffix = PurePath(path.lower()).suffix
-    prose = _is_prose(path, text) or suffix in {".vue", ".svelte"}
+    basis = _prose_basis(path, text)
+    prose = basis is not None or suffix in {".vue", ".svelte"}
     code_file = _code_file(path, text)
     return _ScanContext(
         path=path, text=text, config=cfg, tree=tree, lines=lines,
         prose=prose, code_file=code_file, active_families=_active_families(path, cfg),
+        guessed_prose=basis is ProseBasis.CONTENT,
     )
 
 
@@ -459,7 +466,17 @@ def scan_all(
         findings = merged_findings(findings, _view_findings(context, source, view, hidden_ranges, document))
     if context.code_file and "code" in context.active_families and not _is_exempt(path, context.config):
         findings.extend([] if program_output.exempt_output(path, text) else path_findings(path, text))
-    return findings
+    return _guessed_prose_observed(context, findings)
+
+
+def _guessed_prose_observed(context: _ScanContext, findings: list[dict]) -> list[dict]:
+    if not context.guessed_prose:
+        return findings
+    observe_severity = VerdictKind.OBSERVE.value
+    return [
+        {**row, "severity": observe_severity} if row["family"] in PROSE_FINDING_FAMILIES else row
+        for row in findings
+    ]
 
 
 def _colon_count(context: _ScanContext, document: bool) -> ColonCount | None:

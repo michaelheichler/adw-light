@@ -27,9 +27,9 @@ class _StopTurn(NamedTuple):
 
 
 def _verdict(turn: _StopTurn, turn_id: str) -> dict:
-    from lib import after_run
+    from lib import after_run_stop
     payload, cfg, until, config = turn
-    after_run_reason, after_run_notice = after_run.stop(payload, cfg, until, config=config)
+    after_run_reason, after_run_notice = after_run_stop.stop(payload, cfg, until, config=config)
     scan_paths = stop_scan.ScanPaths.from_cwd(payloads.cwd(payload))
     outcome, foreign = turn_outcome(payload, cfg, turn_id, until=until, scan_paths=scan_paths)
     recovered = session_state.take_recovery_notice(payloads.session_id(payload), cfg.get("state_root"))

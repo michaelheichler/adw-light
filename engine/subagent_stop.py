@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from lib import after_run, payloads, session_state, stop_scan
+from lib import after_run_stop, payloads, session_state, stop_scan
 from lib.config import payload_hook_config
 from lib.end_turn import stop_outcome
 from lib.hookio import PARSE_FAILURE, STATE_FAILURE, join_notices, read_payload, stop_block, system_message, write_payload
@@ -18,7 +18,7 @@ def run(payload: dict, config: dict | None = None, *, until: float | None = None
         cfg = payload_hook_config(config, payload)
 
         def gate(turn_id: str) -> dict:
-            after_reason, after_notice = after_run.subagent_stop(payload, cfg, until, config=config)
+            after_reason, after_notice = after_run_stop.subagent_stop(payload, cfg, until, config=config)
             outcome = stop_outcome(payload, cfg, hook="subagent_stop", turn_id=turn_id, until=until)
             notice = join_notices(
                 session_state.take_recovery_notice(payloads.session_id(payload), cfg.get("state_root")),

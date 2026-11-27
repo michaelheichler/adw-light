@@ -17,6 +17,7 @@ try:
     from .commit_git_resolution import _located_verb
     from .file_kinds import CONFIG_BASENAMES
     from .imported_baseline import file_digest, text_digest
+    from .office_text import DOCUMENT_SUFFIXES
     from .path_policy import PROJECT_MARKERS
     from .regular_file import open_regular
     from .scan_input import TEXT_SUFFIXES
@@ -28,6 +29,7 @@ except ImportError:
     from commit_git_resolution import _located_verb
     from file_kinds import CONFIG_BASENAMES
     from imported_baseline import file_digest, text_digest
+    from office_text import DOCUMENT_SUFFIXES
     from path_policy import PROJECT_MARKERS
     from regular_file import open_regular
     from scan_input import TEXT_SUFFIXES
@@ -47,7 +49,7 @@ ABSENT = "absent"
 UNKNOWN = "unknown"
 GIT_OPERATIONS = frozenset({"merge", "revert", "cherry-pick"})
 REPLAYING = frozenset({"rebase", "pull", "am"})
-WALK_SUFFIXES = TEXT_SUFFIXES | {"", ".docx", ".odt", ".pptx", ".xlsx"}
+WALK_SUFFIXES = TEXT_SUFFIXES | {""} | DOCUMENT_SUFFIXES
 
 
 def _git_verbs(segment: list[str], cwd: Path) -> list[str]:

@@ -7,6 +7,7 @@ from in_memory_hook import ALLOWED, DENY, PASSED, PRINCIPLE, InMemoryHookCase, b
 HARD_PATH = (DENY, ["hard_coded_path"])
 PATH_NOTED = (None, ["hard_coded_system_path"])
 PASSIVE = (DENY, ["passive_voice"])
+PASSIVE_NOTED = (None, ["passive_voice"])
 PLAN = "docs/plan.md"
 STEP = "The plan has one step: auth runs first."
 THREE_COLONS = "Lint runs second: it checks types too. The deploy waits for one thing: a green build. Rollback stays simple: revert the release tag and redeploy the previous build from the archive.\n"
@@ -100,8 +101,9 @@ class ProgramOutputFiles(FakeRepoCase):
     def test_out_file_line_holding_a_plugin_cache_path_in_a_folder_that_is_not_ignored_is_refused(self):
         self.assertEqual(self.verdict("reports/deploy.out", "installed " + self.plugin_cache() + "\n"), HARD_PATH)
 
-    def test_log_file_keeps_its_prose_findings(self):
-        self.assertEqual(self.verdict("logs/deploy.log", "The cache was rebuilt, cleaned and saved.\n"), PASSIVE)
+    def test_log_file_is_allowed_and_keeps_its_prose_findings(self):
+        """A test must verify what the code does for its client, never how it does it."""
+        self.assertEqual(self.verdict("logs/deploy.log", "The cache was rebuilt, cleaned and saved.\n"), PASSIVE_NOTED)
 
 
 class PluginCachePathInSource(InMemoryHookCase):
