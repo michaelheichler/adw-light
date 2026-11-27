@@ -110,5 +110,7 @@ def is_binary_content(path: str | PurePath, content: bytes | str) -> bool:
         return True
     if sample.startswith(SHEBANG) or (suffix and suffix in TEXT_SUFFIXES):
         return False
+    if b"\0" in sample:
+        return True
     dense = strange_share(_encoded(content)) > STRANGE_SHARE
     return _signed(sample) or dense if suffix else _executable(sample) and dense
