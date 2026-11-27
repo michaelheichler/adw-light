@@ -364,31 +364,50 @@ def blob_source(content: bytes) -> tuple[str, str | None]:
     return hashlib.sha256(content).hexdigest(), text
 
 
-def head_sources(root: Path, raws: list[str], until: float) -> tuple[dict[str, tuple[str, str | None]], set[str]]:
+def head_sources(root: Path, raws: list[str], until: float, *, previous: str | None = None
+                 ) -> tuple[dict[str, tuple[str, str | None]], set[str]]:
     if not raws:
         return {}, set()
-    blobs = git_port.view().head_blobs(root, raws, until=until) if time.monotonic() < until else None
+    if time.monotonic() >= until:
+        return {}, set(raws)
+    git = git_port.view()
+    if previous is None:
+        blobs = git.head_blobs(root, raws, until=until)
+    else:
+        blobs = git.revision_blobs(root, previous, raws, until=until) if previous else {}
     if blobs is None:
         return ({}, set(raws)) if time.monotonic() >= until else (dict.fromkeys(raws, (UNKNOWN, None)), set())
-    return {raw: blob_source(blobs[raw]) if raw in blobs else (UNKNOWN, None) for raw in raws}, set()
+    missing = UNKNOWN if previous is None else ABSENT
+    return {raw: blob_source(blobs[raw]) if raw in blobs else (missing, None) for raw in raws}, set()
 
 
 def previous_sources(compared: Comparison, raws: list[str]) -> tuple[dict[str, tuple[str, str | None]], set[str]]:
     snapshot, found, wanted = compared.before, {}, []
+    previous = snapshot.get("previous_head")
     for raw in raws:
         mark = snapshot["marks"].get(raw)
         current = compared.marks.get(raw, [""])
-        if raw in compared.moved:
-            found[raw] = compared.moved[raw]
-        elif mark is not None:
+        if mark is not None:
             fingerprint, text = compared.sources.get(source_key(raw, mark), (UNKNOWN, None))
             found[raw] = (fingerprint, text)
-        elif not snapshot["git"] or current[0] in {"??", ignored_configs.IGNORED_MARK} or current[0].startswith("A"):
+        elif previous is not None and _predates_snapshot(compared, raw):
+            found[raw] = compared.current(raw)
+        elif raw in compared.moved:
+            found[raw] = compared.moved[raw]
+        elif not snapshot["git"] or (previous is None and (current[0] in {"??", ignored_configs.IGNORED_MARK}
+                                                             or current[0].startswith("A"))):
             found[raw] = (ABSENT, None)
         else:
             wanted.append(raw)
-    fetched, late = head_sources(compared.root, wanted, compared.until)
+    fetched, late = head_sources(compared.root, wanted, compared.until, previous=previous)
     return found | fetched, late
+
+
+def _predates_snapshot(compared: Comparison, raw: str) -> bool:
+    mark = compared.marks.get(raw)
+    path = project_path(compared.root, raw) if mark is None else None
+    observed = mark[1] if mark is not None else stamp(path) if path else []
+    return bool(observed) and observed[3] < compared.before.get("wall_ns", 0)
 
 
 def changed(before: dict, after: dict) -> list[str]:
