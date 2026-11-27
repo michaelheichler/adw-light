@@ -18,10 +18,6 @@ class Entry(NamedTuple):
 
 
 RULES: dict[str, Entry] = {
-    "after_run_deferred": Entry(
-        "Commit scan incomplete",
-        "The commit scan could not finish and must run again at Stop",
-    ),
     "ai_closer": Entry(
         "Wrap-up flourish",
         "Cuts the closing gesture that restates the point instead of ending",

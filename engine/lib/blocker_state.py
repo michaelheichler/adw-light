@@ -13,15 +13,14 @@ KEY = "unresolved_blockers"
 REPORT_LINE_RE = re.compile(r"\nFull report: .*?(?=\n|$)")
 RECORD_ERROR_KEY = "<record-error>"
 BATCH_KEY = "<batch>"
-AFTER_RUN_KEY = "<after-run>"
 BATCH_ERROR_KEY = "<batch-error>"
 STALL_KEY = "stall"
 DEFERRED_STALL_KEY = "deferred_stall"
 DROPPED_KEY = "dropped_paths"
-HELD_KEY = "held_files"
 TOUCHED_KEY = "touched_at"
 MAX_SCOPE_PATHS = 500
 RESCAN_RELEASED_KEYS = frozenset({RECORD_ERROR_KEY})
+RETIRED_KEYS = frozenset({"<after-run>"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +69,7 @@ def _normalized_bucket(bucket: dict) -> tuple[dict[str, str], list[str], int]:
     raw_revision = bucket.get("revision")
     pending = {
         key: value for key, value in raw_pending.items()
-        if isinstance(key, str) and isinstance(value, str)
+        if isinstance(key, str) and isinstance(value, str) and key not in RETIRED_KEYS
     } if isinstance(raw_pending, dict) else {}
     paths = [value for value in raw_paths if isinstance(value, str)] if isinstance(raw_paths, list) else []
     revision = raw_revision if isinstance(raw_revision, int) and not isinstance(raw_revision, bool) else 0
@@ -134,7 +133,7 @@ def set_pending(scope: BlockerScope | str, *values: object) -> None:
 
     def mutate(bucket: dict) -> dict:
         pending, _paths, _revision = _normalized_bucket(bucket)
-        pending[path or "<turn>"] = reason if path == AFTER_RUN_KEY else REPORT_LINE_RE.sub("", reason)
+        pending[path or "<turn>"] = REPORT_LINE_RE.sub("", reason)
         return _marked({**bucket, "pending": pending}, [path or "<turn>"])
 
     _update(scope, mutate)
@@ -396,47 +395,6 @@ def snapshot(session_id: str, agent_id: str, root=None) -> tuple[list[str], list
     return list(pending.values()), paths
 
 
-def _held(bucket: dict) -> dict[str, dict[str, str]]:
-    stored = bucket.get(HELD_KEY)
-    if not isinstance(stored, dict):
-        return {}
-    return {
-        path: {key: value for key, value in entry.items() if isinstance(key, str) and isinstance(value, str)}
-        for path, entry in stored.items() if isinstance(path, str) and isinstance(entry, dict)
-    }
-
-
-def hold_files(scope: BlockerScope, entries: dict[str, dict[str, str]]) -> list[str]:
-    added: list[str] = []
-
-    def mutate(bucket: dict) -> dict:
-        held = _held(bucket)
-        fresh = {path: entry for path, entry in entries.items() if path not in held}
-        added.extend(fresh)
-        return {**bucket, HELD_KEY: {**held, **fresh}}
-
-    _update(scope, mutate)
-    return added
-
-
-def release_files(scope: BlockerScope, paths: list[str]) -> None:
-    gone = set(paths)
-
-    def mutate(bucket: dict) -> dict:
-        kept = {path: entry for path, entry in _held(bucket).items() if path not in gone}
-        return {key: value for key, value in bucket.items() if key != HELD_KEY} | ({HELD_KEY: kept} if kept else {})
-
-    _update(scope, mutate)
-
-
-def held_files(session_id: str, root=None) -> dict[str, dict[str, dict[str, str]]]:
-    scopes = session_state.read_state_strict(session_id, root).get(KEY)
-    if not isinstance(scopes, dict):
-        return {}
-    found = {agent: _held(bucket) for agent, bucket in scopes.items() if isinstance(agent, str) and isinstance(bucket, dict)}
-    return {agent: held for agent, held in found.items() if held}
-
-
 class QueuedScope(NamedTuple):
     paths: list[object]
     has_pending: bool
@@ -444,8 +402,8 @@ class QueuedScope(NamedTuple):
 
 def _queued_scope(bucket: dict) -> QueuedScope:
     paths = bucket.get("paths")
-    pending = bucket.get("pending")
-    return QueuedScope(paths if isinstance(paths, list) else [], isinstance(pending, dict) and bool(pending))
+    pending, _paths, _revision = _normalized_bucket(bucket)
+    return QueuedScope(paths if isinstance(paths, list) else [], bool(pending))
 
 
 def queued_scopes(session_id: str, root: str | Path | None) -> dict[str, QueuedScope]:

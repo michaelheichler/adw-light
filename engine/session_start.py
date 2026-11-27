@@ -20,7 +20,6 @@ def run(payload: dict | None = None, config: dict | None = None, *, drift: Calla
         session_state.acquire_session_lease(session_id, state_root)
         retention.sweep(state_root=state_root, ledger_root=ledger_root)
         _count_wording_debt(session_id, fields.get("cwd"), state_root)
-        _prime_ignored(session_id, fields.get("cwd"), state_root)
         _start_setup(fields.get("cwd"))
     message = CONTRACT_REMINDER if fields.get("source") in REMINDER_SOURCES else CONTRACT
     notice = (drift or _drift_notice)()
@@ -33,17 +32,6 @@ def _count_wording_debt(session_id: str, cwd: object, state_root: str | None) ->
     try:
         wording_debt.note_session_start(session_id, cwd, state_root)
     except (OSError, ValueError, RecursionError, MemoryError):
-        return
-
-
-def _prime_ignored(session_id: str, cwd: object, state_root: str | None) -> None:
-    if not isinstance(cwd, str) or not cwd or not Path(cwd).is_dir():
-        return
-    from lib import after_run
-
-    try:
-        after_run.prime_ignored(session_id, cwd, state_root)
-    except (OSError, ValueError, RuntimeError):
         return
 
 

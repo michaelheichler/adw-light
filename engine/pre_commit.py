@@ -42,7 +42,9 @@ STAGE_SEPARATELY = (
     "The commit gate scans the index before this command runs, so it cannot judge content the same command stages "
     "or reads from the worktree. Stage in its own tool call, then commit without paths, -a, -i, -o, or -p."
 )
-UNREAD_INDEX = "The commit gate could not read the index of {repo}, which lies outside the project the after-run check covers."
+UNREAD_INDEX = (
+    "The commit gate could not read the index of {repo}, which lies outside the current project."
+)
 
 @dataclass(frozen=True, slots=True)
 class _CommitRunContext:
@@ -118,7 +120,9 @@ def _gate(context: _CommitRunContext, turn_id: str, commit_cwds: list[GitCall]) 
                 return deny(f"{COMMIT_REFUSED}{exc}")
             messages[i] = None
     try:
-        repo_rows, receipts = _repo_findings_by_repo(commit_cwds, context.config, _session_start(context), messages, covered)
+        repo_rows = _repo_findings_by_repo(
+            commit_cwds, context.config, _session_start(context), covered,
+        )
     except UnreadableCommit as exc:
         return deny(f"{COMMIT_REFUSED}{exc}")
     message_findings = [row for text in messages.values() for row in _scan_message(text, outer_cfg)]
@@ -134,10 +138,6 @@ def _gate(context: _CommitRunContext, turn_id: str, commit_cwds: list[GitCall]) 
     kind, message = verdict_message(decisions, outer_cfg) if decisions else ("release", "")
     if kind == "block":
         return deny(message)
-    if receipts:
-        from lib.after_commit import record_receipt
-        for repo, parent, text, blobs in receipts:
-            record_receipt(context.payload, context.roots.state, repo, parent, text, blobs)
     notice = _inherited_notice(scan)
     if kind == "observe":
         return advise("\n".join(part for part in (message, notice) if part), "PreToolUse")
@@ -215,8 +215,10 @@ def _commit_content(repo: Path, call: GitCall, previous: list[GitCall], covered:
         raise UnreadableCommit(UNREAD_INDEX.format(repo=repo)) from exc
 
 
-def _repo_findings_by_repo(calls: list[GitCall], config: dict | None, started_at: float | None, messages: dict, covered: dict):
-    rows, receipts = [], []
+def _repo_findings_by_repo(
+    calls: list[GitCall], config: dict | None, started_at: float | None, covered: dict,
+) -> list[_RepoScan]:
+    rows = []
     seen = set()
     for i, call in enumerate(calls):
         if call.verb != "commit" or call.new_folder or (repo := call.repo()) is None:
@@ -236,11 +238,7 @@ def _repo_findings_by_repo(calls: list[GitCall], config: dict | None, started_at
         if key not in seen:
             rows.append(_RepoScan(cfg, *_repo_findings(repo, cfg, started_at, blobs, base)))
             seen.add(key)
-        text = messages[i]
-        parent = view().resolve_commit(repo, "HEAD")
-        if text is not None and parent and not amended and len(messages) == 1:
-            receipts.append((repo, parent, text + ("\n" if text and not text.endswith("\n") else ""), blobs))
-    return rows, receipts
+    return rows
 
 
 @contextmanager

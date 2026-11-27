@@ -14,7 +14,9 @@ from lib import blocker_state, captured_output, imported_baseline, journal, payl
 from lib.mcp_health import config_roots
 from lib.config import contract_strings, effective_config
 from lib.findings import Finding, VerdictKind
-from lib.hookio import advise, claude_feedback_response, config_failure, join_notices, read_payload, stop_block, write_payload
+from lib.hookio import (
+    advise, claude_feedback_response, config_failure, read_payload, stop_block, write_payload,
+)
 from lib.payloads import RecordPayload, exact_string_dict, record_payload
 from lib.baseline import split_committed, split_fallback
 from lib.import_advice import imported_advice
@@ -393,30 +395,9 @@ def _gate_context_for(
     )
 
 
-def _merge_after_run(record: dict, after: dict) -> dict:
-    if not after or not record:
-        return after or record
-    responses = (record, after)
-    messages = [str(item.get("hookSpecificOutput", {}).get("additionalContext") or item.get("systemMessage", ""))
-                for item in responses]
-    reasons = [item["reason"] for item in responses if item.get("decision") == "block"]
-    notice = join_notices(*dict.fromkeys(messages))
-    if reasons:
-        return {**after, **stop_block(join_notices(*dict.fromkeys(reasons), notice))}
-    return {**record, **after, **advise(notice, "PostToolUse")}
-
-
-def run(payload: dict, config: dict | None = None, *, until: float | None = None) -> dict:
+def run(payload: dict, config: dict | None = None) -> dict:
     try:
-        result = _run_record(payload, config)
-        from lib import after_run
-
-        name = payloads.tool_name(payload)
-        if name == "Bash":
-            return _merge_after_run(result, after_run.post(payload, config, until=until))
-        if name in after_run.DIRECT_WRITERS:
-            after_run.note_direct_write(payload, config, until=until)
-        return result
+        return _run_record(payload, config)
     except Exception as exc:
         reason = config_failure("edit", exc, payloads.cwd(payload) or None)
         blocker_state.hold_undecidable(payload, config, UNDECIDABLE_KEY, reason)

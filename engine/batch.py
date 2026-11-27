@@ -485,22 +485,18 @@ def _batch_response(kind: str, reason: str) -> dict:
     return {}
 
 
-def run(payload: dict, config: dict | None = None, *, until: float | None = None) -> dict:
+def run(payload: dict, config: dict | None = None) -> dict:
     try:
-        return _run(payload, config, until)
+        return _run(payload, config)
     except Exception as exc:
         reason = config_failure("batch", exc, payloads.cwd(payload) or None)
         blocker_state.hold_undecidable(_sanitized_payload(payload), config, UNDECIDABLE_KEY, reason)
         return {"decision": "block", "reason": reason}
 
 
-def _run(payload: dict, config: dict | None, until: float | None = None) -> dict:
+def _run(payload: dict, config: dict | None) -> dict:
     payload = _sanitized_payload(payload)
     cfg = payload_hook_config(config, payload)
-    from lib import after_run
-    reason = after_run.batch_reason(payload, cfg, until)
-    if reason:
-        return {**_batch_response("block", reason), after_run.LIVE_BLOCK: True}
     return run_with_ledger(
         hook="batch",
         payload=payload,

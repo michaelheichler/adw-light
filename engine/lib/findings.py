@@ -49,7 +49,6 @@ _FINDING_KEYS = frozenset({
 })
 _REQUIRED_KEYS = frozenset(_RequiredFindingDict.__annotations__)
 BLOCK_RULES = frozenset({
-    "after_run_deferred",
     "unresolved_doc_reference", "added_docstring", "throat_clearing_opener", "meta_commentary",
     "low_sentence_variance", "uniform_paragraph_endings", "oversized_list", "three_item_list",
     "choppy_sentences", "de_parataxis", "de_uniform_rhythm", "de_uniform_paragraphs",
