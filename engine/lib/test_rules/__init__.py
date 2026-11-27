@@ -4,7 +4,8 @@ import ast
 import functools
 import importlib
 import pkgutil
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
+from pathlib import PurePath
 from typing import NamedTuple
 
 try:
@@ -39,11 +40,16 @@ class RuleSet(NamedTuple):
     check: Callable[[Unit, str], Iterable[Hit]]
 
 
+@functools.lru_cache(maxsize=8)
+def file_lines(text: str) -> tuple[str, ...]:
+    return tuple(text.splitlines())
+
+
 @functools.lru_cache(maxsize=32)
 def module_tree(text: str) -> ast.Module | None:
     try:
         return ast.parse(text)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
         return None
 
 
@@ -118,17 +124,65 @@ def unit_findings(unit: Unit, text: str, rule_sets: Iterable[RuleSet] | None = N
     return [row for rule_set in chosen for row in _set_findings(rule_set, unit, text)]
 
 
-def check_file(path: str, text: str, rule_sets: Iterable[RuleSet] | None = None) -> list[dict]:
+def check_file(
+    path: str, text: str, rule_sets: Iterable[RuleSet] | None = None, *, contracts: Collection[str] = (),
+) -> list[dict]:
     chosen = RULE_SETS if rule_sets is None else tuple(rule_sets)
     if not chosen:
         return []
+    from . import repo_building
+
+    file_rows = repo_building.file_rows(path, text) if repo_building.RULE_SET in chosen else []
+    chosen = tuple(group for group in chosen if group is not repo_building.RULE_SET)
+    if contracts:
+        chosen = _with_contracts(chosen, contracts)
     layer_units, merged_findings = _layer_tools()
     layered = layer_units(path, text)
     lexed = None if layered is not None and not layered.broken else extract(path, text)
     if layered is None:
-        return _unit_rows(lexed, text, chosen)
-    rows = _unit_rows(layered.units, text, chosen)
+        return file_rows + _unit_rows(lexed, text, chosen)
+    rows = file_rows + _unit_rows(layered.units, text, chosen)
+    if layered.broken and not layered.units and not lexed:
+        return rows + _broken_file_rows(path, text, chosen)
     return merged_findings(rows, _unit_rows(lexed, text, chosen)) if layered.broken else rows
+
+
+def _with_contracts(chosen: tuple[RuleSet, ...], contracts: Collection[str]) -> tuple[RuleSet, ...]:
+    from . import wording_assertion
+
+    return tuple(
+        group._replace(check=functools.partial(wording_assertion.check, contracts=contracts))
+        if group is wording_assertion.RULE_SET else group
+        for group in chosen
+    )
+
+
+def _broken_file_rows(path: str, text: str, chosen: tuple[RuleSet, ...]) -> list[dict]:
+    from . import principle_citation
+
+    if principle_citation.RULE_SET not in chosen:
+        return []
+    whole = _whole_file_unit(path, text)
+    heads = principle_citation.broken_heads(whole, text)
+    return _unit_rows(heads or (whole,), text, (principle_citation.RULE_SET,))
+
+
+def _whole_file_unit(path: str, text: str) -> Unit:
+    return Unit(path, PurePath(path).name, 1, max(1, len(text.splitlines())), text, PurePath(path).suffix.lstrip("."))
+
+
+def verified_citation_lines(path: str, text: str) -> set[int]:
+    from . import principle_citation
+
+    layer_units, _ = _layer_tools()
+    layered = layer_units(path, text)
+    if layered is not None and layered.broken and not layered.units and not extract(path, text):
+        whole = _whole_file_unit(path, text)
+        comments = principle_citation.comment_citations(whole, text)
+        heads = principle_citation.broken_heads(whole, text)
+        return {unit.start - 1 for unit in heads if unit.start - 1 in comments}
+    units = layered.units if layered is not None else extract(path, text)
+    return {line for unit in units if (line := principle_citation._citation(unit, text))}
 
 
 def file_units(path: str, text: str) -> list[Unit]:

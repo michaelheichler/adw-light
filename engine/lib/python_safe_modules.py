@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+import re
+
 Kind = str | tuple[str, tuple["Kind", ...]]
 
 PATH_METHODS: dict[str, Kind] = {
@@ -53,7 +56,8 @@ HASH_FUNCTIONS = ("blake2b", "blake2s", "file_digest", "md5", "sha1", "sha224", 
 DATETIME_FACTORIES = ("fromisoformat", "fromtimestamp", "now", "strptime", "today", "utcnow")
 
 IMPORTABLE = frozenset({
-    "ast", "collections", "datetime", "hashlib", "html", "itertools", "math", "os.path", "pathlib", "re", "tomllib", "yaml",
+    "ast", "collections", "datetime", "hashlib", "html", "itertools", "math", "os.path", "pathlib", "re", "tempfile",
+    "tomllib", "yaml",
 })
 INERT_MODULES = frozenset({
     "base64", "binascii", "bisect", "copy", "decimal", "difflib", "enum", "fnmatch", "fractions", "functools", "heapq",
@@ -70,6 +74,7 @@ FUNCTIONS: dict[str, Kind] = {
     **{f"math.{name}": "value" for name in MATH_FUNCTIONS},
     "collections.Counter": "counter", "collections.OrderedDict": "dict",
     **{f"hashlib.{name}": "hash" for name in HASH_FUNCTIONS},
+    "tempfile.gettempdir": "text",
     "tomllib.load": "json", "tomllib.loads": "json",
     "yaml.safe_load": "json", "yaml.safe_load_all": ("sequence", ("json",)),
     "ast.parse": "ast_tree", "ast.dump": "text", "ast.literal_eval": "json",
@@ -174,3 +179,75 @@ def callable_result(callee: Kind | None, item_kinds: list[Kind | None]) -> Kind 
 
 def common_item(kinds: list[Kind | None]) -> Kind:
     return kinds[0] if kinds and kinds[0] is not None and all(kind == kinds[0] for kind in kinds) else "value"
+
+
+READ_ONLY_OPEN_MODE_CHARS = frozenset("rbtU")
+OPEN_KEYWORDS = frozenset({"buffering", "encoding", "errors", "newline", "closefd"})
+SAFE_IMPORTS = {"json": "json_module", "sys": "sys_module"}
+SYS_ATTRIBUTES: dict[str, Kind] = {
+    "stdin": "file", "argv": ("sequence", ("text",)), "executable": "text", "maxsize": "value",
+    "platform": "text", "version": "text", "version_info": "value", "exit": "sys_exit",
+}
+JSON_FUNCTIONS = frozenset({"dumps", "load", "loads"})
+DUMPS_KEYWORDS = frozenset({"allow_nan", "ensure_ascii", "indent", "separators", "skipkeys", "sort_keys"})
+PATH_CLASSES = frozenset({"Path", "PurePath"})
+SORT_HELPERS = frozenset({"max", "min", "sorted"})
+CONTAINER_LITERALS = (ast.Dict, ast.DictComp, ast.List, ast.ListComp)
+UNASSIGNED_HINT = ", which is never assigned in this payload. Define it or inline the value"
+SAFE_BUILTINS = frozenset({
+    "abs", "all", "any", "bool", "bytes", "dict", "enumerate", "float", "int", "isinstance", "iter", "len", "list", "max",
+    "min", "next", "print", "range", "repr", "round", "set", "sorted", "str", "sum", "tuple", "type", "zip",
+})
+SAFE_EXCEPTIONS = frozenset({
+    "ArithmeticError", "AssertionError", "AttributeError", "Exception", "FileNotFoundError", "IndexError", "KeyError",
+    "LookupError", "OSError", "StopIteration", "SystemExit", "TypeError", "UnicodeDecodeError", "ValueError", "ZeroDivisionError",
+})
+JSON_ERROR = "JSONDecodeError"
+FIXED_BUILTIN_KINDS: dict[str, Kind] = {"str": "text", "repr": "text", "bytes": "bytes", "range": ("sequence", ("value",))}
+SAFE_LITERAL_TYPES = (str, bytes, int, float, complex, bool, type(None))
+ASSIGNABLE_KINDS = frozenset({"bytes", "file", "json", "path", "text", "value"}) | OBJECT_KINDS
+
+SUSPICIOUS_BARE_LITERAL_RE = re.compile(r"(?:\b(?:write|exec|eval)\s*\(|__)")
+
+Comprehension = ast.GeneratorExp | ast.ListComp | ast.SetComp | ast.DictComp
+
+
+def common_kind(kinds: list[Kind] | tuple[Kind, ...]) -> Kind:
+    return kinds[0] if kinds and all(kind == kinds[0] for kind in kinds) else "value"
+
+
+def item_kind(kind: Kind | None) -> Kind | None:
+    if isinstance(kind, tuple):
+        return kind[1][0] if kind[0] == "sequence" else common_kind(kind[1])
+    return {"text": "text", "bytes": "value", "file": "text", "json": "json", **ITEMS}.get(kind)
+
+
+def assignable_kind(kind: Kind | None) -> bool:
+    if isinstance(kind, tuple):
+        return all(assignable_kind(item) for item in kind[1])
+    return kind in ASSIGNABLE_KINDS
+
+
+def describe_node(node: ast.AST) -> str:
+    try:
+        text = " ".join(ast.unparse(node).split())
+    except (RecursionError, ValueError):
+        text = ""
+    return f"{type(node).__name__} \"{text[:80]}\" on line {getattr(node, 'lineno', '?')}"
+
+
+def stdout_arguments(node: ast.Call, bindings: dict[str, Kind]) -> list[ast.expr] | None:
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr == "write" and len(node.args) == 1 and not node.keywords:
+        stream, values = func.value, node.args
+    elif (func.attr == "dump" and isinstance(func.value, ast.Name) and bindings.get(func.value.id) == "json_module"
+          and len(node.args) == 2 and all(keyword.arg in DUMPS_KEYWORDS for keyword in node.keywords)):
+        stream, values = node.args[1], node.args[:1]
+    else:
+        return None
+    if isinstance(stream, ast.Attribute) and stream.attr == "stdout" and isinstance(stream.value, ast.Name):
+        if bindings.get(stream.value.id) == "sys_module":
+            return values
+    return None

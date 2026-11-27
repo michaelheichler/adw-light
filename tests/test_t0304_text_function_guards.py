@@ -1,20 +1,28 @@
-from quiet_git import disable_background_maintenance
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 import unittest
 
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+sys.path.insert(0, str(PROJECT / "engine"))
 
-SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+from adw_light import run_hook
+from lib.git_port import FakeGitView
+
+
+NO_REPOSITORY = FakeGitView({"roots": {}})
+
 AGENT = "adw-test-writer"
 TEST_FILE = "tests/test_probe.py"
 DENY = "deny"
 RULE = "wording_assertion"
-BODY_START = 4
-HEADER = ("import pytest", "", "", "def test_probe():")
+BODY_START = 5
+CITATION = '"""A test must verify what the code does for its client, never how it does it."""'
+HEADER = ("import pytest", "", "", "def test_probe():", "    " + CITATION)
 LOWER = " ".join(("the", "cache", "is", "empty"))
 TITLED = " ".join(("The", "Cache", "Is", "Empty"))
 UNRELATED = " ".join(("the", "store", "is", "full"))
@@ -23,6 +31,8 @@ ONE_EXTRA = " ".join((LOWER, "now"))
 TWO_EXTRA = " ".join((LOWER, "right", "now"))
 THREE_EXTRA = " ".join((LOWER, "right", "now", "again"))
 PRODUCTION = "src/app.py"
+PLAIN = "plain"
+SOURCED = "sourced"
 
 
 def quoted(text):
@@ -41,46 +51,47 @@ def lower_check(given):
     return f"assert render_text({quoted(given)}) == {quoted(LOWER)}"
 
 
+def project(root, name):
+    folder = root / name
+    (folder / ".git").mkdir(parents=True)
+    (folder / "tests").mkdir()
+    return folder
+
+
 class TextFunctionGuards(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         workspace = TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name)
-        self.repo = self.root / "repo"
-        self.state = self.root / "state"
-        self.home = self.root / "home"
-        self.home.mkdir()
-        (self.repo / "tests").mkdir(parents=True)
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
-        disable_background_maintenance(str(self.repo))
+        cls.addClassCleanup(workspace.cleanup)
+        cls.root = Path(workspace.name).resolve()
+        cls.state = cls.root / "state"
+        (cls.root / "home").mkdir()
+        project(cls.root, PLAIN)
+        sourced = project(cls.root, SOURCED)
+        (sourced / "src").mkdir()
+        (sourced / PRODUCTION).write_text(f"TITLE = {quoted(TITLED)}\n", encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"HOME": str(cls.root / "home")})
+        environment.start()
+        cls.addClassCleanup(environment.stop)
 
-    def place(self, relative, text):
-        target = self.repo / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+    def reports(self):
+        return set((self.state / "reports").glob("*.json"))
 
-    def write_test(self, content):
+    def wording_rows(self, content, name=PLAIN):
+        repo = self.root / name
         payload = {
-            "cwd": str(self.repo), "session_id": "guards", "hook_event_name": "PreToolUse",
+            "cwd": str(repo), "session_id": self._testMethodName, "hook_event_name": "PreToolUse",
             "agent_type": AGENT, "tool_name": "Write",
-            "tool_input": {"file_path": str(self.repo / TEST_FILE), "content": content},
+            "tool_input": {"file_path": str(repo / TEST_FILE), "content": content},
         }
-        call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state)],
-            input=json.dumps(payload), text=True, capture_output=True,
-            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
-        )
-        self.assertEqual(call.returncode, 0)
-        return json.loads(call.stdout)
+        earlier = self.reports()
+        response = run_hook("PreToolUse", payload, state_dir=self.state, git_view=NO_REPOSITORY)
+        rows = [row for report in sorted(self.reports() - earlier) for row in json.loads(report.read_text(encoding="utf-8"))]
+        return response, [row for row in rows if row["rule"] == RULE]
 
-    def wording_rows(self):
-        reports = sorted((self.state / "reports").glob("*.json"))
-        rows = [row for report in reports for row in json.loads(report.read_text(encoding="utf-8"))]
-        return [row for row in rows if row["rule"] == RULE]
-
-    def verdict(self, content):
-        decision = self.write_test(content).get("hookSpecificOutput", {}).get("permissionDecision")
-        return decision, tuple(row["line"] for row in self.wording_rows())
+    def verdict(self, content, name=PLAIN):
+        response, rows = self.wording_rows(content, name)
+        return response.get("hookSpecificOutput", {}).get("permissionDecision"), tuple(row["line"] for row in rows)
 
     def test_expected_text_derived_from_the_input_is_allowed(self):
         self.assertEqual(self.verdict(probe_module(titled_check(quoted(LOWER)))), (None, ()))
@@ -90,14 +101,12 @@ class TextFunctionGuards(unittest.TestCase):
         self.assertEqual(self.verdict(content), (None, ()))
 
     def test_expected_text_found_in_production_code_denies(self):
-        self.place(PRODUCTION, f"TITLE = {quoted(TITLED)}\n")
         content = probe_module(titled_check(quoted(LOWER)))
-        self.assertEqual(self.verdict(content), (DENY, (BODY_START + 1,)))
+        self.assertEqual(self.verdict(content, SOURCED), (DENY, (BODY_START + 1,)))
 
     def test_production_copy_finding_names_the_production_line(self):
-        self.place(PRODUCTION, f"TITLE = {quoted(TITLED)}\n")
-        self.write_test(probe_module(titled_check(quoted(LOWER))))
-        self.assertEqual([row.get("match") for row in self.wording_rows()], [f"{PRODUCTION}:1"])
+        _, rows = self.wording_rows(probe_module(titled_check(quoted(LOWER))), SOURCED)
+        self.assertEqual([row.get("match") for row in rows], [f"{PRODUCTION}:1"])
 
     def test_input_that_is_a_near_copy_of_the_expected_text_denies(self):
         content = probe_module(titled_check(quoted(TITLED + "!")))

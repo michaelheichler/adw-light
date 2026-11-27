@@ -17,9 +17,11 @@ from .baseline import (
 from .config import resolve_outcome
 from .imported_baseline import Snapshot
 from .scanner import read_scannable, scan_all
-from .temp_scope import outside_project_temp
+from .temp_scope import cwd_forms, outside_project_temp, temp_roots
+from .tests_policy import project_root
 
-STOP_SCAN_CAP = 7.0
+STOP_SCAN_CAP = 6.0
+FULL_TURN = STOP_SCAN_CAP / 2
 MAX_NAMED_SKIPPED = 3
 INHERITED_FIELD = "inherited"
 Split = Callable[[dict], tuple[list[dict], list[dict]]]
@@ -32,10 +34,13 @@ class Rescan:
     skipped: list[str] = field(default_factory=list)
     clean: list[str] = field(default_factory=list)
     cut: str = ""
+    cut_left: float = 0.0
+    stamps: dict[str, str] = field(default_factory=dict)
+    paused: set[str] = field(default_factory=set)
 
 
-def deadline() -> float:
-    return time.monotonic() + STOP_SCAN_CAP
+def deadline(started_at: float | None = None, *, clock: Callable[[], float] = time.monotonic) -> float:
+    return (clock() if started_at is None else started_at) + STOP_SCAN_CAP
 
 
 def _tagged(split: Split, cfg: dict) -> list[dict]:
@@ -63,10 +68,7 @@ def _path_rows(path: Path, cfg: dict, snapshot: Snapshot | None, until: float) -
     return [{**row, "content_hash": digest, "path": str(path)} for row in rows if resolve_outcome(row, cfg) == "block"]
 
 
-def _owned_rows(path: Path, cwd: Path, cfg: dict, until: float) -> list[dict] | None:
-    remaining(until)
-    if not path.is_file() or outside_project_temp(path, cwd):
-        return None
+def _owned_rows(path: Path, cfg: dict, until: float) -> list[dict]:
     with scan_alarm(until):
         snapshot = imported_baseline.lookup(cfg, path)
         return _path_rows(path, cfg, snapshot, until)
@@ -97,40 +99,90 @@ def scan_alarm(until: float) -> Iterator[None]:
         signal.signal(signal.SIGALRM, previous)
 
 
-def rescan(paths: list[str], cwd: Path, cfg: dict, until: float) -> Rescan:
+@dataclass(frozen=True, slots=True)
+class ScanPaths:
+    directory: Path
+    project: str
+    roots: tuple[Path, ...]
+    project_forms: tuple[Path, ...] | None = None
+
+    @classmethod
+    def from_cwd(cls, cwd: str) -> ScanPaths:
+        directory = Path(cwd or ".").absolute()
+        project = project_root(str(directory))
+        forms = cwd_forms(project) if project and Path(project).is_absolute() else None
+        return cls(directory, project, temp_roots(), forms)
+
+    def candidate(self, raw_path: object) -> Path | None:
+        if not isinstance(raw_path, str) or not raw_path:
+            return None
+        path = path_policy.anchored(raw_path, self.directory)
+        if outside_project_temp(path, self.project, roots=self.roots, project=self.project_forms) or not path.is_file():
+            return None
+        return path
+
+
+def _scan_candidates(paths: list[str], scan_paths: ScanPaths, excluded: list[str]) -> Iterator[tuple[str, Path]]:
+    for raw_path in paths:
+        if (path := scan_paths.candidate(raw_path)) is not None:
+            yield raw_path, path
+        else:
+            excluded.append(raw_path)
+
+
+def rescan(paths: list[str], scan_paths: ScanPaths, cfg: dict, until: float,
+           clock: Callable[[], float] = time.monotonic, pause: frozenset[str] = frozenset()) -> Rescan:
     result = Rescan()
-    for index, raw_path in enumerate(paths):
-        path = path_policy.anchored(raw_path, cwd)
+    candidates = _scan_candidates(paths, scan_paths, result.clean)
+    for raw_path, path in candidates:
+        if raw_path in pause:
+            result.skipped.append(str(path))
+            result.paused.add(raw_path)
+            continue
+        left = until - clock()
         try:
-            rows = _owned_rows(path, cwd, cfg, until)
+            if left <= 0:
+                raise OutOfTime
+            rows = _owned_rows(path, cfg, until)
         except OutOfTime:
-            result.skipped = [str(path_policy.anchored(raw, cwd)) for raw in paths[index:]]
+            result.cut_left = left
+            result.skipped.extend([str(path), *(str(unchecked) for _, unchecked in candidates)])
             result.cut = raw_path
             break
-        if rows is not None:
-            result.existing.append(str(path))
-            result.findings.extend(rows)
-        if rows == []:
+        result.existing.append(str(path))
+        result.findings.extend(rows)
+        if not rows:
             result.clean.append(raw_path)
     return result
 
 
-def stamps(paths: list[str]) -> tuple[str, ...]:
-    marks = []
-    for path in paths:
-        try:
-            stat = Path(path).stat()
-        except OSError:
-            marks.append(f"{path}:missing")
-            continue
-        marks.append(f"{path}:{stat.st_size}:{stat.st_mtime_ns}")
-    return tuple(marks)
-
-
 def skipped_reason(skipped: list[str]) -> str:
-    names = ", ".join(sorted(Path(path).name for path in skipped)[:MAX_NAMED_SKIPPED])
-    more = f" and {len(skipped) - MAX_NAMED_SKIPPED} more" if len(skipped) > MAX_NAMED_SKIPPED else ""
+    names = sorted(Path(path).name for path in skipped)[:MAX_NAMED_SKIPPED]
+    return _skip_notice(len(skipped), names)
+
+
+def queued_summary(paths: list[object], scan_paths: ScanPaths) -> str:
+    names = []
+    count = 0
+    for raw in paths:
+        if (path := scan_paths.candidate(raw)) is None:
+            continue
+        count += 1
+        if len(names) < MAX_NAMED_SKIPPED:
+            names.append(path.name)
+    if not count:
+        return ""
+    noun = "file" if count == 1 else "files"
+    preview = " (" + ", ".join(sorted(names)) + ")"
+    return f"{count} {noun}{preview}"
+
+
+def _skip_notice(count: int, names: list[str]) -> str:
+    noun = "file" if count == 1 else "files"
+    named = ": " + ", ".join(names) if names else ""
+    more = f" and {count - len(names)} more" if names and count > len(names) else ""
+    tracked = "It stays" if count == 1 else "They stay"
     return (
-        f"agent-discipline-watcher: Stop ran out of time. {len(skipped)} files not scanned: {names}{more}. "
-        "They stay tracked for the next Stop."
+        f"agent-discipline-watcher: Stop ran out of time. {count} {noun} not scanned{named}{more}. "
+        f"{tracked} tracked for the next Stop."
     )

@@ -1,8 +1,7 @@
-import json
 import unittest
 
 from t20_layer_home import (
-    ACT, BLOCK, CONTEXT, DENY, IF, LIBRARY_NEEDED, LIBRARY_READY, LOOP, NONE, OBSERVED, LayerHome, Outcome,
+    ACT, BLOCK, CITATION, CONTEXT, DENY, IF, LIBRARY_NEEDED, LIBRARY_READY, LOOP, NONE, OBSERVED, LayerHome, Outcome,
 )
 
 
@@ -11,10 +10,11 @@ JAVA_MAIN = "src/main/java/Calc.java"
 
 
 def java_test(*body):
-    return "class CalcTest {\n@Test\nvoid addsAll() {\n" + "".join(line + "\n" for line in body) + "}\n}\n"
+    return "class CalcTest {\n" + CITATION + "\n@Test\nvoid addsAll() {\n" + "".join(line + "\n" for line in body) + "}\n}\n"
 
 
 FOR_LOOP = java_test("for (int i : xs) {", "assertEquals(i, calc.add(i));", "}")
+UNCITED_FOR_LOOP = FOR_LOOP.replace(CITATION + "\n", "")
 WHILE_LOOP = java_test("int i = 0;", "while (i < 3) {", "assertTrue(calc.add(i) >= i);", "i++;", "}")
 ASSERT_KEYWORD_LOOP = java_test("for (int i : xs) {", "assert calc.add(i) == i;", "}")
 NESTED_LOOPS = java_test(
@@ -47,23 +47,27 @@ def loop_denial(*lines):
 
 @unittest.skipUnless(LIBRARY_READY, LIBRARY_NEEDED)
 class JavaTestRulesUnderTheExactLayer(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.home = LayerHome.open(cls, exact=True)
+
     def exact(self, relative, content):
-        return LayerHome(self, exact=True).outcome(relative, content)
+        return self.home.outcome(self, relative, content)
 
     def test_assertion_inside_a_for_loop_denies_on_the_assertion_line(self):
-        self.assertEqual(self.exact(JAVA_TEST, FOR_LOOP), loop_denial(5))
+        self.assertEqual(self.exact(JAVA_TEST, FOR_LOOP), loop_denial(6))
 
     def test_assertion_inside_a_while_loop_denies_on_the_assertion_line(self):
-        self.assertEqual(self.exact(JAVA_TEST, WHILE_LOOP), loop_denial(6))
+        self.assertEqual(self.exact(JAVA_TEST, WHILE_LOOP), loop_denial(7))
 
     def test_assert_keyword_inside_a_loop_denies(self):
-        self.assertEqual(self.exact(JAVA_TEST, ASSERT_KEYWORD_LOOP), loop_denial(5))
+        self.assertEqual(self.exact(JAVA_TEST, ASSERT_KEYWORD_LOOP), loop_denial(6))
 
     def test_nested_loops_give_one_finding_at_the_first_assertion_of_the_outer_loop(self):
-        self.assertEqual(self.exact(JAVA_TEST, NESTED_LOOPS), loop_denial(5))
+        self.assertEqual(self.exact(JAVA_TEST, NESTED_LOOPS), loop_denial(6))
 
     def test_each_outer_loop_gets_its_own_finding(self):
-        self.assertEqual(self.exact(JAVA_TEST, TWO_LOOPS), loop_denial(5, 8))
+        self.assertEqual(self.exact(JAVA_TEST, TWO_LOOPS), loop_denial(6, 9))
 
     def test_assertion_inside_a_lambda_in_a_loop_passes(self):
         self.assertEqual(self.exact(JAVA_TEST, LAMBDA_IN_LOOP), Outcome(NONE, ()))
@@ -75,7 +79,7 @@ class JavaTestRulesUnderTheExactLayer(unittest.TestCase):
         self.assertEqual(self.exact(JAVA_TEST, STRAIGHT), Outcome(NONE, ()))
 
     def test_asserting_in_both_branches_reports_the_if_line(self):
-        self.assertEqual(self.exact(JAVA_TEST, BOTH_BRANCHES), Outcome(CONTEXT, ((IF, OBSERVED, 5),)))
+        self.assertEqual(self.exact(JAVA_TEST, BOTH_BRANCHES), Outcome(CONTEXT, ((IF, OBSERVED, 6),)))
 
     def test_if_without_else_passes(self):
         self.assertEqual(self.exact(JAVA_TEST, ONE_BRANCH), Outcome(NONE, ()))
@@ -84,7 +88,7 @@ class JavaTestRulesUnderTheExactLayer(unittest.TestCase):
         self.assertEqual(self.exact(JAVA_TEST, ONE_ASSERTING_BRANCH), Outcome(NONE, ()))
 
     def test_second_sut_call_after_an_assert_reports_the_second_act(self):
-        self.assertEqual(self.exact(JAVA_TEST, TWO_ACTS), Outcome(CONTEXT, ((ACT, OBSERVED, 6),)))
+        self.assertEqual(self.exact(JAVA_TEST, TWO_ACTS), Outcome(CONTEXT, ((ACT, OBSERVED, 7),)))
 
     def test_single_sut_call_passes(self):
         self.assertEqual(self.exact(JAVA_TEST, ONE_ACT), Outcome(NONE, ()))
@@ -99,20 +103,22 @@ class JavaTestRulesUnderTheExactLayer(unittest.TestCase):
         self.assertEqual(self.exact(JAVA_MAIN, MARKED_OUTSIDE_TEST_TREE), loop_denial(5))
 
     def test_cached_java_grammar_logs_no_reduced_precision(self):
-        hook = LayerHome(self, exact=True)
-        hook.write(JAVA_TEST, FOR_LOOP)
-        self.assertEqual(hook.precision_reasons(), ())
+        self.home.write(self, JAVA_TEST, FOR_LOOP)
+        self.assertEqual(self.home.precision_reasons(JAVA_TEST), ())
 
 
 class JavaTestRulesWithoutTheLibrary(unittest.TestCase):
-    def test_java_loop_assertion_gets_no_finding_and_logs_the_missing_library(self):
-        hook = LayerHome(self, exact=False)
-        outcome = hook.outcome(JAVA_TEST, FOR_LOOP)
-        self.assertEqual((outcome, hook.precision_reasons()), (Outcome(NONE, ()), (("java", "library_missing"),)))
+    @classmethod
+    def setUpClass(cls):
+        cls.home = LayerHome.open(cls, exact=False)
 
-    def test_java_fallback_answers_with_json_and_exit_zero(self):
-        call = LayerHome(self, exact=False).write(JAVA_TEST, FOR_LOOP)
-        self.assertEqual((call.returncode, type(json.loads(call.stdout))), (0, dict))
+    def test_java_loop_assertion_gets_no_finding_and_logs_the_missing_library(self):
+        outcome = self.home.outcome(self, JAVA_TEST, UNCITED_FOR_LOOP)
+        found = (outcome, self.home.precision_reasons(JAVA_TEST))
+        self.assertEqual(found, (Outcome(NONE, ()), (("java", "library_missing"),)))
+
+    def test_java_fallback_answers_with_a_hook_response(self):
+        self.assertIs(type(self.home.write(self, JAVA_TEST, UNCITED_FOR_LOOP)), dict)
 
 
 if __name__ == "__main__":

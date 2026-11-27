@@ -3,15 +3,18 @@ from __future__ import annotations
 import bisect
 import re
 from functools import lru_cache
+from pathlib import Path
 from typing import NamedTuple
 
 try:
+    from .config_roots import grammar_cache_root
     from .language_layer import language_of, layer_for
     from .language_model import PYTHON, CodeUnit, UnitMark
     from .language_shapes import MACRO_ASSERTION_CALL_RE
     from .language_views import code_view
     from .tests_policy import is_test_path
 except ImportError:
+    from config_roots import grammar_cache_root
     from language_layer import language_of, layer_for
     from language_model import PYTHON, CodeUnit, UnitMark
     from language_shapes import MACRO_ASSERTION_CALL_RE
@@ -48,11 +51,15 @@ class UnitScan(NamedTuple):
     errors: tuple[tuple[int, int], ...] = ()
 
 
-@lru_cache(maxsize=4)
 def unit_scan(path: str, text: str) -> UnitScan | None:
     language = language_of(path)
     if language is None or language == PYTHON:
         return None
+    return _unit_scan(path, language, text, grammar_cache_root())
+
+
+@lru_cache(maxsize=4)
+def _unit_scan(path: str, language: str, text: str, _cache_root: Path) -> UnitScan | None:
     layer = layer_for(path, language, text)
     if not layer.precise:
         return None

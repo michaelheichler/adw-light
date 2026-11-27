@@ -34,8 +34,10 @@ except ImportError:
 
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-+*]|\d+[.)])\s+")
 CODE_START = r"`|[a-z_][a-z0-9]*(?:_[a-z0-9_]*|(?:\.[a-z_]\w*)+(?![\w.]))"
-SENTENCE_BREAK_RE = re.compile(rf"(?<=[.!?])\s+(?=[A-Z]|{CODE_START})")
+PATH_START = r"(?:(?:\.{1,2}|tools|src|tests|engine|docs)/[\w.-]+|(?:[\w.-]+/)+[\w.-]+\.[A-Za-z0-9]{1,4}(?![\w-]))"
+SENTENCE_BREAK_RE = re.compile(rf"(?:(?<=[.!?])|(?<=[.!?][\"'”’“]))\s+(?=[\"'“‘„]?[A-Z]|{CODE_START}|{PATH_START})")
 ENGLISH_ABBREVIATIONS = ABBREVIATIONS | {"al", "approx", "cf", "e.g", "etc", "i.e", "incl", "viz"}
+GERMAN_ABBREVIATIONS = {"usw", "abs", "bzw", "vgl", "ggf", "ca", "z.b", "u.a"}
 DOTTED_ABBREVIATION_RE = re.compile(r"(?:[a-z]\.)+[a-z]")
 WORD_RE = re.compile(r"\b\w+(?:[-']\w+)*\b")
 THREE_ITEM_RE = re.compile(
@@ -121,10 +123,34 @@ def sentence_spans(paragraph: Paragraph) -> Iterator[SentenceSpan]:
         yield SentenceSpan(first, column, last, stop + 1, prose[start:end])
 
 
+def _short_code_spans(prose: str) -> Iterator[tuple[int, int]]:
+    delimiters = list(re.finditer(r"`+", prose))
+    closing = {}
+    pairs = {}
+    for mark in reversed(delimiters):
+        width = mark.end() - mark.start()
+        if width in closing:
+            pairs[mark.start()] = closing[width]
+        closing[width] = mark.end()
+    end = 0
+    for mark in delimiters:
+        if mark.start() < end or mark.start() not in pairs:
+            continue
+        end = pairs[mark.start()]
+        if len(WORD_RE.findall(prose, mark.end(), end)) <= 8:
+            yield mark.start(), end
+
+
 def _sentence_bounds(prose: str) -> Iterator[tuple[int, int]]:
     start = 0
+    spans = _short_code_spans(prose)
+    code = next(spans, None)
     for boundary in SENTENCE_BREAK_RE.finditer(prose):
-        if not prose[boundary.end()].isupper() and _ends_with_abbreviation(prose[start:boundary.start()]):
+        while code and code[1] <= boundary.start():
+            code = next(spans, None)
+        if code and code[0] < boundary.start():
+            continue
+        if _ends_with_abbreviation(prose[start:boundary.start()], prose[boundary.end()].isupper()):
             continue
         yield start, boundary.start()
         start = boundary.end()
@@ -132,10 +158,12 @@ def _sentence_bounds(prose: str) -> Iterator[tuple[int, int]]:
         yield start, len(prose)
 
 
-def _ends_with_abbreviation(text: str) -> bool:
+def _ends_with_abbreviation(text: str, uppercase_start: bool) -> bool:
     words = text.split()
     word = words[-1].lower().strip("([\"'").rstrip(".") if words else ""
-    return len(word) == 1 or word in ENGLISH_ABBREVIATIONS or bool(DOTTED_ABBREVIATION_RE.fullmatch(word))
+    if uppercase_start:
+        return word in GERMAN_ABBREVIATIONS
+    return len(word) == 1 or word in ENGLISH_ABBREVIATIONS | GERMAN_ABBREVIATIONS or bool(DOTTED_ABBREVIATION_RE.fullmatch(word))
 
 
 def _position(offsets: list[tuple[int, int]], start: int) -> tuple[int, int]:

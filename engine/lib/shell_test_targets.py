@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import NamedTuple
 
 from lib.archive_commands import STDIN
 from lib.archive_members import ArchiveRead, landed_paths
-from lib.folder_trees import recursive_operands
-from lib.git_globs import removed_paths, tracked_paths, tree_paths
-from lib.git_writes import aliased, relocated
-from lib.incoming_paths import Incoming, changed_paths, incoming
+from lib.folder_trees import recursive_operands, scratch_tree_directory
+from lib.git_globs import removed_paths, tree_paths
+from lib.incoming_paths import missing_stash
 from lib.payloads import resolved_path
 from lib.shell_expansion import Expansions, Tree
 from lib.shell_parse import (
@@ -24,11 +24,11 @@ from lib.temp_scope import (
     Directories,
     _changes_directory,
     joined_paths,
+    landing_directories,
     segment_directories,
 )
 from lib.test_units import language_of
 from lib.tests_policy import (
-    foreign_scratch_repo,
     is_test_path,
     outside_project,
     project_root,
@@ -58,6 +58,7 @@ class Scope(NamedTuple):
     cwd: Path
     directories: Directories
     outer: bool
+    created: frozenset[Path] = frozenset()
 
 
 def reachable_directories(command: str, cwd: Path) -> Directories:
@@ -67,57 +68,38 @@ def reachable_directories(command: str, cwd: Path) -> Directories:
     return tuple(sorted({folder for folders in found if folders for folder in folders}))
 
 
-def gated_paths(command: str, scope: Scope) -> tuple[list[str], list[str]]:
+def gated_paths(
+    command: str, scope: Scope, *, landed: bool = False, staged: set[str] | None = None,
+) -> list[str]:
     expansions = command_expansions(command, scope.cwd)
     segments = line_segments(command)
+    places = (landing_directories(segments, scope.cwd, expansions.path, created=scope.created) if landed
+              else segment_directories(segments, scope.directories, expansions.path))
     paths: list[str] = []
-    unresolved: list[str] = []
-    for position, (segment, folders) in enumerate(zip(segments, segment_directories(segments, scope.directories, expansions.path))):
+    for position, (segment, folders) in enumerate(zip(segments, places)):
         gated = gated_test_targets(segment, expansions)
         lookups = scope.outer and all(map(_changes_directory, segments[:position]))
+        indexed = gated._replace(indexable=gated.indexable and lookups)
         named = _segment_paths(segment, expansions, gated, folders, scope.cwd)
-        looked_up = _lookup_paths(gated._replace(indexable=gated.indexable and lookups), folders, scope.cwd)
-        inside = _tree_tests(expansions.tree(segment)) if not _scratch_tree(segment, expansions, folders, scope.cwd) else []
-        landed = _archive_paths(gated.archive, folders, scope.cwd)
-        paths.extend([*(named or []), *(looked_up or []), *(inside or []), *(landed or [])])
-        rewrites = gated.worktree is not None and _tracks_tests(gated.worktree, folders, scope.cwd, incoming(segment) if lookups else None)
-        if gated.unresolved or rewrites or _unknown_repo(segment, command, gated) or named is None or looked_up is None or inside is None or landed is None:
-            unresolved.append(" ".join(segment))
-    return list(dict.fromkeys(paths)), unresolved
+        named.extend(_lookup_paths(indexed, folders, scope.cwd) or ())
+        if staged is not None and _index_only_git(segment):
+            staged.update(named)
+        else:
+            paths.extend(named)
+        if not _scratch_tree(segment, expansions, folders, scope.cwd):
+            paths.extend(_tree_tests(expansions.tree(segment)) or ())
+        paths.extend(_archive_paths(gated.archive, folders, scope.cwd) or ())
+    return list(dict.fromkeys(paths))
 
 
-def _unknown_repo(segment: list[str], command: str, gated: GatedTargets) -> bool:
-    index = _command_word_index(segment)
-    if index >= len(segment) or _basename(segment[index]) != "git":
-        return False
-    words = [_bare(word) for word in segment[index + 1:]]
-    options = words[:_git_base(words)[1]]
-    changes = bool(gated.paths or gated.lookup or gated.archive) or gated.worktree is not None
-    return aliased(options) or (changes and relocated(command, options))
-
-
-def _segment_paths(segment, expansions, gated, folders: Directories, cwd: Path) -> list[str] | None:
-    mutations = mutation_targets(segment, expansions)
+def _segment_paths(segment, expansions, gated, folders: Directories, cwd: Path) -> list[str]:
     if not folders or folders == OUTER_START:
-        return _in_folders([*gated.paths, *mutations], folders)
+        return joined_paths([*gated.paths, *mutation_targets(segment, expansions)], folders)
     paths = []
     for folder in folders:
         local = expansions._replace(cwd=str(cwd / folder))
-        paths.extend(joined_paths([*gated_test_targets(segment, local).paths, *mutations], (folder,)))
+        paths.extend(joined_paths([*gated_test_targets(segment, local).paths, *mutation_targets(segment, local)], (folder,)))
     return paths
-
-
-def _tracks_tests(base: str, folders: Directories, cwd: Path, coming: Incoming | None) -> bool:
-    if folders is None:
-        return True
-    for folder in folders:
-        directory = cwd / folder / base
-        if _scratch_directory(str(directory), cwd) or foreign_scratch_repo(str(directory), project_root(str(cwd))):
-            continue
-        listed = tracked_paths(directory) if coming is None else changed_paths(coming, directory)
-        if listed is None or any(map(is_test_path, listed)):
-            return True
-    return False
 
 
 def _scratch_directory(directory: str, cwd: Path) -> bool:
@@ -136,7 +118,11 @@ def _archive_paths(read: ArchiveRead | None, folders: Directories, cwd: Path) ->
         if landed is None and (_scratch_directory(destination, cwd) or untracked_scratch(destination, project_root(str(cwd)))):
             continue
         if landed is None:
-            return None
+            named = os.path.normpath(os.path.join(folder, read.directory))
+            if is_test_path(named, str(cwd)):
+                found.append(named)
+                continue
+            return found or None
         found.extend(os.path.normpath(os.path.join(folder, path)) for path in landed)
     return found
 
@@ -145,17 +131,12 @@ def _scratch_tree(segment: list[str], expansions: Expansions, folders: Directori
     paths = [expansions.path(raw) for raw, _follow in recursive_operands(segment)]
     if not paths or folders is None or any(path is None for path in paths):
         return False
-    return all(_scratch_directory(str(cwd / folder / str(path)), cwd) for path in paths for folder in folders)
+    return all(scratch_tree_directory(cwd / folder / str(path), cwd) for path in paths for folder in folders)
 
 
 def _tree_tests(tree: Tree | None) -> list[str] | None:
     candidates = [] if tree is None else [path for path in tree.files if is_test_path(path) or language_of(path)]
     return candidates if len(candidates) <= MAX_JUDGED_FILES else None
-
-
-def _in_folders(paths: list[str], folders: Directories) -> list[str] | None:
-    joined = joined_paths(paths, folders)
-    return None if folders is None and len(joined) < len(paths) else joined
 
 
 def _lookup_paths(gated: GatedTargets, folders: Directories, cwd: Path) -> list[str] | None:
@@ -178,7 +159,13 @@ def _lookup_paths(gated: GatedTargets, folders: Directories, cwd: Path) -> list[
 def _listed(lookup: GitLookup, directory: Path) -> list[str] | None:
     if lookup.tree is None:
         return removed_paths(lookup.pathspecs, directory)
-    return tree_paths(lookup.tree, lookup.pathspecs, directory)
+    sourced = tree_paths(lookup.tree, lookup.pathspecs, directory)
+    if lookup.tree != "stash@{0}":
+        return sourced
+    current = removed_paths(lookup.pathspecs, directory)
+    if sourced is None and missing_stash(directory):
+        return current
+    return None if sourced is None or current is None else [*sourced, *current]
 
 
 def _names_a_file(path: str, folders: tuple[str, ...], cwd: Path) -> bool:
@@ -216,12 +203,7 @@ def _removal_paths(segment: list[str], expansions: Expansions) -> list[str] | No
     return None if gated.unresolved else list(gated.paths)
 
 
-def staged_only(command: str) -> bool:
-    segments = line_segments(command)
-    return bool(segments) and all(map(_index_only_rm, segments))
-
-
-def _index_only_rm(segment: list[str]) -> bool:
+def _index_only_git(segment: list[str]) -> bool:
     index = _command_word_index(segment)
     if _without_redirects(segment) != segment or index >= len(segment) or _basename(segment[index]) != "git":
         return False
@@ -229,10 +211,13 @@ def _index_only_rm(segment: list[str]) -> bool:
     _, position = _git_base(words)
     rest = words[position + 1:]
     options = [word for word in (rest[:rest.index("--")] if "--" in rest else rest) if word.startswith("-") and word != "-"]
-    if words[position:position + 1] != ["rm"]:
-        return False
+    verb = words[position] if position < len(words) else ""
+    if verb == "read-tree":
+        return not any("u" in word[1:] for word in options if not word.startswith("--"))
+    if verb == "write-tree":
+        return True
     state: dict[str, bool] = dict.fromkeys(RM_KEEPING, False)
-    return all(_rm_option(word, state) for word in options) and any(state.values())
+    return verb == "rm" and all(_rm_option(word, state) for word in options) and any(state.values())
 
 
 def _rm_option(word: str, state: dict[str, bool]) -> bool:

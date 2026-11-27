@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import bisect
+import functools
 import re
 from collections.abc import Iterator
 from pathlib import PurePath
@@ -29,6 +30,17 @@ _RUST_TEST_RE = re.compile(
 )
 _CFG_TEST_RE = re.compile(r"#\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+PARSER_OVERFLOW = "parser_overflow"
+SYNTAX_ERROR = "syntax_error"
+
+
+class ParsedPython(NamedTuple):
+    tree: ast.Module | None
+    gap: str = ""
+
+    @property
+    def overflow(self) -> bool:
+        return self.gap == PARSER_OVERFLOW
 
 
 class Unit(NamedTuple):
@@ -57,7 +69,7 @@ def extract(path: str, text: str) -> list[Unit]:
     if language == RUST:
         return _rust_units(path, text)
     if language == JAVASCRIPT:
-        return _javascript_units(path, text)
+        return list(_javascript_units(path, text))
     return []
 
 
@@ -73,9 +85,11 @@ def _call_end(code: str, opening: int) -> int:
     return opening
 
 
-def _javascript_units(path: str, text: str) -> list[Unit]:
+@functools.lru_cache(maxsize=8)
+def _javascript_units(path: str, text: str) -> tuple[Unit, ...]:
     code = masked_code(text, javascript=True)
-    ends = block_ends(text, javascript=True)
+    ends = dict(_brace_pairs(code))
+    newlines = [index for index, character in enumerate(code) if character == "\n"]
     units = []
     for found in _JS_TEST_RE.finditer(code):
         end = _call_end(code, found.end() - 1)
@@ -86,10 +100,10 @@ def _javascript_units(path: str, text: str) -> list[Unit]:
         if closing is None:
             continue
         header = text[found.start():callback.start()].split(",", 1)[0].strip()
-        start = code.count("\n", 0, found.start()) + 1
-        stop = code.count("\n", 0, closing) + 1
+        start = bisect.bisect_left(newlines, found.start()) + 1
+        stop = bisect.bisect_left(newlines, closing) + 1
         units.append(Unit(path, header, start, stop, text[found.start():closing + 1], JAVASCRIPT))
-    return units
+    return tuple(units)
 
 
 def _javascript_expression_end(code: str, start: int) -> int:
@@ -143,10 +157,19 @@ def _decorator_text(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
     return "".join(line + "\n" for line in lines[first - 1:node.lineno - 1])
 
 
-def _python_units(path: str, text: str) -> list[Unit]:
+@functools.lru_cache(maxsize=8)
+def parsed_python(text: str) -> ParsedPython:
     try:
-        tree = ast.parse(text)
+        return ParsedPython(ast.parse(text))
+    except (MemoryError, RecursionError):
+        return ParsedPython(None, PARSER_OVERFLOW)
     except (SyntaxError, ValueError):
+        return ParsedPython(None, SYNTAX_ERROR)
+
+
+def _python_units(path: str, text: str) -> list[Unit]:
+    tree = parsed_python(text).tree
+    if tree is None:
         return []
     lines = text.splitlines()
     return [

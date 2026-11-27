@@ -1,28 +1,78 @@
 from __future__ import annotations
 
 import os
-from pathlib import PurePosixPath
 from typing import NamedTuple
 
-from lib.archive_commands import (
-    STDIN,
-    git_apply_read,
-    home_expanded,
-    patch_plan,
-    stdin_source,
-    tar_read,
-    unzip_read,
+from lib.archive_commands import stdin_source
+from lib.archive_targets import (
+    UNZIP_READ_FLAGS,
+    UNZIP_READ_LETTERS,
+    TAR_EXTRACT_FLAGS,
+    TAR_VERBS,
+    ARCHIVE_VERBS,
+    PAX_VERB,
+    TAR_STDOUT_FLAG,
+    TAR_COMMAND_FLAG,
+    _archive_targets,
+    _pax_reads,
+    _unzip_reads,
+    _tar_to_stdout,
+    _tar_extracts,
+    _patch_targets,
 )
-from lib.archive_members import ArchiveRead
+from lib.copy_targets import (
+    DESTINATION_LAST_ARG_VERBS,
+    DESTINATION_ALL_ARGS_VERBS,
+    ARGUMENT_VERBS,
+    TARGET_DIR_VERBS,
+    TARGET_DIR_FLAGS,
+    TARGET_DIR_PREFIX,
+    DD_OUTPUT_PREFIX,
+    COPY_VERBS,
+    Slot,
+    _destination_slots,
+    _target_slot,
+    _target_directory,
+    _drop_target_dir,
+    _copy_gate,
+    _copy_targets,
+)
 from lib.flag_outputs import FLAG_WRITERS, flag_targets
-from lib.git_writes import (
-    WORKTREE_COMMANDS,
-    cleans_files,
-    worktree_rewrite,
-    written_paths,
+from lib.gated_targets import GitLookup, GatedTargets, NO_TARGETS, UNRESOLVED, _read_targets
+from lib.git_targets import (
+    GIT_PATH_COMMANDS,
+    GIT_CHANGING_COMMANDS,
+    GIT_VALUE_FLAGS,
+    GIT_BASE_FLAGS,
+    WORK_TREE_PREFIX,
+    GLOB_CHARS,
+    PATHSPEC_FILE_FLAG,
+    GIT_MERGE_FILE,
+    MERGE_PRINT_FLAGS,
+    MERGE_VALUE_FLAGS,
+    GIT_DRY_APPLY_FLAGS,
+    RESTORE_STAGED,
+    RESTORE_WORKTREE,
+    RESTORE_PLAIN_FLAGS,
+    _GitSource,
+    _GitCall,
+    _merged_file,
+    _merge_operands,
+    _git_changes_paths,
+    _git_base,
+    _base_value,
+    _git_targets,
+    _git_command_targets,
+    _based,
+    _directory_flags_only,
+    _pathspec_targets,
+    _unstages_only,
+    _source_tree,
+    _option_value,
+    _is_directory_pathspec,
 )
 from lib.inplace_targets import sed_reads_only, sed_script_known
-from lib.shell_expansion import Expansions
+from lib.shell_expansion import Expansions, _link_pairs
 from lib.shell_parse import (
     _bare,
     _basename,
@@ -34,10 +84,6 @@ from lib.shell_parse import (
 from lib.shell_syntax import _without_redirects
 from lib.xargs_feed import CALLBACK_READERS, READER_HAZARDS
 
-DESTINATION_LAST_ARG_VERBS = frozenset({"cp", "mv", "ln", "sed", "install", "rsync"})
-DESTINATION_ALL_ARGS_VERBS = frozenset({"rm", "unlink", "shred", "truncate", "chmod", "chown", "touch", "sponge", "mkfifo"})
-ARGUMENT_VERBS = DESTINATION_LAST_ARG_VERBS | DESTINATION_ALL_ARGS_VERBS | {"dd"}
-TARGET_DIR_VERBS = frozenset({"cp", "mv", "ln", "install"})
 XARGS_VALUE_FLAGS = frozenset({"-I", "-L", "-n", "-P", "-d", "-E", "-s", "-a"})
 FIND_CALLBACKS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 FIND_FILE_OUTPUTS = frozenset({"-fprint", "-fprint0", "-fprintf", "-fls"})
@@ -47,78 +93,12 @@ SYNTAX_CHECK_FLAGS = {
     **dict.fromkeys(("node", "nodejs"), frozenset({"--check", "-c"})),
     **dict.fromkeys(("sh", "bash", "zsh", "dash", "ksh"), frozenset({"-n"})),
 }
-TARGET_DIR_FLAGS = frozenset({"-t", "--target-directory"})
-TARGET_DIR_PREFIX = "--target-directory="
-DD_OUTPUT_PREFIX = "of="
-COPY_VERBS = frozenset({"cp", "mv", "ln", "install", "rsync"})
-GIT_PATH_COMMANDS = frozenset({"checkout", "restore", "rm"})
-GIT_CHANGING_COMMANDS = GIT_PATH_COMMANDS | {"mv", "apply", "stash"} | WORKTREE_COMMANDS | {
-    "reset", "switch", "clean", "worktree", "clone", "read-tree", "sparse-checkout",
-}
-GIT_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"})
-GIT_BASE_FLAGS = frozenset({"-C", "--work-tree"})
-WORK_TREE_PREFIX = "--work-tree="
-GLOB_CHARS = frozenset("*?[")
-PATHSPEC_FILE_FLAG = "--pathspec-from-file"
-GIT_MERGE_FILE = "merge-file"
-MERGE_PRINT_FLAGS = frozenset({"-p", "--stdout", "--object-id"})
-MERGE_VALUE_FLAGS = frozenset({"-L"})
-GIT_DRY_APPLY_FLAGS =frozenset({"--check", "--stat", "--numstat", "--summary"})
-UNZIP_READ_FLAGS = frozenset({"-l", "-t", "-p", "-v", "-Z", "-z"})
-UNZIP_READ_LETTERS = frozenset("ltpvZz")
-TAR_EXTRACT_FLAGS = frozenset({"--extract", "--get"})
-TAR_VERBS = frozenset({"tar", "bsdtar", "gtar"})
-ARCHIVE_VERBS = TAR_VERBS | {"unzip"}
-PAX_VERB = "pax"
-TAR_STDOUT_FLAG = "--to-stdout"
-TAR_COMMAND_FLAG = "--to-command"
-RESTORE_STAGED = frozenset({"--staged", "-S"})
-RESTORE_WORKTREE = frozenset({"--worktree", "-W", "-SW", "-WS"})
-RESTORE_PLAIN_FLAGS = frozenset({"--staged", "-S", "-q", "--quiet"})
 SED_SCRIPT_TARGET = "sed script"
-
-
-class Slot(NamedTuple):
-    position: int
-    prefix: str
-
-
-class GitLookup(NamedTuple):
-    base: str
-    pathspecs: tuple[str, ...]
-    tree: str | None
-    strict: bool
-
-
-class GatedTargets(NamedTuple):
-    paths: tuple[str, ...]
-    unresolved: bool
-    lookup: GitLookup | None = None
-    indexable: bool = False
-    archive: ArchiveRead | None = None
-    worktree: str | None = None
-
-
-class _GitSource(NamedTuple):
-    plain_call: bool
-    stdin: str | None
-    cwd: str | None
-
-
-class _GitCall(NamedTuple):
-    command: str
-    base: str
-    rest: list[str]
-    indexable: bool
 
 
 class TargetWords(NamedTuple):
     paths: list[str]
     unknown: list[str]
-
-
-NO_TARGETS = GatedTargets((), False)
-UNRESOLVED = GatedTargets((), True)
 
 
 def writes_by_verb(segment: list[str]) -> bool:
@@ -138,8 +118,23 @@ def writes_by_verb(segment: list[str]) -> bool:
 
 
 def mutation_targets(segment: list[str], expansions: Expansions) -> list[str]:
+    expansions = _without_new_link_aliases(segment, expansions)
     paths = [_expand_home(path) for path in _mutation_words(segment, expansions).paths if _is_file_target(path)]
     return paths + [alias for path in paths for alias in expansions.aliases(path)]
+
+
+def _without_new_link_aliases(segment: list[str], expansions: Expansions) -> Expansions:
+    index = _command_word_index(segment)
+    if index < len(segment) and _basename(segment[index]) == "ln":
+        args = _without_redirects(segment[index + 1:])
+        words = [expansions.path(arg) for arg in args]
+        if None not in words and any(word == "--symbolic" or (word.startswith("-") and not word.startswith("--") and "s" in word) for word in words):
+            created = {os.path.normpath(link) for link, _ in _link_pairs(words)}
+            expansions = expansions._replace(links=tuple(pair for pair in expansions.links if pair[0] not in created))
+    return expansions
+
+
+protected_mutation_targets = mutation_targets
 
 
 def unknown_targets(segment: list[str], expansions: Expansions) -> list[str]:
@@ -178,10 +173,10 @@ def _verb_words(segment: list[str], expansions: Expansions) -> list[tuple[str, s
         gated = _copy_gate(verb, args, expansions)
         if not gated.unresolved:
             return [(path, path) for path in gated.paths]
-    known = [word for word in words if word is not None]
-    slots: list[Slot] = _destination_slots(verb, known) if len(known) == len(words) else []
+    operands = [word if word is not None else "" for word in words]
+    slots = _destination_slots(verb, operands)
     for slot in slots:
-        value = known[slot.position] if verb in DESTINATION_ALL_ARGS_VERBS else expansions.path(args[slot.position])
+        value = words[slot.position] if verb in DESTINATION_ALL_ARGS_VERBS else expansions.path(args[slot.position])
         found.append((args[slot.position], None if value is None else value[len(slot.prefix):]))
     return found
 
@@ -211,28 +206,7 @@ def _merge_words(args: list[str], expansions: Expansions) -> list[tuple[str, str
     return [(raw, None if path is None else os.path.join(base, path))]
 
 
-def _merged_file(args: list[str]) -> tuple[str, str] | None:
-    bare = [_bare(token) for token in args]
-    base, position = _git_base(bare)
-    if position >= len(bare) or bare[position] != GIT_MERGE_FILE or MERGE_PRINT_FLAGS.intersection(bare[position + 1:]):
-        return None
-    operands = _merge_operands(args[position + 1:])
-    return (base, operands[0]) if operands else None
-
-
-def _merge_operands(rest: list[str]) -> list[str]:
-    operands: list[str] = []
-    position = 0
-    while position < len(rest):
-        word = _bare(rest[position])
-        if word == "--":
-            return operands + rest[position + 1:]
-        operands += [] if word.startswith("-") else [rest[position]]
-        position += 2 if word in MERGE_VALUE_FLAGS else 1
-    return operands
-
-
-def callback_writes(segment: list[str], expansions: Expansions) -> list[str]:
+def callback_writes(segment: list[str], expansions: Expansions, *, safe_feed: bool = False) -> list[str]:
     index = _command_word_index(segment)
     verb = _basename(segment[index]) if index < len(segment) else ""
     args = [_bare(token) for token in _without_redirects(segment[index + 1:])]
@@ -243,7 +217,7 @@ def callback_writes(segment: list[str], expansions: Expansions) -> list[str]:
         return [f"{verb} {call[0]}" for call in readers if not _reads_only(call, hazards, fed=False)]
     if verb == "xargs":
         call = _xargs_call(args)
-        return [] if not call or _reads_only(call, hazards, fed=True) else [f"xargs {call[0]}"]
+        return [] if not call or _reads_only(call, hazards, fed=not safe_feed) else [f"xargs {call[0]}"]
     return _find_writes(args, hazards) if verb == "find" else []
 
 
@@ -292,54 +266,6 @@ def _flagged(word: str, flags: tuple[str, ...]) -> bool:
     return word.startswith("-") and any(flag[1] in word[1:] for flag in flags if len(flag) == 2)
 
 
-def _destination_slots(verb: str, words: list[str]) -> list[Slot]:
-    positional = [position for position, word in enumerate(words) if not word.startswith("-")]
-    if verb == "dd":
-        return [Slot(position, DD_OUTPUT_PREFIX) for position in positional if words[position].startswith(DD_OUTPUT_PREFIX)]
-    if verb in DESTINATION_ALL_ARGS_VERBS:
-        return [Slot(position, "") for position in positional]
-    target = _target_slot(words) if verb in TARGET_DIR_VERBS else None
-    if target is not None:
-        return [target]
-    return [Slot(positional[-1], "")] if verb in DESTINATION_LAST_ARG_VERBS and positional else []
-
-
-def _target_slot(words: list[str]) -> Slot | None:
-    for position, word in enumerate(words):
-        if word.startswith(TARGET_DIR_PREFIX):
-            return Slot(position, TARGET_DIR_PREFIX)
-        if word in TARGET_DIR_FLAGS and position + 1 < len(words):
-            return Slot(position + 1, "")
-    return None
-
-
-def _target_directory(args: list[str]) -> str | None:
-    for position, token in enumerate(args):
-        bare = _bare(token)
-        if bare.startswith(TARGET_DIR_PREFIX):
-            return bare[len(TARGET_DIR_PREFIX):]
-        if bare in TARGET_DIR_FLAGS and position + 1 < len(args):
-            return _bare(args[position + 1])
-    return None
-
-
-def _drop_target_dir(args: list[str]) -> list[str]:
-    kept = []
-    skip_next = False
-    for token in args:
-        if skip_next:
-            skip_next = False
-            continue
-        bare = _bare(token)
-        if bare.startswith(TARGET_DIR_PREFIX):
-            continue
-        if bare in TARGET_DIR_FLAGS:
-            skip_next = True
-            continue
-        kept.append(token)
-    return kept
-
-
 def gated_test_targets(segment: list[str], expansions: Expansions) -> GatedTargets:
     calls = expansions.calls(segment)
     if calls is not None:
@@ -357,190 +283,48 @@ def gated_test_targets(segment: list[str], expansions: Expansions) -> GatedTarge
     return _patch_targets(segment[index + 1:]) if verb == "patch" else NO_TARGETS
 
 
+def worktree_add(segment: list[str], expansions: Expansions) -> bool:
+    index = _command_word_index(segment)
+    if index >= len(segment) or _basename(segment[index]) != "git":
+        return False
+    args = _without_redirects(segment[index + 1:])
+    _, subcommand = _git_base([_bare(word) for word in args])
+    return [expansions.pattern(word) for word in args[subcommand:subcommand + 2]] == ["worktree", "add"]
+
+
 def _copy_or_git(segment: list[str], index: int, expansions: Expansions) -> GatedTargets:
     verb = _basename(segment[index])
+    if verb == "git" and worktree_add(segment, expansions):
+        return NO_TARGETS
     args = _without_redirects(segment[index + 1:])
-    words = [word for word in (expansions.pattern(token) for token in args) if word is not None]
+    if verb == "git":
+        bare = [_bare(token) for token in args]
+        _, position = _git_base(bare)
+        command = bare[position:position + 1]
+        if command in (["merge"], ["revert"], ["cherry-pick"]):
+            return NO_TARGETS
+        if command == ["stash"] and bare[position + 1:position + 2] in (["pop"], ["apply"]):
+            return NO_TARGETS
+    resolved = (token if verb == "git" and token in {"--source=stash@{0}", "stash@{0}"} else expansions.pattern(token)
+                for token in args)
+    words = [word for word in resolved if word is not None]
     if len(words) != len(args):
         return UNRESOLVED if verb in COPY_VERBS or _git_changes_paths(args, expansions) else NO_TARGETS
     if verb == "git":
-        return _git_targets(words, _GitSource(plain_call=index == 0, stdin=stdin_source(segment[index + 1:]), cwd=expansions.cwd))
+        based = _with_env_worktree(segment[:index], words, expansions)
+        return _git_targets(based, _GitSource(plain_call=index == 0, stdin=stdin_source(segment[index + 1:]), cwd=expansions.cwd))
     return _copy_gate(verb, args, expansions)
 
 
-def _git_changes_paths(args: list[str], expansions: Expansions) -> bool:
-    _, position = _git_base([_bare(token) for token in args])
-    if position >= len(args):
-        return False
-    subcommand = expansions.pattern(args[position])
-    return subcommand is None or subcommand in GIT_CHANGING_COMMANDS
-
-
-def _copy_gate(verb: str, args: list[str], expansions: Expansions) -> GatedTargets:
-    words = [expansions.pattern(token) or "" for token in args]
-    slot = _target_slot(words) if verb != "rsync" else None
-    positional = [position for position, word in enumerate(words) if not word.startswith("-")]
-    destination = slot[0] if slot else (positional[-1] if len(positional) > 1 else None)
-    if destination is not None and expansions.path(args[destination]) is None:
-        return UNRESOLVED
-    return GatedTargets(tuple(_expand_home(path) for path in _copy_targets(verb, words, slot, expansions.cwd)), False)
-
-
-def _copy_targets(verb: str, words: list[str], slot: Slot | None, cwd: str | None = None) -> list[str]:
-    taken = {slot[0]} if slot else set()
-    sources = [word for position, word in enumerate(words) if not word.startswith("-") and position not in taken]
-    if slot is None:
-        if len(sources) < 2:
-            return sources
-        target_dir, sources = sources[-1], sources[:-1]
-    else:
-        target_dir = words[slot[0]][len(slot[1]):]
-    joined = [os.path.join(target_dir, PurePosixPath(source).name) for source in sources]
-    dest = os.path.join(cwd or ".", _expand_home(target_dir))
-    same = len(sources) == 1 and PurePosixPath(target_dir).name == PurePosixPath(sources[0]).name
-    if not os.path.isdir(dest) and (same or os.path.isfile(dest)):
-        joined = []
-    return list(dict.fromkeys([target_dir, *joined, *(sources if verb == "mv" else [])]))
-
-
-def _git_base(words: list[str]) -> tuple[str, int]:
-    position = 0
-    base = ""
-    while position < len(words) and words[position].startswith("-"):
-        flag = words[position]
-        base = os.path.join(base, _base_value(flag, words[position + 1:position + 2]))
-        position += 2 if flag in GIT_VALUE_FLAGS else 1
-    return base, position
-
-
-def _base_value(flag: str, following: list[str]) -> str:
-    if flag.startswith(WORK_TREE_PREFIX):
-        return flag[len(WORK_TREE_PREFIX):]
-    return following[0] if flag in GIT_BASE_FLAGS and following else ""
-
-
-def _git_targets(words: list[str], source: _GitSource) -> GatedTargets:
-    base, position = _git_base(words)
-    command, rest = (words[position], words[position + 1:]) if position < len(words) else ("", [])
-    found = _git_command_targets(words, source)
-    if cleans_files(command, rest):
-        return UNRESOLVED
-    written = tuple(_expand_home(os.path.join(base, path)) for path in written_paths(command, rest))
-    return found._replace(paths=found.paths + written) if written else found
-
-
-def _git_command_targets(words: list[str], source: _GitSource) -> GatedTargets:
-    base, position = _git_base(words)
-    command, rest = (words[position], words[position + 1:]) if position < len(words) else ("", [])
-    rewrites = worktree_rewrite(command, rest, os.path.join(source.cwd or ".", base))
-    if command in GIT_PATH_COMMANDS:
-        found = _pathspec_targets(_GitCall(command, base, rest, source.plain_call and _directory_flags_only(words[:position])))
-        return found._replace(worktree=base) if rewrites else found
-    if command == "mv":
-        return GatedTargets(tuple(_expand_home(os.path.join(base, path)) for path in _copy_targets("mv", rest, None, os.path.join(source.cwd or ".", base))), False)
-    dry_apply = bool(GIT_DRY_APPLY_FLAGS.intersection(rest)) and "--apply" not in rest
-    if command == "apply" and not dry_apply:
-        return _read_targets(_based(git_apply_read(rest, source.stdin), base))
-    if command == "stash" and rest[:1] in (["pop"], ["apply"]):
-        return UNRESOLVED
-    return GatedTargets((), False, worktree=base) if rewrites else NO_TARGETS
-
-
-def _based(read: ArchiveRead | None, base: str) -> ArchiveRead | None:
-    if read is None or not base:
-        return read
-    return read._replace(source=os.path.join(base, read.source), directory=os.path.join(base, read.directory))
-
-
-def _read_targets(read: ArchiveRead | None) -> GatedTargets:
-    return UNRESOLVED if read is None else GatedTargets((), False, archive=read)
-
-
-def _patch_targets(raw: list[str]) -> GatedTargets:
-    plan = patch_plan([_bare(home_expanded(token)) for token in _without_redirects(raw)], stdin_source(raw))
-    return UNRESOLVED if plan is None else GatedTargets(plan.paths, False, archive=plan.read)
-
-
-def _directory_flags_only(flags: list[str]) -> bool:
-    return len(flags) % 2 == 0 and all(flag == "-C" for flag in flags[::2])
-
-
-def _pathspec_targets(call: _GitCall) -> GatedTargets:
-    options = call.rest[:call.rest.index("--")] if "--" in call.rest else call.rest
-    if _unstages_only(call, options):
-        return NO_TARGETS
-    paths = call.rest[call.rest.index("--") + 1:] if "--" in call.rest else [word for word in call.rest if not word.startswith("-")]
-    tree = _source_tree(call, options)
-    wide = [path for path in paths if GLOB_CHARS.intersection(path) or _is_directory_pathspec(path)]
-    globbed = any(GLOB_CHARS.intersection(path) for path in paths)
-    closed = (call.command == "checkout" and "--" not in call.rest) or not call.indexable or (tree is not None and globbed)
-    unreadable = any(option.startswith(PATHSPEC_FILE_FLAG) for option in options) or any(path.startswith(":") for path in paths)
-    if unreadable or (wide and closed):
-        return UNRESOLVED
-    named = tuple(_expand_home(os.path.join(call.base, path)) for path in paths if path not in wide)
-    lookup = GitLookup(call.base, tuple(paths), tree, call.command == "rm" or bool(wide))
-    return GatedTargets(named, False, lookup, call.indexable)
-
-
-def _unstages_only(call: _GitCall, options: list[str]) -> bool:
-    if call.command != "restore" or not RESTORE_STAGED.intersection(options):
-        return False
-    worktree = RESTORE_WORKTREE.intersection(options)
-    sourced = _option_value(options, ("-s", "--source")) is not None
-    return not worktree and not sourced and all(option in RESTORE_PLAIN_FLAGS for option in options if option.startswith("-"))
-
-
-def _source_tree(call: _GitCall, options: list[str]) -> str | None:
-    if call.command == "restore":
-        source = _option_value(options, ("-s", "--source"))
-        return source if source is not None else ("HEAD" if "--staged" in options or "-S" in options else None)
-    trees = [word for word in options if not word.startswith("-")] if call.command == "checkout" else []
-    return trees[0] if trees else None
-
-
-def _option_value(options: list[str], flags: tuple[str, str]) -> str | None:
-    for position, word in enumerate(options):
-        if word.startswith(flags[1] + "="):
-            return word[len(flags[1]) + 1:]
-        if word in flags and position + 1 < len(options):
-            return options[position + 1]
-    return None
-
-
-def _is_directory_pathspec(path: str) -> bool:
-    return path in {"", ".", ".."} or path.endswith(("/", "/.", "/..")) or path.startswith(":")
-
-
-def _archive_targets(verb: str, raw: list[str]) -> GatedTargets:
-    words = [_bare(home_expanded(token)) for token in _without_redirects(raw)]
-    if verb in TAR_VERBS:
-        if not _tar_extracts(words) or _tar_to_stdout(words):
-            return NO_TARGETS
-        return _read_targets(tar_read(words, stdin_source(raw) or STDIN))
-    return NO_TARGETS if _unzip_reads(words) else _read_targets(unzip_read(words))
-
-
-def _pax_reads(raw: list[str]) -> bool:
-    return any(word.startswith("-") and not word.startswith("--") and "r" in word[1:] for word in map(_bare, raw))
-
-
-def _unzip_reads(words: list[str]) -> bool:
-    clusters = [word[1:] for word in words if word.startswith("-") and not word.startswith("--")]
-    return bool(UNZIP_READ_FLAGS.intersection(words)) or any(UNZIP_READ_LETTERS.intersection(cluster) for cluster in clusters)
-
-
-def _tar_to_stdout(words: list[str]) -> bool:
-    if any(word.startswith(TAR_COMMAND_FLAG) for word in words):
-        return False
-    clusters = [word[1:] for word in words if word.startswith("-") and not word.startswith("--")]
-    old_style = [words[0]] if words and not words[0].startswith("-") else []
-    return TAR_STDOUT_FLAG in words or any("O" in cluster for cluster in clusters + old_style)
-
-
-def _tar_extracts(words: list[str]) -> bool:
-    if words and not words[0].startswith("-") and "x" in words[0]:
-        return True
-    return any(
-        word in TAR_EXTRACT_FLAGS or (word.startswith("-") and not word.startswith("--") and "x" in word)
-        for word in words
-    )
+def _with_env_worktree(prefix: list[str], words: list[str], expansions: Expansions) -> list[str]:
+    base, subcommand = _git_base(words)
+    if any(word == "--work-tree" or word.startswith(WORK_TREE_PREFIX) for word in words[:subcommand]):
+        return words
+    settings = [word.partition("=")[2] for word in prefix if word.startswith("GIT_WORK_TREE=")]
+    root = expansions.path(settings[-1]) if settings else None
+    if not root or not os.path.isabs(root):
+        return words
+    directory = os.path.abspath(os.path.join(expansions.cwd or ".", base))
+    if os.path.commonpath((directory, root)) == os.path.normpath(root):
+        return words
+    return [*words[:subcommand], WORK_TREE_PREFIX + root, *words[subcommand:]]

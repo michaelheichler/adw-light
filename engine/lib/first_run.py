@@ -328,6 +328,12 @@ def log_setup(record: dict) -> None:
 
 
 def main(argv: list[str]) -> int:
+    if logs := option_values(argv, "--log"):
+        with open(logs[-1], "ab") as log:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(log.fileno(), 1)
+            os.dup2(log.fileno(), 2)
     projects = [Path(value) for value in option_values(argv, "--project")]
     languages = option_values(argv, "--language")
     lock = config_roots.install_root() / LOCK_NAME

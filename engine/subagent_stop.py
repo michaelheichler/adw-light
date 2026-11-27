@@ -1,27 +1,32 @@
 from __future__ import annotations
 
-from lib import payloads, session_state
+from lib import after_run, payloads, session_state, stop_scan
 from lib.config import payload_hook_config
 from lib.end_turn import stop_outcome
-from lib.hookio import PARSE_FAILURE, STATE_FAILURE, read_payload, stop_block, system_message, write_payload
+from lib.hookio import PARSE_FAILURE, STATE_FAILURE, join_notices, read_payload, stop_block, system_message, write_payload
 from lib.reporting import run_with_ledger
 
 SUBAGENT_STOP_EVENT = "SubagentStop"
 
 
-def run(payload: dict, config: dict | None = None) -> dict:
+def run(payload: dict, config: dict | None = None, *, until: float | None = None) -> dict:
     try:
+        if until is None:
+            until = stop_scan.deadline()
         if payload is PARSE_FAILURE or not payloads.session_id(payload) or not payloads.agent_id(payload):
             return stop_block(STATE_FAILURE + "invalid SubagentStop payload")
         cfg = payload_hook_config(config, payload)
 
         def gate(turn_id: str) -> dict:
-            outcome = stop_outcome(payload, cfg, hook="subagent_stop", turn_id=turn_id)
-            notice = "\n".join(part for part in (
-                session_state.take_recovery_notice(payloads.session_id(payload), cfg.get("state_root")), outcome.notice,
-            ) if part)
+            after_reason, after_notice = after_run.subagent_stop(payload, cfg, until, config=config)
+            outcome = stop_outcome(payload, cfg, hook="subagent_stop", turn_id=turn_id, until=until)
+            notice = join_notices(
+                session_state.take_recovery_notice(payloads.session_id(payload), cfg.get("state_root")),
+                outcome.notice, after_notice,
+            )
             response = system_message(notice) if notice else {}
-            return {**stop_block(outcome.reason), **response} if outcome.reason else response
+            reason = join_notices(outcome.reason, after_reason)
+            return {**stop_block(reason), **response} if reason else response
 
         return run_with_ledger(
             hook="subagent_stop",

@@ -30,7 +30,7 @@ def _code(payload: dict) -> str:
 
 
 def run(payload: dict, config: dict | None = None) -> dict:
-    return fail_closed("Python", lambda: _checked_run(payload))
+    return fail_closed("Python", lambda: _checked_run(payload), cwd(payload))
 
 
 def _checked_run(payload: dict) -> dict:

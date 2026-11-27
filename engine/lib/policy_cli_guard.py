@@ -5,14 +5,18 @@ import shutil
 from pathlib import Path
 
 from .shell_syntax import (
-    DYNAMIC_RE, _basename, _command_word_index, _payload_command_index, _segments, _words,
+    DYNAMIC_RE, _basename, _command_word_index, _payload_command_index, _segments, _without_redirects, _words,
     interpreter_invocation,
 )
 
 CLI_NAME = "adw-config"
 MODULE_NAMES = frozenset({"lib.adw_config", "adw_config", "adw_config.py"})
-SUBCOMMANDS = frozenset({"tests", "family", "prose-languages"})
-READ_ONLY_ARGS = ([], ["status"], ["--help"])
+SUBCOMMANDS = frozenset({"tests", "family", "prose-languages", "contract", "rule", "UserPromptExpansion", "UserPromptSubmit"})
+READ_ONLY_ARGS = frozenset({(), ("status",), ("-h",), ("--help",)}) | frozenset(
+    (command, flag)
+    for command in SUBCOMMANDS - {"UserPromptExpansion", "UserPromptSubmit"}
+    for flag in ("status", "-h", "--help")
+)
 COPY_VERBS = frozenset({"ln", "cp", "install", "rsync"})
 REPARSE_VERBS = frozenset({"eval", "xargs"})
 
@@ -55,10 +59,10 @@ def _python_mutation(segment: list[str]) -> bool:
     invocation = interpreter_invocation(segment)
     if invocation is not None and invocation.payload is not None:
         return "adw_config" in invocation.payload
-    words = [_plain(word) for word in _words(segment)]
+    words = [_plain(word) for word in _words(_without_redirects(segment))]
     for index, word in enumerate(words):
         if _basename(word) in MODULE_NAMES:
-            return words[index + 1:] not in READ_ONLY_ARGS
+            return tuple(words[index + 1:]) not in READ_ONLY_ARGS
     return False
 
 
@@ -79,7 +83,7 @@ def mutates_policy(segment: list[str], cwd: Path) -> bool:
     if verb in REPARSE_VERBS:
         return _reparsed(segment, index, cwd)
     if _is_cli(name, cwd):
-        return rest not in READ_ONLY_ARGS
+        return tuple(_words(_without_redirects(segment[index + 1:]))) not in READ_ONLY_ARGS
     if DYNAMIC_RE.search(name):
         return bool(rest) and rest[0] in SUBCOMMANDS
     if verb in COPY_VERBS:

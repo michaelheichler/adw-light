@@ -8,17 +8,12 @@ from typing import NamedTuple
 
 from lib import session_state
 from lib.temp_copies import Cwd, source_key
-from lib.temp_scope import outside_project_temp
 
 AUTHORED_FILENAME = "authored_temp.jsonl"
 MALFORMED_MARKER = "authored_temp.malformed-noticed"
 LEGACY_KEYS = ("authored_temp", "authored_temp_overflow")
 MAX_LINES = 200_000
-MIN_LINE_BYTES = 4
-FULL_REASON = (
-    f"Scratch provenance for this session is full ({MAX_LINES:,} paths). "
-    "Write to a project path or start a new session."
-)
+FULL_MARKER = "authored_temp.full-noticed"
 MALFORMED_NOTICE = (
     "agent-discipline-watcher: {count} damaged lines in the scratch provenance file were skipped. "
     "A copy of those temp files counts as imported."
@@ -62,12 +57,14 @@ def _last_byte(store: Path) -> bytes:
         return handle.read(1)
 
 
-def _append_locked(directory: Path, keys: list[str]) -> None:
+def _append_locked(directory: Path, keys: list[str]) -> bool:
     store = directory / AUTHORED_FILENAME
     seen = set(_read(store).keys)
     fresh = [key for key in dict.fromkeys(keys) if key not in seen]
+    fresh = fresh[:max(0, MAX_LINES - len(seen))]
+    full = len(seen) + len(fresh) >= MAX_LINES
     if not fresh:
-        return
+        return full
     descriptor = os.open(store, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         torn = os.fstat(descriptor).st_size > 0 and _last_byte(store) != b"\n"
@@ -76,25 +73,32 @@ def _append_locked(directory: Path, keys: list[str]) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    return full
 
 
-def _append(directory: Path, keys: list[str]) -> None:
+def _append(directory: Path, keys: list[str]) -> bool:
     lock_fd = os.open(directory / session_state.LOCK_FILENAME, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        _append_locked(directory, keys)
+        return _append_locked(directory, keys)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
 
 
-def note_authored_temp(session_id: str, paths: list[str], cwd: Cwd, root: Cwd) -> None:
+def note_authored_temp(session_id: str, paths: list[str], cwd: Cwd, root: Cwd) -> bool:
     keys = [source_key(path, cwd) for path in paths]
     if not session_id or not keys:
-        return
+        return False
     directory = session_state.session_directory(session_id, root)
     directory.mkdir(parents=True, exist_ok=True)
-    _append(directory, keys)
+    if not _append(directory, keys):
+        return False
+    try:
+        (directory / FULL_MARKER).touch(exist_ok=False)
+    except FileExistsError:
+        return False
+    return True
 
 
 def _migrate(session_id: str, directory: Path, root: Cwd) -> None:
@@ -135,22 +139,3 @@ def take_malformed_notice(session_id: str, root: Cwd) -> str:
     except FileExistsError:
         return ""
     return MALFORMED_NOTICE.format(count=malformed)
-
-
-def _keys_at_cap(directory: Path) -> frozenset[str]:
-    store = directory / AUTHORED_FILENAME
-    try:
-        size = store.stat().st_size
-    except FileNotFoundError:
-        return frozenset()
-    if size < MAX_LINES * MIN_LINE_BYTES:
-        return frozenset()
-    keys = _read(store).keys
-    return frozenset(keys) if len(keys) >= MAX_LINES else frozenset()
-
-
-def scratch_refusal(session_id: str, paths: list[str], cwd: Cwd, root: Cwd) -> str:
-    keys = {source_key(path, cwd) for path in paths if outside_project_temp(path, cwd)}
-    directory = _directory(session_id, root) if keys else None
-    recorded = _keys_at_cap(directory) if directory is not None else frozenset()
-    return FULL_REASON if recorded and not keys <= recorded else ""

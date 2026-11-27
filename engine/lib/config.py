@@ -30,8 +30,10 @@ SCANNER_ALWAYS_BLOCKING_RULES = frozenset({
     "file_too_long",
     "unscannable_file",
 })
-FIXED_OBSERVE_RULES = frozenset({"file_length_warning", "file_length_critical"})
+REPORT_ONLY_RULES = frozenset({"wording_debt_lock", "wording_test_gap", "hard_coded_system_path"})
+FIXED_OBSERVE_RULES = frozenset({"file_length_warning", "file_length_critical"}) | REPORT_ONLY_RULES
 STRICT_HARD_BLOCK_RULES = frozenset({
+    "wording_assertion", "wording_exception_match", "wording_log_assertion", "wording_ui_locator",
     "added_comment",
     "added_docstring",
     "unresolved_doc_reference",
@@ -43,11 +45,9 @@ STRICT_HARD_BLOCK_RULES = frozenset({
     "agent_marker_author",
 })
 SELF_PROTECTION_RULES = frozenset({
-    "watcher_install_surface", "watcher_wiring_removal", "config_seal", "install_without_sandbox_home",
-    "commit_gate_bypass", "cap_override", "state_deletion", "state_mutation",
-    "inline_interpreter_write", "shell_payload_block", "interpreter_heredoc_write",
-    "dynamic_heredoc_write", "decode_pipe_write", "inplace_edit_write", "opaque_source_write", "dynamic_write_target",
-    "test_write_gate", "test_writer_definition", "wording_debt_lock",
+    "watcher_install_surface", "watcher_wiring_removal", "config_seal",
+    "state_deletion", "state_mutation",
+    "test_write_gate", "test_writer_definition",
 })
 ALWAYS_BLOCKING_RULES = (
     SCANNER_ALWAYS_BLOCKING_RULES | STRICT_HARD_BLOCK_RULES | SELF_PROTECTION_RULES
@@ -66,6 +66,7 @@ RETIRED_RULES = frozenset({"long_sentence", "de_sentence_length"})
 RETIRED_SETTINGS = frozenset({"sentence_word_cap"})
 
 MAX_LISTED_ROWS = 5
+CONTRACT_STRINGS_KEY = "contract_strings"
 
 DEFAULTS = {
     "prose": True,
@@ -76,12 +77,15 @@ DEFAULTS = {
     "clean_code": True,
     "max_rows": MAX_LISTED_ROWS,
     "list_item_cap": 8,
+    "prose_colon_limit": 3,
     "adw_model": "",
     "exempt_paths": [],
+    CONTRACT_STRINGS_KEY: [],
     "exempt_families": {},
     "baseline": "report",
     "gates": {},
     "rule_gates": {
+        "after_run_deferred": "enforce",
         "apology_comment": "observe",
         "dead_metaphor": "observe",
         "ai_tell": "observe",
@@ -138,8 +142,10 @@ DEFAULTS = {
         "deferred_work_comment": "observe",
         "comment_shape": "observe",
         "agent_marker_author": "enforce",
-        "wording_debt_lock": "enforce",
+        "wording_debt_lock": "observe",
+        "wording_test_gap": "observe",
         "hard_coded_path": "enforce",
+        "hard_coded_system_path": "observe",
         "dash_cluster": "off",
         "quote_marks": "off",
         "genitive_apostrophe": "off",
@@ -282,7 +288,8 @@ def _validate_structured_policy(settings: dict[str, object]) -> None:
         from .configure_policy import MAPPING_MERGE_KEYS, known_values
     except ImportError:
         from configure_policy import MAPPING_MERGE_KEYS, known_values
-    structured = {key: value for key, value in settings.items() if key in MAPPING_MERGE_KEYS or key == "exempt_paths"}
+    keys = MAPPING_MERGE_KEYS | {"exempt_paths", CONTRACT_STRINGS_KEY}
+    structured = {key: value for key, value in settings.items() if key in keys}
     try:
         known_values(structured)
     except ValueError as exc:
@@ -334,6 +341,13 @@ def flatten_settings(data: object) -> dict:
     return settings
 
 
+def contract_strings(settings: dict) -> frozenset[str]:
+    values = settings.get(CONTRACT_STRINGS_KEY)
+    if type(values) is list and all(type(value) is str for value in values):
+        return frozenset(values)
+    return frozenset()
+
+
 def _project_settings(cwd: str | os.PathLike[str]) -> dict:
     path = _find_project_config(Path(cwd))
     try:
@@ -380,18 +394,90 @@ def effective_hook_config(config: object, cwd: str | os.PathLike[str] | None) ->
 def payload_hook_config(config: object, payload: object) -> dict:
     merged = effective_hook_config(config, payload_cwd(payload) or None)
     merged["session_id"] = payload_session_id(payload)
+    if merged["session_id"] and payload_cwd(payload):
+        _note_linked_config(Path(payload_cwd(payload)), merged)
     return merged
 
 
-def _find_project_config(cwd: Path) -> Path:
-    current = cwd.resolve()
+LINKED_CONFIG_RULE = "linked_config_ignored"
+LINKED_CONFIG_KEY = "linked_configs"
+
+
+def _note_linked_config(cwd: Path, merged: dict) -> None:
+    try:
+        skipped = _locate_project_config(cwd)[1]
+        if skipped is None:
+            return
+        reporting, session_state = _ledger_modules()
+        fresh: list[str] = []
+
+        def remember(state: dict) -> dict:
+            noted = state.get(LINKED_CONFIG_KEY, [])
+            if str(skipped) in noted:
+                return state
+            fresh.append(str(skipped))
+            return {**state, LINKED_CONFIG_KEY: [*noted, str(skipped)][-32:]}
+
+        session_state.update_state(merged["session_id"], remember, merged.get("state_root"))
+        for path in fresh:
+            reporting.append_row({
+                "ts": reporting.now_iso(), "session_id": merged["session_id"], "hook": "config", "event": "load",
+                "family": "self_protection", "rule": LINKED_CONFIG_RULE, "path": path, "outcome": "release",
+            }, merged.get("ledger_root"))
+    except (OSError, ValueError, TypeError):
+        return
+
+
+def _project_markers() -> frozenset[str]:
+    try:
+        from .shell_snapshot import PROJECT_MARKERS
+    except ImportError:
+        from shell_snapshot import PROJECT_MARKERS
+    return PROJECT_MARKERS
+
+
+def _link_project(folder: Path) -> Path | None:
+    home = Path.home().resolve()
+    markers = _project_markers()
+    for directory in (folder, *folder.parents):
+        if directory == home or directory == directory.parent:
+            return None
+        if (directory / ".git").exists() or any((directory / marker).is_file() for marker in markers):
+            return directory
+    return None
+
+
+def _link_escape(logical: Path) -> tuple[Path, Path] | None:
+    for link in reversed((logical, *logical.parents)):
+        if not link.is_symlink():
+            continue
+        container = link.parent.resolve()
+        root = _link_project(container)
+        if root is not None and not link.resolve().is_relative_to(root):
+            return link.resolve(), container
+    return None
+
+
+def _first_config(folders) -> Path | None:
+    return next((parent / CONFIG_NAME for parent in folders if (parent / CONFIG_NAME).exists()), None)
+
+
+def _locate_project_config(cwd: Path) -> tuple[Path, Path | None]:
+    logical = Path(os.path.abspath(cwd))
+    current = logical.resolve()
     if current.is_file():
-        current = current.parent
-    for parent in (current, *current.parents):
-        candidate = parent / CONFIG_NAME
-        if candidate.exists():
-            return candidate
-    return current / CONFIG_NAME
+        current, logical = current.parent, logical.parent
+    found = _first_config((current, *current.parents))
+    escape = _link_escape(logical)
+    if escape is None:
+        return found or current / CONFIG_NAME, None
+    container = escape[1]
+    chosen = _first_config((container, *container.parents))
+    return chosen or container / CONFIG_NAME, (found if found is not None and found != chosen else None)
+
+
+def _find_project_config(cwd: Path) -> Path:
+    return _locate_project_config(cwd)[0]
 
 
 def project_config_path(cwd: str | os.PathLike[str]) -> Path:

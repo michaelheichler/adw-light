@@ -32,6 +32,11 @@ MORE_FINDINGS = "weitere Befunde"
 PRINCIPLE_LABEL = "Prinzip"
 
 RULES: dict[str, GermanEntry] = {
+    "after_run_deferred": GermanEntry(
+        "Commit-Prüfung nicht abgeschlossen",
+        "Die Commit-Prüfung konnte nicht abgeschlossen werden",
+        "Wiederhole die Commit-Prüfung beim Stop-Hook.",
+    ),
     "unresolved_doc_reference": GermanEntry("Unbekannter Name", "Der Name fehlt in dieser Datei", "Nutze einen Namen aus der Datei oder Backticks."),
     "banned_dash": GermanEntry(
         "Unzulässiger Strich",
@@ -47,6 +52,11 @@ RULES: dict[str, GermanEntry] = {
         "Bindestrich mit Leerzeichen",
         "Meldet einen Bindestrich mit Leerzeichen, der einen Gedankenstrich ersetzt",
         "Setz ein Komma oder einen Punkt, oder schließ den Bindestrich an das Wort an.",
+    ),
+    "prose_colon": GermanEntry(
+        "Zu viele Doppelpunkte im Satzinneren",
+        "Erlaubt Doppelpunkte in Markdown-Dokumenten und begrenzt ihre Anzahl im Satzinneren in anderen Texten",
+        "Ersetz überzählige Doppelpunkte durch Kommas, Punkte oder Klammern.",
     ),
     "pronoun_apostrophe": GermanEntry(
         "Apostroph am Pronomen",
@@ -429,20 +439,36 @@ RULES: dict[str, GermanEntry] = {
         "Schreib TODO, FIXME oder HACK groß mit Doppelpunkt, dann ein großgeschriebenes Verb, ein benanntes Objekt und einen Zweck mit to oder so. FIXME nennt den Fehler, HACK nennt die Bedingung zum Entfernen.",
     ),
     "wording_debt_lock": GermanEntry(
-        "Testschreiben durch Wortlaut-Schulden gesperrt",
-        "Blockiert ein Schreiben von Tests, das die Zahl der Wortlaut-Tests nicht senkt, solange das Projekt noch welche hat",
-        "Schreib einen Wortlaut-Test in einen Verhaltenstest um oder lösch ihn, wenn er nur Text prüft. Füg nicht mehr neue Tests hinzu, als du Wortlaut-Tests entfernst.",
+        "Bestehende Wortlaut-Tests",
+        "Meldet bestehende Wortlaut-Tests, ohne Teständerungen zu blockieren",
+        "Lass unveränderte Wortlaut-Tests stehen. Prüfe das Verhalten, wenn du Assertions ergänzt oder änderst. "
+        "Der Full report listet jede Einheit unter units.",
+    ),
+    "wording_test_gap": GermanEntry(
+        "Testdatei nicht prüfbar",
+        "Meldet eine Testdatei, die das Gate nicht lesen konnte, und zählt sie nicht als Wortlaut-Test",
+        "Prüf diese Datei von Hand auf Wortlaut-Assertions. Der nächste Scan zählt sie, sobald das Gate sie lesen kann.",
     ),
     "hard_coded_path": GermanEntry(
         "Fest verdrahteter Maschinenpfad",
-        "Blockiert Code oder Tests mit einem absoluten Pfad, einem Home-Pfad, einem Laufwerksbuchstaben oder einem lokalen Benutzernamen, weil sie auf jedem anderen Rechner scheitern",
+        "Meldet einen festen Home-Pfad, einen Laufwerksbuchstaben oder einen lokalen Benutzernamen",
         "Bau den Pfad aus einer berechneten Wurzel wie dem Projektverzeichnis, einem Temp-Verzeichnis oder dem Home-Lookup und häng nur repo-relative Teile an.",
+    ),
+    "hard_coded_system_path": GermanEntry(
+        "Fest verdrahteter Systempfad",
+        "Meldet einen festen Systempfad oder Temp-Pfad, der sich zwischen Rechnern unterscheiden kann",
+        "Leite den Pfad bei Bedarf aus der Umgebung ab.",
     ),
     "wording_assertion": GermanEntry(
         "Test prüft Wortlaut",
         "Blockiert einen Test, dessen erwarteter Wert ein Satz ist, weil eine Textänderung ihn rot macht, obwohl der Code noch funktioniert",
         "Prüf das Verhalten hinter dem Text, etwa ein Entscheidungsfeld, eine Regel-ID oder einen Exit-Code. Lösch den Test, wenn er nur Wortlaut prüft.",
     ),
+    "test_principle_citation": GermanEntry("Test ohne belegten Grundsatz", "Fordert ein Zitat aus dem Testleitfaden", "Zitiere den Leitfaden wörtlich."),
+    "test_builds_repo": GermanEntry("Test baut ein Repository", "Blockiert Tests, die ein Git-Repository anlegen oder ändern",
+                                   "Gib die Eingabe im Speicher an den Test weiter."),
+    "test_builds_tree": GermanEntry("Test schreibt temporäre Dateien", "Meldet Tests, deren Vorbereitung Dateien im temporären Ordner anlegt",
+                                   "Halte die Testdaten im Speicher."),
     "snapshot_assertion": GermanEntry(
         "Test vergleicht mit gespeicherter Kopie",
         "Meldet einen Test, der die Ausgabe mit einem Snapshot oder einer Golden-Datei vergleicht, ohne den Schreibvorgang zu blockieren",

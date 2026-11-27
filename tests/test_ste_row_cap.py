@@ -1,15 +1,21 @@
-from quiet_git import disable_background_maintenance
 import json
-import subprocess
+import os
 import sys
 from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 import unittest
 
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+sys.path.insert(0, str(PROJECT / "engine"))
 
-SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+from adw_light import run_hook
+from lib.git_port import FakeGitView
 
+
+NO_REPOSITORY = FakeGitView({"roots": {}})
 
 def dangling_list(count):
     return "".join("- The cache keeps row %d and\n" % number for number in range(1, count + 1))
@@ -20,21 +26,20 @@ def nominalized_paragraphs(count):
 
 
 class SteRowCapThroughWriteHook(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         workspace = TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name)
-        self.state = self.root / ".adw-state"
-        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
-        disable_background_maintenance(self.root)
+        cls.addClassCleanup(workspace.cleanup)
+        cls.root = Path(workspace.name)
+        cls.state = cls.root / ".adw-state"
+        (cls.root / "home").mkdir()
+        environment = mock.patch.dict(os.environ, {"HOME": str(cls.root / "home")})
+        environment.start()
+        cls.addClassCleanup(environment.stop)
 
     def hook(self, event, **payload):
-        call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), event, "--host", "claude", "--state-dir", str(self.state)],
-            input=json.dumps({"cwd": str(self.root), "session_id": "ste-row-cap", "hook_event_name": event, **payload}),
-            text=True, capture_output=True, check=True,
-        )
-        return json.loads(call.stdout)
+        base = {"cwd": str(self.root), "session_id": self._testMethodName, "hook_event_name": event}
+        return run_hook(event, {**base, **payload}, state_dir=self.state, git_view=NO_REPOSITORY)
 
     def write_attempt(self, content):
         self.hook("SessionStart", source="startup")
@@ -43,7 +48,8 @@ class SteRowCapThroughWriteHook(unittest.TestCase):
 
     def ledger_outcomes(self, rule):
         rows = (json.loads(line) for line in (self.state / "ledger" / "ledger.jsonl").read_text().splitlines() if line.strip())
-        return Counter(row["outcome"] for row in rows if row["rule"] == rule)
+        mine = (row for row in rows if row["session_id"] == self._testMethodName)
+        return Counter(row["outcome"] for row in mine if row["rule"] == rule)
 
     def test_sixty_dangling_list_items_leave_fifty_observe_rows(self):
         self.write_attempt(dangling_list(60))

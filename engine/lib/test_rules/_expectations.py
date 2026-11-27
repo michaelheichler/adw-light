@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Iterator
 from typing import NamedTuple
 
@@ -39,7 +40,12 @@ _TRUTH_KEYWORDS = (("expr",),)
 _CONTAINERS = (ast.List, ast.Tuple, ast.Set)
 _REGEX_CLASSES = frozenset("dDsSwWbBAZ")
 _REGEX_SYNTAX = frozenset("^$*+?{}()|[].")
-Bindings = dict[str, str]
+_STRFTIME_RE = re.compile(r"%[-_0^#]?[A-Za-z%]")
+_SPEC_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+_NESTING_LIMIT = 8
+_NO_CONVERSION = -1
+Bindings = dict[str, str | ast.JoinedStr]
+Pairs = tuple[tuple[str, ast.expr], ...]
 
 
 class Scope(NamedTuple):
@@ -51,6 +57,7 @@ class Found(NamedTuple):
     text: str
     typed: str
     kind: str
+    contract: str = ""
 
 
 class Expected(NamedTuple):
@@ -58,6 +65,7 @@ class Expected(NamedTuple):
     text: str
     typed: str
     kind: str
+    contract: str = ""
 
 
 def dotted(node: ast.expr) -> str:
@@ -71,15 +79,43 @@ def dotted(node: ast.expr) -> str:
 def text_of(node: ast.expr | None, bindings: Bindings) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
-    if isinstance(node, ast.JoinedStr) and any(isinstance(part, ast.Constant) for part in node.values):
-        return "".join(part.value if isinstance(part, ast.Constant) else PLACEHOLDER for part in node.values)
+    if isinstance(node, ast.JoinedStr):
+        return _fstring_text(node)
     if isinstance(node, ast.Name):
-        return bindings.get(node.id)
+        bound = bindings.get(node.id)
+        return _fstring_text(bound) if isinstance(bound, ast.JoinedStr) else bound
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return _joined(text_of(node.left, bindings), text_of(node.right, bindings))
+        text = _operand_text(node, bindings)
+        return text if text is None or text.strip() else None
     if isinstance(node, ast.Call) and dotted(node.func) == _ESCAPE_CALL and len(node.args) == 1:
         return text_of(node.args[0], bindings)
     return formatted(node, lambda template: text_of(template, bindings), _text_argument)
+
+
+def _bound(node: ast.expr | None, bindings: Bindings) -> ast.expr | None:
+    if isinstance(node, ast.Name):
+        bound = bindings.get(node.id)
+        if isinstance(bound, ast.JoinedStr):
+            return bound
+    return node
+
+
+def _literal_parts(node: ast.JoinedStr) -> str:
+    return "".join(part.value if isinstance(part, ast.Constant) else " " for part in node.values)
+
+
+def _fstring_text(node: ast.JoinedStr) -> str | None:
+    literal = _literal_parts(node)
+    return literal if literal.strip() else None
+
+
+def _operand_text(node: ast.expr, bindings: Bindings) -> str | None:
+    target = _bound(node, bindings)
+    if isinstance(target, ast.JoinedStr):
+        return _literal_parts(target)
+    if isinstance(target, ast.BinOp) and isinstance(target.op, ast.Add):
+        return _joined(_operand_text(target.left, bindings), _operand_text(target.right, bindings))
+    return text_of(target, bindings)
 
 
 def _text_argument(node: ast.expr | None) -> str:
@@ -114,6 +150,7 @@ def _typed_part(part: ast.expr | None) -> str:
 
 
 def typed_text(node: ast.expr | None, bindings: Bindings) -> str:
+    node = _bound(node, bindings)
     if isinstance(node, ast.JoinedStr):
         return "".join(_typed_part(part) for part in node.values)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
@@ -135,19 +172,79 @@ def _elements(node: ast.expr) -> list[ast.expr] | None:
     return None
 
 
-def _literal_texts(node: ast.expr | None, bindings: Bindings) -> tuple[tuple[str, ast.expr], ...] | None:
+def _machine_spec(text: str) -> bool:
+    return _SPEC_WORD_RE.search(_STRFTIME_RE.sub(" ", text)) is None
+
+
+def _spec_texts(spec: ast.expr, bindings: Bindings, depth: int) -> Pairs:
+    if not isinstance(spec, ast.JoinedStr):
+        return ()
+    text = _fstring_text(spec)
+    head = () if text is None or _machine_spec(text) else ((text, spec),)
+    return (*head, *_inner_texts(spec, bindings, depth))
+
+
+def _inner_texts(node: ast.JoinedStr, bindings: Bindings, depth: int) -> Pairs:
+    if depth >= _NESTING_LIMIT:
+        return ()
+    pairs: list[tuple[str, ast.expr]] = []
+    for part in node.values:
+        if isinstance(part, ast.FormattedValue):
+            pairs.extend(_string_texts(part.value, bindings, depth + 1) or ())
+            if part.format_spec is not None:
+                pairs.extend(_spec_texts(part.format_spec, bindings, depth + 1))
+    return tuple(pairs)
+
+
+def _chain(node: ast.expr) -> list[ast.expr]:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return [*_chain(node.left), *_chain(node.right)]
+    return [node]
+
+
+def _operand_inner(node: ast.expr, bindings: Bindings, depth: int) -> Pairs | None:
+    target = _bound(node, bindings)
+    if isinstance(target, ast.JoinedStr):
+        return _inner_texts(target, bindings, depth)
+    return () if text_of(target, bindings) is not None else None
+
+
+def _chain_texts(node: ast.BinOp, bindings: Bindings, depth: int) -> Pairs | None:
+    inner = [_operand_inner(operand, bindings, depth) for operand in _chain(node)]
+    if any(found is None for found in inner):
+        return None
     text = text_of(node, bindings)
-    if text is not None:
-        return ((text, node),)
+    head = () if text is None else ((text, node),)
+    return (*head, *(pair for found in inner for pair in found))
+
+
+def _string_texts(node: ast.expr | None, bindings: Bindings, depth: int = 0) -> Pairs | None:
+    target = _bound(node, bindings)
+    if isinstance(target, ast.JoinedStr):
+        outer = _fstring_text(target)
+        head = () if outer is None else ((outer, target),)
+        return (*head, *_inner_texts(target, bindings, depth))
+    if isinstance(target, ast.BinOp) and isinstance(target.op, ast.Add):
+        return _chain_texts(target, bindings, depth)
+    text = text_of(target, bindings)
+    return None if text is None else ((text, target),)
+
+
+def _literal_texts(node: ast.expr | None, bindings: Bindings, nested: bool = False) -> Pairs | None:
+    if node is None:
+        return None
+    texts = _string_texts(node, bindings)
+    if texts is not None:
+        return texts if texts or nested else None
     if isinstance(node, ast.Constant):
         return ()
-    elements = _elements(node) if node is not None else None
+    elements = _elements(node)
     if elements is None:
         return None
-    nested = [_literal_texts(element, bindings) for element in elements]
-    if any(found is None for found in nested):
+    found = [_literal_texts(element, bindings, nested=True) for element in elements]
+    if any(item is None for item in found):
         return None
-    return tuple(pair for found in nested for pair in found)
+    return tuple(pair for item in found for pair in item)
 
 
 def _kind(actual: ast.expr | None, scope: Scope) -> str:
@@ -155,20 +252,72 @@ def _kind(actual: ast.expr | None, scope: Scope) -> str:
     return kind or ASSERTED
 
 
+def _pure(node: ast.expr, bindings: Bindings) -> bool:
+    target = _bound(node, bindings)
+    if isinstance(target, ast.JoinedStr):
+        return all(isinstance(part, ast.Constant) for part in target.values)
+    if isinstance(target, (ast.Constant, ast.Name)):
+        return True
+    if isinstance(target, ast.BinOp) and isinstance(target.op, ast.Add):
+        return _pure(target.left, bindings) and _pure(target.right, bindings)
+    elements = _elements(target)
+    return elements is not None and all(_pure(element, bindings) for element in elements)
+
+
+def _placeholder(part: ast.FormattedValue) -> str | None:
+    conversion = "" if part.conversion == _NO_CONVERSION else "!" + chr(part.conversion)
+    if part.format_spec is None:
+        return "{" + conversion + "}"
+    spec = _fstring_template(part.format_spec) if isinstance(part.format_spec, ast.JoinedStr) else None
+    return None if spec is None else "{" + conversion + ":" + spec + "}"
+
+
+def _fstring_template(node: ast.JoinedStr) -> str | None:
+    if all(isinstance(part, ast.Constant) for part in node.values):
+        return "".join(part.value for part in node.values)
+    if any(isinstance(part, ast.Constant) and "{}" in part.value for part in node.values):
+        return None
+    pieces = [part.value if isinstance(part, ast.Constant) else _placeholder(part) for part in node.values]
+    return None if None in pieces else "".join(pieces)
+
+
+def _template(node: ast.expr | None, bindings: Bindings) -> str | None:
+    target = _bound(node, bindings)
+    if isinstance(target, ast.Constant) and isinstance(target.value, str):
+        return target.value
+    if isinstance(target, ast.Name):
+        bound = bindings.get(target.id)
+        return bound if isinstance(bound, str) else None
+    if isinstance(target, ast.JoinedStr):
+        return _fstring_template(target)
+    if isinstance(target, ast.BinOp) and isinstance(target.op, ast.Add):
+        return _joined(_template(target.left, bindings), _template(target.right, bindings))
+    return None
+
+
+def _exact(node: ast.expr | None, bindings: Bindings) -> str:
+    return _template(node, bindings) or ""
+
+
 def _single(node: ast.expr | None, actual: ast.expr | None, scope: Scope, pattern: bool = False) -> Iterator[Found]:
-    text = text_of(node, scope.bindings)
-    if text is not None:
-        typed = typed_text(node, scope.bindings)
-        yield Found(regex_words(text) if pattern else text, regex_words(typed) if pattern else typed, _kind(actual, scope))
+    kind = _kind(actual, scope)
+    for text, piece in _string_texts(node, scope.bindings) or ():
+        typed = typed_text(piece, scope.bindings)
+        if pattern:
+            yield Found(regex_words(text), regex_words(typed), kind)
+        else:
+            yield Found(text, typed, kind, _exact(piece, scope.bindings))
 
 
 def _literal_side(first: ast.expr | None, second: ast.expr | None, scope: Scope) -> Iterator[Found]:
-    left, right = _literal_texts(first, scope.bindings), _literal_texts(second, scope.bindings)
-    if (left is None) == (right is None):
+    bindings = scope.bindings
+    left, right = _literal_texts(first, bindings), _literal_texts(second, bindings)
+    if left is not None and right is not None and _pure(first, bindings) and _pure(second, bindings):
         return
-    found, actual = (left, second) if left is not None else (right, first)
-    kind = _kind(actual, scope)
-    yield from (Found(text, typed_text(node, scope.bindings), kind) for text, node in found)
+    for found, actual in ((left, second), (right, first)):
+        kind = _kind(actual, scope)
+        for text, node in found or ():
+            yield Found(text, typed_text(node, bindings), kind, _exact(node, bindings))
 
 
 def _operands(call: ast.Call, names: tuple[tuple[str, ...], ...]) -> list[ast.expr | None]:
@@ -222,9 +371,8 @@ def _assert_texts(call: ast.Call, scope: Scope) -> Iterator[Found]:
 
 
 def _pattern(node: ast.expr | None, kind: str, scope: Scope) -> Iterator[Found]:
-    text = text_of(node, scope.bindings)
-    if text is not None:
-        yield Found(regex_words(text), regex_words(typed_text(node, scope.bindings)), kind)
+    for text, piece in _string_texts(node, scope.bindings) or ():
+        yield Found(regex_words(text), regex_words(typed_text(piece, scope.bindings)), kind)
 
 
 def _exception_texts(call: ast.Call, scope: Scope) -> Iterator[Found]:
@@ -242,9 +390,8 @@ def _mock_log_texts(call: ast.Call, scope: Scope) -> Iterator[Found]:
     func = call.func
     if _method(call) in _MOCK_ASSERTS and isinstance(func.value, ast.Attribute) and func.value.attr in _LOG_LEVELS:
         for argument in [*call.args, *(keyword.value for keyword in call.keywords)]:
-            text = text_of(argument, scope.bindings)
-            if text is not None:
-                yield Found(text, typed_text(argument, scope.bindings), LOG)
+            for text, piece in _string_texts(argument, scope.bindings) or ():
+                yield Found(text, typed_text(piece, scope.bindings), LOG)
 
 
 def _call_found(call: ast.Call, scope: Scope) -> Iterator[Found]:

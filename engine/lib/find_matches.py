@@ -70,6 +70,20 @@ def find_calls(segment: list[str], resolve: Resolver, cwd: str) -> tuple[Call, .
     return None if found is None else _calls(found) + _named_calls(plan)
 
 
+def deletion_starts(segment: list[str], resolve: Resolver) -> list[str]:
+    index = _command_word_index(segment)
+    if index >= len(segment) or _basename(segment[index]) != "find":
+        return []
+    words = [resolve(token) for token in _without_redirects(segment[index + 1:])]
+    if "-delete" not in words or None in words:
+        return []
+    try:
+        plan = _plan(words)
+    except Unsupported:
+        return []
+    return plan.starts if _has(plan.tree, "-delete") else []
+
+
 def _named_calls(plan: Plan) -> tuple[Call, ...]:
     deleting, spelled = _spelled(plan.tree)
     if not deleting:

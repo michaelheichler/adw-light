@@ -5,8 +5,8 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
-from lib import fixture_prose, imported_baseline, payloads, temp_authorship, tests_policy, wording_debt
-from lib.baseline import LENGTH_RULES, committed_text, partition, split_committed
+from lib import fixture_prose, imported_baseline, payloads, tests_policy, wording_debt
+from lib.baseline import LENGTH_RULES, baseline_mode, colon_ownership, committed_text, partition, split_committed, split_pending_file
 from lib.config import payload_hook_config
 from lib.hookio import (
     PARSE_FAILURE, advise, allow, claude_pretool_response, deny, fail_closed, read_payload, write_payload,
@@ -20,6 +20,7 @@ from lib.reporting import (
 )
 from lib.scanner import file_length_findings, scan_all
 from lib.temp_scope import outside_project_temp
+from lib.write_shape import WriteConfig, grouped_write_rows, write_config
 
 PATCH_FILE = re.compile(r"^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s+(.+)$", re.MULTILINE)
 SPECIAL_TARGET = (
@@ -98,7 +99,7 @@ def split_patch(patch: str) -> list[tuple[str, str]]:
 
 
 def run(payload: dict, config: dict | None = None) -> dict:
-    return fail_closed("write", lambda: _checked_run(payload, config))
+    return fail_closed("write", lambda: _checked_run(payload, config), payloads.cwd(payload))
 
 
 def _checked_run(payload: dict, config: dict | None) -> dict:
@@ -112,7 +113,7 @@ def _run(payload: dict, config: dict | None) -> dict:
     return run_with_ledger(
         hook="pre_write",
         payload=payload,
-        gate=lambda turn_id: _gate(payload, cfg, turn_id),
+        gate=lambda turn_id: _gate(payload, cfg, write_config(config, payload, cfg), turn_id),
         ledger_root=cfg.get("ledger_root"),
         state_root=cfg.get("state_root"),
     )
@@ -153,24 +154,19 @@ def _special_target_refusal(payload: dict, cwd: Path) -> str:
     return SPECIAL_TARGET.format(path=special[0]) if special else ""
 
 
-def _scratch_refusal(payload: dict, cwd: Path, cfg: dict) -> str:
-    paths = [str(_resolved_path(raw, cwd)) for raw in payloads.edited_paths(payload)]
-    return temp_authorship.scratch_refusal(payloads.session_id(payload), paths, cwd, cfg.get("state_root"))
-
-
-def _gate(payload: dict, cfg: dict, turn_id: str) -> dict:
+def _gate(payload: dict, cfg: dict, settings_for: WriteConfig, turn_id: str) -> dict:
     started = time.monotonic()
     decoded = _decode(_tool_input(payload))
     cwd = Path(payload.get("cwd") or ".")
-    refusal = _special_target_refusal(payload, cwd) or _scratch_refusal(payload, cwd, cfg)
+    refusal = _special_target_refusal(payload, cwd)
     if refusal:
         return deny(refusal)
     _note_first_seen(payload, cwd, cfg)
-    root = tests_policy.project_root(payloads.cwd(payload) or ".")
-    findings, inherited = _pending_findings(decoded, cwd, cfg, root)
+    findings, inherited = _pending_findings(decoded, cwd, cfg, settings_for)
     gate = tests_policy.Gate(payload, cfg, time.time())
-    findings = _unique_findings(findings + wording_debt.gate_findings(gate, _test_changes(decoded, cwd)))
-    decisions = _record(payload, cfg, turn_id, findings, started) if findings else []
+    findings += wording_debt.gate_findings(gate, _test_changes(decoded, cwd), settings_for=settings_for)
+    decisions = [decision for settings, rows in grouped_write_rows(_unique_findings(findings), settings_for, cfg)
+                 for decision in _record(payload, settings, turn_id, rows, started)]
     kind, message = verdict_message(decisions, cfg)
     if kind == "block":
         return deny(message)
@@ -234,8 +230,12 @@ def _edit_findings(decoded: PendingWrite, resolved_path: Path, cfg: dict, root: 
         pending = _pending_edit_text(decoded)
         return _label_pending_text(_stamped(scan_all(decoded.path, pending, scan_cfg), decoded.path)), []
     before, after = applied
-    owned, _ = partition(scan_all(scan_path, after, scan_cfg), compare(scan_path, before, after))
+    ordinary, added, carried = colon_ownership(scan_path, scan_all(scan_path, after, scan_cfg), [before], scan_cfg)
+    owned, _ = partition(ordinary, compare(scan_path, before, after))
+    owned.extend(added)
     kept, inherited = _length_split(owned, resolved_path, cfg, after)
+    if baseline_mode(cfg) == "report":
+        inherited.extend(carried)
     return _stamped(kept, decoded.path), _stamped(inherited, decoded.path)
 
 
@@ -247,10 +247,10 @@ def _protected_edit_text(decoded: PendingWrite, resolved_path: Path) -> str:
 def _edit_shape_findings(decoded: PendingWrite, cwd: Path, cfg: dict, root: str) -> tuple[list[dict], list[dict]]:
     resolved_path = _resolved_path(decoded.path, cwd)
     protected = _stamped(
-        path_findings(str(resolved_path), cfg, content=_protected_edit_text(decoded, resolved_path)),
+        path_findings(str(resolved_path), cfg, cwd=cwd, content=_protected_edit_text(decoded, resolved_path)),
         decoded.path,
     )
-    if outside_project_temp(resolved_path, cwd):
+    if tests_policy.scratch_write(resolved_path, cwd):
         return protected, []
     owned, inherited = _edit_findings(decoded, resolved_path, cfg, root)
     return protected + owned, inherited
@@ -260,7 +260,7 @@ class _ShapeScope(NamedTuple):
     cwd: Path
     cfg: dict
     projected: dict
-    root: str
+    settings_for: WriteConfig
 
 
 def _patch_text(tool_input: dict) -> object:
@@ -273,16 +273,19 @@ def _projected_rows(scope: _ShapeScope) -> tuple[list[dict], list[dict]]:
     inherited: list[dict] = []
     for path, content in scope.projected.items():
         resolved_path = _resolved_path(path, scope.cwd)
-        rows.extend(_stamped(path_findings(str(resolved_path), scope.cfg, content=content), path))
-        if content is not None and not outside_project_temp(resolved_path, scope.cwd):
-            owned, relieved = _length_split(file_length_findings(path, content), resolved_path, scope.cfg, content)
+        rows.extend(_stamped(path_findings(str(resolved_path), scope.cfg, cwd=scope.cwd, content=content), path))
+        if content is not None and not tests_policy.scratch_write(resolved_path, scope.cwd):
+            settings = scope.settings_for(path)
+            owned, relieved = _length_split(file_length_findings(path, content), resolved_path, settings, content)
             rows.extend(_stamped(owned, path))
             inherited.extend(_stamped(relieved, path))
     return rows, inherited
 
 
 def _scanned_pending(path: str, text: str, scope: _ShapeScope) -> list[dict]:
-    scan_cfg = fixture_prose.scan_config(scope.cfg, _resolved_path(path, scope.cwd), scope.root)
+    target = _resolved_path(path, scope.cwd)
+    root = tests_policy.target_root(Path(path), scope.cwd)
+    scan_cfg = fixture_prose.scan_config(scope.settings_for(path), target, root)
     scanned = _stamped(scan_all(path, text, scan_cfg), path)
     if scope.projected.get(path) is None:
         return scanned
@@ -291,23 +294,23 @@ def _scanned_pending(path: str, text: str, scope: _ShapeScope) -> list[dict]:
     }]
 
 
-def _write_shape_findings(decoded: PendingWrite, cwd: Path, cfg: dict, root: str) -> tuple[list[dict], list[dict]]:
+def _write_shape_findings(decoded: PendingWrite, cwd: Path, cfg: dict, settings_for: WriteConfig) -> tuple[list[dict], list[dict]]:
     whole_file = "content" in decoded.tool_input
     patch = _patch_text(decoded.tool_input)
-    scope = _ShapeScope(cwd, cfg, projected_content(patch, cwd) if isinstance(patch, str) else {}, root)
+    scope = _ShapeScope(cwd, cfg, projected_content(patch, cwd) if isinstance(patch, str) else {}, settings_for)
     owned_rows, inherited_rows = _projected_rows(scope)
     for path, text in pending_writes(decoded):
         resolved_path = _resolved_path(path, cwd)
         if path not in scope.projected:
             content = text if whole_file else None
-            owned_rows.extend(_stamped(path_findings(str(resolved_path), cfg, content=content), path))
-        if outside_project_temp(resolved_path, cwd):
+            owned_rows.extend(_stamped(path_findings(str(resolved_path), cfg, cwd=cwd, content=content), path))
+        if tests_policy.scratch_write(resolved_path, cwd):
             continue
         scanned = _scanned_pending(path, text, scope)
         if not whole_file:
             owned_rows.extend(_label_pending_text(scanned))
             continue
-        owned, inherited = split_committed(resolved_path, scanned, cfg, text)
+        owned, inherited = split_pending_file(resolved_path, scanned, settings_for(path), text)
         owned_rows.extend(owned)
         inherited_rows.extend(inherited)
     return owned_rows, inherited_rows
@@ -329,10 +332,13 @@ def _test_changes(decoded: PendingWrite, cwd: Path) -> list[tests_policy.Pending
     ]
 
 
-def _pending_findings(decoded: PendingWrite, cwd: Path, cfg: dict, root: str) -> tuple[list[dict], list[dict]]:
+def _pending_findings(
+    decoded: PendingWrite, cwd: Path, cfg: dict, settings_for: WriteConfig,
+) -> tuple[list[dict], list[dict]]:
     if decoded.is_edit:
-        return _edit_shape_findings(decoded, cwd, cfg, root)
-    return _write_shape_findings(decoded, cwd, cfg, root)
+        root = tests_policy.target_root(Path(decoded.path), cwd)
+        return _edit_shape_findings(decoded, cwd, settings_for(decoded.path), root)
+    return _write_shape_findings(decoded, cwd, cfg, settings_for)
 
 
 def _resolved_path(path: str, cwd: Path) -> Path:

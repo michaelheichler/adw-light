@@ -3,18 +3,20 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 try:
     from . import catalog_de, families, heartbeat_marks, session_state
-    from .config import MAX_LISTED_ROWS
+    from .config import MAX_LISTED_ROWS, REPORT_ONLY_RULES
     from .findings import Finding, Outcome
     from .finding_output import (
         Explainer, Lead, clip as _clip, deduplicated as _deduplicated, lead_text,
@@ -26,7 +28,7 @@ except ImportError:
     import families
     import heartbeat_marks
     import session_state
-    from config import MAX_LISTED_ROWS
+    from config import MAX_LISTED_ROWS, REPORT_ONLY_RULES
     from findings import Finding, Outcome
     from finding_output import (
         Explainer, Lead, clip as _clip, deduplicated as _deduplicated, lead_text,
@@ -45,6 +47,177 @@ MAX_CURRENT_LEDGER_BYTES = 256 * 1024
 MAX_CURRENT_LEDGER_ROWS = 512
 
 OUTCOMES = Outcome
+_LEDGER_PAYLOAD = ContextVar("ledger_payload", default=None)
+
+_SECRET_VALUE = r'''(?:"(?:\\.|[^"\\])*"|'[^']*'|(?:\\.|[^\s'";&|<>])+)'''
+_AUTH_NAME = r"(?:proxy-)?authorization"
+_HEADER_NAME = r"(?:cookie|[\w-]*-(?:key|token|secret))"
+_JSON_NAME = r"(?:[\w-]*[-_]key|(?:[\w-]*[-_])?(?:apikey|token|secret|password|passwd)|cookie)"
+_FLAG_NAME = r"(?:(?:[a-z0-9]+[-_])*(?:api[-_]?key|apikey|token|secret|password|passwd)|oauth2-bearer)"
+_ASSIGNED_NAME = r"(?:(?:\w*_)?(?:key|token|secret|apikey)|\w*(?:password|passwd))"
+_ANY_SCHEME = r"(?:[\w.+-]+[ \t]+)?"
+_KNOWN_SCHEME = r"(?:(?:bearer|basic|token|digest|negotiate)[ \t]+)?"
+_HEADER_FLAG = r"(?<!\S)(?:-H|--header)(?:=|[ \t]*)"
+
+
+def _within(quote):
+    return rf"(?:\\.|(?!(?P={quote}))[^\\\n])+"
+
+
+_SECRET_FORMS = {
+    "header_quoted": (rf"{_HEADER_FLAG}(?P<hq>[\"'])[ \t]*{_HEADER_NAME}[ \t]*:[ \t]*", _within("hq")),
+    "auth_quoted": (rf"(?P<aq>[\"'])[ \t]*{_AUTH_NAME}[ \t]*:[ \t]*{_ANY_SCHEME}", _within("aq")),
+    "json_auth": (rf"(?P<jaq>[\"'])(?:auth|{_AUTH_NAME})(?P=jaq)[ \t]*:[ \t]*(?P<jav>[\"']){_ANY_SCHEME}", _within("jav")),
+    "json_key": (rf"(?P<jkq>[\"']){_JSON_NAME}(?P=jkq)[ \t]*:[ \t]*(?P<jkv>[\"'])", _within("jkv")),
+    "auth_bare": (rf"(?:(?m:^)[ \t]*{_AUTH_NAME}[ \t]*:[ \t]*|(?<![^\s=]){_AUTH_NAME}:)[\"']?{_KNOWN_SCHEME}", _SECRET_VALUE),
+    "header_bare": (rf"(?<![^\s=]){_HEADER_NAME}:", _SECRET_VALUE),
+    "scheme_value": (r"\A[ \t]*(?:bearer|basic)[ \t]+", r"[^\s\"'\\]+\Z"),
+    "flag": (rf"(?<![\w-])--?{_FLAG_NAME}(?:=|[ \t]+(?!-))", _SECRET_VALUE),
+    "assignment": (rf"(?<![\w-]){_ASSIGNED_NAME}=", _SECRET_VALUE),
+}
+_SECRET_TARGET = re.compile(
+    "|".join(rf"(?P<{name}>{prefix}){value}" for name, (prefix, value) in _SECRET_FORMS.items()), re.IGNORECASE,
+)
+_SHORT_GAP = r"(?:[ \t]+(?!-)|(?=[^\s-]))"
+_LONG_GAP = r"(?:=|[ \t]+(?!-))"
+_CLIENT_FLAGS = {
+    "wget": rf"--(?:http-|proxy-|ftp-)?user{_LONG_GAP}",
+    "httpie": rf"-a{_SHORT_GAP}|--auth{_LONG_GAP}",
+    "mysql": r"-p(?=[^\s-])",
+    "sshpass": rf"-p{_SHORT_GAP}",
+}
+_CLIENT_TARGETS = {client: re.compile(rf"((?<!\S)(?:{flags})){_SECRET_VALUE}") for client, flags in _CLIENT_FLAGS.items()}
+_CLIENT_SEGMENT = re.compile(
+    r"(?<![\w.-])(?:(?P<wget>wget)|(?P<httpie>https?)|(?P<mysql>(?:mysql|mariadb)\w*)|(?P<sshpass>sshpass))"
+    r'''(?![\w.:-])(?:"(?:\\.|[^"\\])*"|'[^']*'|[^;&|\n])*'''
+)
+_URL_USERINFO = re.compile(r'''(\b[a-z][\w+.-]*://)[^\s/@?#"']+@''', re.IGNORECASE)
+
+
+_CLIENT_WORD = re.compile(r'''(?:\\\n|\\.|"(?:\\.|[^"\\])*"|'[^']*'|[^\s;&|()`'"\\])+|[;&|()`\n]''')
+_CLIENT_BREAKS = frozenset({";", "&", "|", "(", ")", "`", "\n"})
+_QUOTED_PART = re.compile(r"\\." r'|"((?:\\.|[^"\\])*)"' r"|'([^']*)'", re.DOTALL)
+_CLIENT_NAMES = frozenset({"curl", "docker", "redis-cli"})
+_CURL_PLAIN_LETTERS = "aBfgGhiIjJklLMnNOpqRsSvVZ0-9#:"
+_CURL_VALUE_LETTERS = "AcCdDeFHKmoPQrtTwxXyYz"
+_CURL_VALUE = re.compile(rf"-[{_CURL_PLAIN_LETTERS}]*[{_CURL_VALUE_LETTERS}]$")
+_CLIENT_SECRET = {
+    "curl": re.compile(rf"-[{_CURL_PLAIN_LETTERS}]*[buUE]|--(?:cookie|(?:proxy-)?user)(?:=|$)"),
+    "docker login": re.compile(r"-p"),
+    "redis-cli": re.compile(r"-a|--pass(?:=|$)"),
+}
+_DOCKER_VALUE_OPTIONS = {"--config", "--context", "-c", "--host", "-H", "--log-level", "-l",
+                         "--tlscacert", "--tlscert", "--tlskey"}
+
+
+def _client_state(client, word):
+    if client is None:
+        name = word.strip("\\\"'").rsplit("/", 1)[-1]
+        return name if name in _CLIENT_NAMES else None
+    if client == "docker option":
+        return "docker"
+    if word in _DOCKER_VALUE_OPTIONS:
+        return "docker option"
+    if word.startswith("-"):
+        return "docker"
+    return "docker login" if word == "login" else None
+
+
+def _flag_secret(flag, word):
+    if flag is None:
+        return None, None
+    if flag.end() < len(word):
+        return flag.end(), None
+    return None, (None if word.endswith("=") else "mask")
+
+
+def _client_step(client, pending, word):
+    if pending:
+        return (0 if pending == "mask" else None), None, client
+    if client not in _CLIENT_SECRET:
+        return None, None, _client_state(client, word)
+    mask_from, pending = _flag_secret(_CLIENT_SECRET[client].match(word), word)
+    if client == "curl" and _CURL_VALUE.match(word):
+        pending = "skip"
+    return mask_from, pending, client
+
+
+def _client_words(target):
+    client, pending = None, None
+    for token in _CLIENT_WORD.finditer(target):
+        word = token.group()
+        if word in _CLIENT_BREAKS:
+            client, pending = None, None
+        elif word != "\\\n":
+            mask_from, pending, client = _client_step(client, pending, word)
+            yield token, mask_from
+
+
+def _mask_quoted_parts(word):
+    counts = []
+
+    def masked(part):
+        inner = part.group(1) if part.group(1) is not None else part.group(2)
+        if inner is None:
+            return part.group()
+        text, count = _mask_client_arguments(inner)
+        counts.append(count)
+        return part.group()[0] + text + part.group()[0]
+
+    return _QUOTED_PART.sub(masked, word), sum(counts)
+
+
+def _mask_client_arguments(target):
+    parts, end, count = [], 0, 0
+    for token, mask_from in _client_words(target):
+        word = token.group()
+        if mask_from is None:
+            masked, found = _mask_quoted_parts(word)
+        else:
+            masked, found = word[:mask_from] + "***", int(word[mask_from:] != "***")
+        if found:
+            parts.extend((target[end:token.start()], masked))
+            end, count = token.end(), count + found
+    return "".join(parts) + target[end:], count
+
+
+def _kept_prefix(match):
+    return next(match.group(name) for name in _SECRET_FORMS if match.group(name) is not None) + "***"
+
+
+def _mask_clients(target):
+    counts = []
+
+    def masked_segment(segment):
+        masked, count = _CLIENT_TARGETS[segment.lastgroup].subn(r"\g<1>***", segment.group())
+        counts.append(count)
+        return masked
+
+    return _CLIENT_SEGMENT.sub(masked_segment, target), sum(counts)
+
+
+def mask_target(target):
+    target, arguments = _mask_client_arguments(target)
+    target, userinfo = _URL_USERINFO.subn(r"\g<1>***@", target)
+    target, credentials = _SECRET_TARGET.subn(_kept_prefix, target)
+    masked, client_credentials = _mask_clients(target)
+    return masked, arguments + userinfo + credentials + client_credentials
+
+
+def _refused_target(decision):
+    payload = _LEDGER_PAYLOAD.get()
+    if not payload or decision.outcome != "block" or decision.event not in {"PreToolUse", "PreCommit"}:
+        return {}
+    data = payload.get("tool_input")
+    data = data if isinstance(data, dict) else {}
+    target = data.get("command") or data.get("file_path") or decision.path or ""
+    target = target if isinstance(target, str) else ""
+    masked, replacements = mask_target(target)
+    fields: dict[str, str | bool] = {key: value[:300] for key in ("tool_name", "cwd") if isinstance(value := payload.get(key), str)}
+    fields.update(target=masked[:300], target_truncated=len(masked) > 300)
+    if replacements:
+        fields["target_redacted"] = True
+    return fields
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +301,7 @@ OBSERVE_LEAD = (
 
 
 BLOCK_LEADS = Lead(BLOCK_LEAD, catalog_de.BLOCK_LEAD)
+REPORT_ONLY_STATUS = "report only"
 
 
 def compact_block(
@@ -148,12 +322,19 @@ def compact_block(
     return "\n".join([head, *lines, block_tail(len(unique) - sent, shown, german)]), report
 
 
+def reported_beside(decisions: list[tuple[dict, str]]) -> list[dict]:
+    return [
+        {**finding, "status": REPORT_ONLY_STATUS} for finding, outcome in decisions
+        if outcome == Outcome.WOULD_BLOCK and finding.get("rule") in REPORT_ONLY_RULES
+    ]
+
+
 def verdict_message(
     decisions: list[tuple[dict, str]], config: dict | None = None
 ) -> tuple[str, str]:
     blocking = [finding for finding, outcome in decisions if outcome == Outcome.BLOCK]
     if blocking:
-        return "block", compact_block(blocking, config)[0]
+        return "block", compact_block(blocking + reported_beside(decisions), config)[0]
     observed = [finding for finding, outcome in decisions if outcome == Outcome.WOULD_BLOCK]
     if not observed:
         return "release", ""
@@ -259,7 +440,7 @@ def record_decision(*values: object, **fields: object) -> None:
             event=decision.event, family=decision.family, rule=decision.rule,
             path=decision.path, tool_use_id=decision.tool_use_id,
             turn_id=decision.turn_id, outcome=decision.outcome,
-            duration_ms=decision.duration_ms,
+            duration_ms=decision.duration_ms, **_refused_target(decision),
         ),
         root,
     )
@@ -364,9 +545,11 @@ def run_with_ledger(*values: object, **fields: object) -> dict:
     if session_id:
         session_state.acquire_session_lease(session_id, invocation.state_root)
     started = time.monotonic()
+    token = _LEDGER_PAYLOAD.set(invocation.payload)
     try:
         return gate(turn_id)
     finally:
+        _LEDGER_PAYLOAD.reset(token)
         duration_ms = int((time.monotonic() - started) * 1000)
         if session_id and heartbeat_marks.worth_a_row(session_id, invocation.hook, turn_id, invocation.state_root, duration_ms):
             record_heartbeat(

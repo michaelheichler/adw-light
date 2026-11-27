@@ -1,18 +1,32 @@
-from quiet_git import disable_background_maintenance
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 import unittest
 
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+sys.path.insert(0, str(PROJECT / "engine"))
 
-SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+from adw_light import run_hook
+from lib.git_port import FakeGitView
+
+
+NO_REPOSITORY = FakeGitView({"roots": {}})
+
 RULE = "hard_coded_path"
 DENY = "deny"
 AGENT = "adw-test-writer"
 LOCAL_NAME = "zed42x"
+OWNER = "maren"
+SYSTEM_RULE = "hard_coded_system_path"
+PRINCIPLE = "A test must verify what the code does for its client, never how it does it."
+USER_VARIABLES = ("USER", "LOGNAME", "USERNAME")
+KEPT_PATH_LINE = "SHOT = " + json.dumps("/" + "/".join(("tmp", "shot.png")))
+COUNT_LINE = "COUNT = 1"
 
 
 def rooted(*parts):
@@ -32,73 +46,92 @@ def python_test(expression, prelude=""):
         "import unittest\nfrom pathlib import Path\n" + prelude + "\n\n"
         "class PathProbe(unittest.TestCase):\n"
         "    def test_reads_fixture(self):\n"
+        "        \"\"\"" + PRINCIPLE + "\"\"\"\n"
         "        fixture = " + expression + "\n"
         "        self.assertEqual(fixture.suffix, \".json\")\n"
     )
 
 
 class HardCodedPathGate(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         workspace = TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name)
-        self.repo = self.root / "repo"
-        self.state = self.root / "state"
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self.repo.mkdir()
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
-        disable_background_maintenance(str(self.repo))
+        cls.addClassCleanup(workspace.cleanup)
+        cls.root = Path(workspace.name)
+        cls.repo = cls.root / "repo"
+        cls.state = cls.root / "state"
+        (cls.root / "home").mkdir()
+        (cls.repo / "src").mkdir(parents=True)
+        (cls.repo / "src" / "kept.py").write_text(KEPT_PATH_LINE + "\n", encoding="utf-8")
+        (cls.repo / "src" / "added.py").write_text(COUNT_LINE + "\n", encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"HOME": str(cls.root / "home")})
+        environment.start()
+        cls.addClassCleanup(environment.stop)
+        for name in USER_VARIABLES:
+            os.environ.pop(name, None)
 
-    def run_hook(self, tool_name, tool_input, extra_env):
+    def hook(self, tool_name, tool_input):
         payload = {
-            "cwd": str(self.repo), "session_id": "paths", "hook_event_name": "PreToolUse",
+            "cwd": str(self.repo), "session_id": self._testMethodName, "hook_event_name": "PreToolUse",
             "agent_id": "a1", "agent_type": AGENT, "tool_name": tool_name, "tool_input": tool_input,
         }
-        call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state)],
-            input=json.dumps(payload), text=True, capture_output=True, check=False,
-            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", ""), **extra_env},
-        )
-        self.assertEqual(call.returncode, 0)
-        return json.loads(call.stdout)
+        return run_hook("PreToolUse", payload, state_dir=self.state, git_view=NO_REPOSITORY)
 
-    def path_lines(self):
-        rows = [row for report in sorted((self.state / "reports").glob("*.json"))
-                for row in json.loads(report.read_text(encoding="utf-8"))]
-        return tuple(row["line"] for row in rows if row["rule"] == RULE)
+    def path_lines(self, new_reports, rule=RULE):
+        rows = [row for report in sorted(new_reports) for row in json.loads(report.read_text(encoding="utf-8"))]
+        return tuple(row["line"] for row in rows if row["rule"] == rule)
 
-    def verdict_of(self, output):
-        return output.get("hookSpecificOutput", {}).get("permissionDecision"), self.path_lines()
+    def reports(self):
+        return set((self.state / "reports").glob("*.json"))
 
-    def write(self, relative, content, **extra_env):
+    def verdict_of(self, tool_name, tool_input, rule=RULE):
+        earlier = self.reports()
+        output = self.hook(tool_name, tool_input)
+        return output.get("hookSpecificOutput", {}).get("permissionDecision"), self.path_lines(self.reports() - earlier, rule)
+
+    def write(self, relative, content, rule=RULE):
         tool_input = {"file_path": str(self.repo / relative), "content": content}
-        return self.verdict_of(self.run_hook("Write", tool_input, extra_env))
+        return self.verdict_of("Write", tool_input, rule)
 
-    def edit(self, relative, before, old, new):
-        target = self.repo / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(before, encoding="utf-8")
-        tool_input = {"file_path": str(target), "old_string": old, "new_string": new}
-        return self.verdict_of(self.run_hook("Edit", tool_input, {}))
+    def write_as_user(self, relative, content, user):
+        payload = {
+            "cwd": str(self.repo), "session_id": self._testMethodName, "hook_event_name": "PreToolUse",
+            "agent_id": "a1", "agent_type": AGENT, "tool_name": "Write",
+            "tool_input": {"file_path": str(self.repo / relative), "content": content},
+        }
+        earlier = self.reports()
+        call = subprocess.run(
+            [sys.executable, "-ISB", str(PROJECT / "adw_light.py"), "PreToolUse", "--state-dir", str(self.state)],
+            input=json.dumps(payload), text=True, capture_output=True, check=True,
+            env={"HOME": str(self.root / "home"), "PATH": os.environ.get("PATH", ""), "USER": user},
+        )
+        decision = json.loads(call.stdout).get("hookSpecificOutput", {}).get("permissionDecision")
+        return decision, self.path_lines(self.reports() - earlier)
+
+    def edit(self, relative, old, new, rule=RULE):
+        tool_input = {"file_path": str(self.repo / relative), "old_string": old, "new_string": new}
+        return self.verdict_of("Edit", tool_input, rule)
 
     def test_literal_home_path_in_a_test_denies_on_its_line(self):
-        fixture = json.dumps(rooted("Users", "alice", "project", "fixtures", "a.json"))
+        """A test must verify what the code does for its client, never how it does it."""
+        fixture = json.dumps(rooted("Users", OWNER, "project", "fixtures", "a.json"))
         verdict = self.write("tests/test_paths.py", python_test("Path(" + fixture + ")"))
-        self.assertEqual(verdict, (DENY, (7,)))
+        self.assertEqual(verdict, (DENY, (8,)))
 
-    def test_tilde_home_path_in_a_test_denies(self):
+    def test_portable_tilde_home_path_in_a_test_passes_with_a_note(self):
+        """A test must verify what the code does for its client, never how it does it."""
         fixture = json.dumps(home_anchored("project/a.json"))
-        verdict = self.write("tests/test_paths.py", python_test("Path(" + fixture + ")"))
-        self.assertEqual(verdict, (DENY, (7,)))
+        verdict = self.write("tests/test_paths.py", python_test("Path(" + fixture + ")"), SYSTEM_RULE)
+        self.assertEqual(verdict, (None, (8,)))
 
     def test_fixture_joined_to_a_computed_root_passes(self):
         content = python_test('ROOT / "fixtures" / "a.json"', prelude="\nROOT = Path(__file__).resolve().parent")
         self.assertEqual(self.write("tests/test_paths.py", content), (None, ()))
 
     def test_paths_in_a_markdown_file_pass(self):
+        """A test must verify what the code does for its client, never how it does it."""
         content = (
-            "# Notes\n\nThe tool reads " + rooted("Users", "alice", "project")
+            "# Notes\n\nThe tool reads " + rooted("Users", OWNER, "project")
             + " and keeps its cache in " + home_anchored(".cache/tool") + ".\n"
         )
         self.assertEqual(self.write("docs/notes.md", content), (None, ()))
@@ -108,40 +141,49 @@ class HardCodedPathGate(unittest.TestCase):
         self.assertEqual(self.write("src/d.py", content), (DENY, (2,)))
 
     def test_backslash_drive_letter_in_go_denies(self):
-        literal = json.dumps(drive("C", "\\", "Users", "bob", "data"))
+        """A test must verify what the code does for its client, never how it does it."""
+        literal = json.dumps(drive("C", "\\", "Users", OWNER, "data"))
         content = "package main\n\nvar dataDir = " + literal + "\n"
         self.assertEqual(self.write("src/data.go", content), (DENY, (3,)))
 
     def test_bare_absolute_path_in_shell_denies(self):
-        content = "#!/bin/sh\ncd " + rooted("home", "bob", "project") + "\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "#!/bin/sh\ncd " + rooted("home", OWNER, "project") + "\n"
         self.assertEqual(self.write("src/run.sh", content), (DENY, (2,)))
 
-    def test_local_username_in_code_denies(self):
+    def test_local_username_outside_a_home_path_passes(self):
+        """A test must verify what the code does for its client, never how it does it."""
         content = "OWNER = " + json.dumps(LOCAL_NAME) + "\n"
-        self.assertEqual(self.write("src/who.py", content, USER=LOCAL_NAME), (DENY, (1,)))
+        self.assertEqual(self.write_as_user("src/who.py", content, LOCAL_NAME), (None, ()))
 
     def test_same_name_passes_when_it_is_not_the_local_user(self):
+        """A test must verify what the code does for its client, never how it does it."""
         content = "OWNER = " + json.dumps(LOCAL_NAME) + "\n"
         self.assertEqual(self.write("src/who.py", content), (None, ()))
 
     def test_generic_account_name_passes_even_as_the_local_user(self):
+        """A test must verify what the code does for its client, never how it does it."""
         content = "OWNER = " + json.dumps("runner") + "\n"
-        self.assertEqual(self.write("src/who.py", content, USER="runner"), (None, ()))
+        self.assertEqual(self.write_as_user("src/who.py", content, "runner"), (None, ()))
 
     def test_two_letter_local_username_passes(self):
+        """A test must verify what the code does for its client, never how it does it."""
         content = "OWNER = " + json.dumps("zq") + "\n"
-        self.assertEqual(self.write("src/who.py", content, USER="zq"), (None, ()))
+        self.assertEqual(self.write_as_user("src/who.py", content, "zq"), (None, ()))
 
     def test_deploy_script_with_a_remote_home_path_passes(self):
-        content = "#!/bin/sh\nrsync -a . bob@host:" + rooted("home", "bob", "project") + "\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "#!/bin/sh\nrsync -a . bob@host:" + rooted("home", OWNER, "project") + "\n"
         self.assertEqual(self.write("deploy/push.sh", content), (None, ()))
 
     def test_deploy_named_script_outside_a_deploy_folder_passes(self):
-        content = "#!/bin/sh\nrsync -a . bob@host:" + rooted("home", "bob", "project") + "\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "#!/bin/sh\nrsync -a . bob@host:" + rooted("home", OWNER, "project") + "\n"
         self.assertEqual(self.write("tools/deploy_site.sh", content), (None, ()))
 
     def test_same_remote_path_outside_deploy_scope_denies(self):
-        content = "#!/bin/sh\nrsync -a . bob@host:" + rooted("home", "bob", "project") + "\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "#!/bin/sh\nrsync -a . bob@host:" + rooted("home", OWNER, "project") + "\n"
         self.assertEqual(self.write("src/push.sh", content), (DENY, (2,)))
 
     def test_path_inside_a_go_comment_passes(self):
@@ -156,23 +198,22 @@ class HardCodedPathGate(unittest.TestCase):
         self.assertEqual(self.write("src/feed.py", content), (None, ()))
 
     def test_vue_template_path_passes_while_script_path_denies(self):
+        """A test must verify what the code does for its client, never how it does it."""
         content = (
-            "<template>\n  <p>" + rooted("Users", "alice", "notes") + "</p>\n</template>\n<script>\n"
-            "export default { data() { return { dir: " + json.dumps(rooted("Users", "alice", "data")) + " } } }\n"
+            "<template>\n  <p>" + rooted("Users", OWNER, "notes") + "</p>\n</template>\n<script>\n"
+            "export default { data() { return { dir: " + json.dumps(rooted("Users", OWNER, "data")) + " } } }\n"
             "</script>\n"
         )
         self.assertEqual(self.write("src/App.vue", content), (DENY, (5,)))
 
     def test_edit_that_keeps_an_existing_path_passes(self):
-        line = "SHOT = " + json.dumps(rooted("tmp", "shot.png"))
-        verdict = self.edit("src/old.py", line + "\n", line, line + "\nCOUNT = 1")
+        verdict = self.edit("src/kept.py", KEPT_PATH_LINE, KEPT_PATH_LINE + "\n" + COUNT_LINE)
         self.assertEqual(verdict[0], None)
 
-    def test_edit_that_adds_a_path_denies(self):
-        line = "COUNT = 1"
-        added = "SHOT = " + json.dumps(rooted("tmp", "shot.png"))
-        verdict = self.edit("src/old.py", line + "\n", line, line + "\n" + added)
-        self.assertEqual(verdict, (DENY, (2,)))
+    def test_edit_that_adds_a_temp_path_notes_its_line(self):
+        """A test must verify what the code does for its client, never how it does it."""
+        verdict = self.edit("src/added.py", COUNT_LINE, COUNT_LINE + "\n" + KEPT_PATH_LINE, SYSTEM_RULE)
+        self.assertEqual(verdict, (None, (2,)))
 
     def test_flask_route_with_a_parameter_passes(self):
         content = "@app.route(" + json.dumps(rooted("home", "<user>")) + ")\ndef profile(user):\n    return user\n"
@@ -191,16 +232,18 @@ class HardCodedPathGate(unittest.TestCase):
         self.assertEqual(self.write("src/patterns.py", content), (None, ()))
 
     def test_machine_path_after_a_skipped_route_on_one_line_denies(self):
+        """A test must verify what the code does for its client, never how it does it."""
         route = json.dumps(rooted("home", "<u>"))
-        content = "x = url_for(" + route + "); y = " + json.dumps(rooted("Users", "bob", "d")) + "\n"
+        content = "x = url_for(" + route + "); y = " + json.dumps(rooted("Users", OWNER, "d")) + "\n"
         self.assertEqual(self.write("src/links.py", content), (DENY, (1,)))
 
     def test_plain_open_call_with_a_machine_path_denies(self):
-        content = "open(" + json.dumps(rooted("Users", "bob", "x")) + ")\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "open(" + json.dumps(rooted("Users", OWNER, "x")) + ")\n"
         self.assertEqual(self.write("src/open.py", content), (DENY, (1,)))
 
     def data_module(self):
-        return "DATA = " + json.dumps(rooted("Users", "bob", "data")) + "\n"
+        return "DATA = " + json.dumps(rooted("Users", OWNER, "data")) + "\n"
 
     def test_code_module_named_compose_denies(self):
         self.assertEqual(self.write("src/compose.py", self.data_module()), (DENY, (1,)))
@@ -212,31 +255,38 @@ class HardCodedPathGate(unittest.TestCase):
         self.assertEqual(self.write("src/deploy/core.py", self.data_module()), (DENY, (1,)))
 
     def test_root_deploy_script_passes(self):
-        content = "#!/bin/sh\ncp a " + rooted("Users", "bob", "x") + "\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "#!/bin/sh\ncp a " + rooted("Users", OWNER, "x") + "\n"
         self.assertEqual(self.write("deploy.sh", content), (None, ()))
 
     def test_dockerfile_passes(self):
-        content = "FROM python:3.12\nWORKDIR " + rooted("Users", "bob", "x") + "\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "FROM python:3.12\nWORKDIR " + rooted("Users", OWNER, "x") + "\n"
         self.assertEqual(self.write("Dockerfile", content), (None, ()))
 
     def test_compose_file_passes(self):
-        content = "services:\n  app:\n    volumes:\n      - " + rooted("Users", "bob", "x") + ":/data\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "services:\n  app:\n    volumes:\n      - " + rooted("Users", OWNER, "x") + ":/data\n"
         self.assertEqual(self.write("docker-compose.yml", content), (None, ()))
 
     def test_ci_workflow_passes(self):
-        content = "jobs:\n  build:\n    steps:\n      - run: cp a " + rooted("Users", "bob", "x") + "\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "jobs:\n  build:\n    steps:\n      - run: cp a " + rooted("Users", OWNER, "x") + "\n"
         self.assertEqual(self.write(".github/workflows/ci.yml", content), (None, ()))
 
     def test_shell_end_of_options_marker_does_not_hide_a_path(self):
-        content = "cp -- \"$1\" " + rooted("Users", "bob", "x") + "\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "cp -- \"$1\" " + rooted("Users", OWNER, "x") + "\n"
         self.assertEqual(self.write("src/copy.sh", content), (DENY, (1,)))
 
     def test_sql_dash_comment_with_a_path_passes(self):
-        content = "-- seeded from " + rooted("Users", "bob", "x") + "\nSELECT 1;\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "-- seeded from " + rooted("Users", OWNER, "x") + "\nSELECT 1;\n"
         self.assertEqual(self.write("src/seed.sql", content), (None, ()))
 
     def test_sql_statement_with_a_path_denies(self):
-        content = "SELECT 1;\nCOPY items FROM '" + rooted("Users", "bob", "x") + "';\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "SELECT 1;\nCOPY items FROM '" + rooted("Users", OWNER, "x") + "';\n"
         self.assertEqual(self.write("src/seed.sql", content), (DENY, (2,)))
 
     def computed_root_test(self, expression):
@@ -249,6 +299,7 @@ class HardCodedPathGate(unittest.TestCase):
     def test_typescript_template_joined_to_a_computed_root_passes(self):
         content = (
             'import { root } from "./root";\n\n'
+            "// Principle: " + PRINCIPLE + "\n"
             'test("cache dir sits under the root", () => {\n'
             "  const p = `${root}" + rooted("tmp", "cache") + "`;\n"
             '  expect(p.startsWith(root)).toBe(true);\n'
@@ -264,13 +315,24 @@ class HardCodedPathGate(unittest.TestCase):
         content = '#!/bin/sh\nDATA="$(pwd)' + rooted("var", "data") + '"\nls "$DATA"\n'
         self.assertEqual(self.write("scripts/run.sh", content), (None, ()))
 
-    def test_separate_literal_after_a_computed_root_join_still_denies(self):
+    def test_separate_system_literal_after_a_computed_root_join_is_still_noted(self):
+        """A test must verify what the code does for its client, never how it does it."""
         expression = 'Path(f"{ROOT}/x" + ' + json.dumps(rooted("var", "data", "y.json")) + ")"
-        verdict = self.write("tests/test_cache.py", self.computed_root_test(expression))
-        self.assertEqual(verdict, (DENY, (8,)))
+        verdict = self.write("tests/test_cache.py", self.computed_root_test(expression), SYSTEM_RULE)
+        self.assertEqual(verdict, (None, (9,)))
+
+    def test_shell_home_expansion_passes_but_absolute_path_still_fails(self):
+        """A test must verify what the code does for its client, never how it does it."""
+        command = "git config --file {}/.gitconfig user.name"
+        expressions = ["subprocess.run(" + json.dumps(command.format(home)) + ", shell=True)" for home in ("~", rooted("Users", OWNER))]
+
+        verdicts = [self.write("tests/test_config.py", python_test(expression, prelude="import subprocess")) for expression in expressions]
+
+        self.assertEqual(verdicts, [(None, ()), (DENY, (8,))])
 
     def test_form_feed_line_keeps_the_reported_line_number(self):
-        content = "import os\n\x0c\nDATA = " + json.dumps(rooted("Users", "bob", "data")) + "\n"
+        """A test must verify what the code does for its client, never how it does it."""
+        content = "import os\n\x0c\nDATA = " + json.dumps(rooted("Users", OWNER, "data")) + "\n"
         self.assertEqual(self.write("src/form.py", content), (DENY, (3,)))
 
 

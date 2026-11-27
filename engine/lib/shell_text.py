@@ -3,26 +3,33 @@ from __future__ import annotations
 import re
 import shlex
 from functools import lru_cache
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
 WORD_FRAGMENT_RE = re.compile(r'''\\.|'[^']*'|"(?:\\.|[^"\\])*"''')
+ESCAPED_WORD_SPACE = frozenset({"\\ ", "\\\t"})
 SUBSTITUTION_RE = re.compile(r"\\.|\$\(|`", re.DOTALL)
 BACKTICK_BODY_RE = re.compile(r"(?:\\.|[^`\\])*", re.DOTALL)
 SINGLE_QUOTE = r"'[^']*'"
 DOUBLE_QUOTE = r'"(?:\\.|[^"\\])*"'
 BACKTICK = r"`(?:\\.|[^`\\])*`?"
 COMMENT = r"(?<![^\s;&|()])\#[^\n]*"
+ANSI_C_QUOTE = r"\$'(?:\\.|[^'\\])*'"
 
 
 def _scan_pattern(*, physical: bool) -> str:
     optional = "" if physical else "?"
     disabled = "(?!)" if physical else ""
     bare_escape = "" if physical else r"\\?"
+    literal = r"""[^\s;&|()<>'"$\x60\\]*"""
+    quoted = r"""(?:'[^'$\x60\\\n]*'|"[^"$\x60\\\n]*")"""
+    joined = rf"{literal}(?:{quoted}{literal})+(?=$|[\s;&|()<>])"
+    redirect_word = r"""(?:\\[ \t\\]|\\(?![ \t\\])|[^\s;&|()<>'"\\])+"""
     return rf"""
         (?P<continuation>\\\n)
       | (?P<escape>\\.)
+      | (?P<ansi>{ANSI_C_QUOTE}{optional})
       | (?P<single>{SINGLE_QUOTE}{optional})
       | (?P<double>{DOUBLE_QUOTE}{optional})
       | (?P<backtick>{disabled}{BACKTICK})
@@ -31,15 +38,17 @@ def _scan_pattern(*, physical: bool) -> str:
       | (?P<herestring><<<[ \t]*(?P<word>{SINGLE_QUOTE}|{DOUBLE_QUOTE}|[^\s;&|()<>'"]+))
       | (?P<heredoc><<(?P<strip>-?)[ \t]*(?:'(?P<quoted>[^'\n]*)'|"(?P<dquoted>[^"\n]*)"|{bare_escape}(?P<bare>[^\s;&|()<>'"]+)))
       | (?P<dup>\d*[<>]&(?:\d+|-)?)
-      | (?P<redirect>\d*(?:>>|>\||<>|>|<)[ \t]*(?:{SINGLE_QUOTE}|{DOUBLE_QUOTE}|[^\s;&|()<>'"]+))
+      | (?P<redirect>\d*(?:>>|>\||<>|>|<)[ \t]*(?:{joined}|{SINGLE_QUOTE}|{DOUBLE_QUOTE}|{redirect_word}))
       | (?P<comment>{disabled}{COMMENT})
       | (?P<separator>[;&|()\n])
-      | (?P<other>(?:[^\\'"`#;&|()<>\s$]|\$(?!\())+|[^\S\n]+|.)
+      | (?P<other>(?:[^\\'"`#;&|()<>\s$]|\$(?![(']))+|[^\S\n]+|.)
     """
 
 
 SCAN_RE = re.compile(_scan_pattern(physical=False), re.VERBOSE | re.DOTALL)
 PHYSICAL_SCAN_RE = re.compile(_scan_pattern(physical=True), SCAN_RE.flags)
+PLAIN_TEXT_RE = re.compile(r"(?P<other><<-?|#|\n)")
+ANSI_C_RE = re.compile(ANSI_C_QUOTE + "?", re.DOTALL)
 REDIRECT_PARTS_RE = re.compile(r"(\d*)(>>|>\||<>|<&|>&|>|<)[ \t]*(.*)", re.DOTALL)
 MARKED_RE = re.compile(r"\x00(\d+)(<<|>>|>\||<>|<&|>&|>|<)(.*)", re.DOTALL)
 ANSI_C_START_RE = re.compile(r"\$'|\\.|'[^']*'?|\"(?:\\.|[^\"\\])*\"?", re.DOTALL)
@@ -50,7 +59,12 @@ ANSI_C_ESCAPES = {
     "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
     "\\": "\\", "'": "'", '"': '"', "?": "?",
 }
-PASSED_THROUGH = frozenset({"escape", "single", "double", "other"})
+PASSED_THROUGH = frozenset({"escape", "ansi", "single", "double", "other"})
+QUOTED_WORDS = frozenset({"double", "ansi"})
+ARITHMETIC_OPENERS = frozenset({"separator", "subst"})
+ARITHMETIC_PLAIN = frozenset({"heredoc", "comment"})
+SHELL_MARKS = ARITHMETIC_PLAIN | {"separator"}
+LINE_BREAK = ("separator", "\n")
 REPLACED = frozenset({"backtick", "subst", "procsub"})
 MARKED = frozenset({"redirect", "dup"})
 SCRIPT_READERS = frozenset({"source", "."})
@@ -58,6 +72,11 @@ SUBSTITUTED = "$SUBSTITUTED"
 PROCESS_FILE = "/dev/fd/63"
 REDIRECT_MARK = "\x00"
 INLINE_INPUT = "<<"
+
+
+class _Reading(NamedTuple):
+    heredocs: frozenset[int]
+    breaks: frozenset[int]
 
 
 class _Heredoc(NamedTuple):
@@ -101,13 +120,18 @@ def shell_tokens(text: str, *, physical: bool = False) -> Iterator[ShellToken]:
     position = 0
     pending: list[tuple[_Heredoc, bool]] = []
     pattern = PHYSICAL_SCAN_RE if physical else SCAN_RE
+    arithmetic_stop = 0
+    reading = _shell_reading(text) if physical and "<<" in text else None
     while position < len(text):
         newline = text.find("\n", position) if physical else -1
         limit = len(text) if newline < 0 else max(position + 1, newline)
         match = pattern.match(text, position, limit)
         if match is None:
             break
+        match = _shell_match(text, match, arithmetic_stop, reading) if match.lastgroup in SHELL_MARKS else match
         position = match.end()
+        if match.lastgroup in ARITHMETIC_OPENERS and 0 <= arithmetic_stop <= match.start() and text.startswith("((", position - 1):
+            arithmetic_stop = _arithmetic_reach(text, position - 1)
         if not physical and match.lastgroup in {"subst", "procsub"}:
             position = _closing_paren(text, position) + 1
         if not physical and match.lastgroup == "double":
@@ -124,32 +148,90 @@ def shell_tokens(text: str, *, physical: bool = False) -> Iterator[ShellToken]:
         yield ShellToken(None, position, bodies)
 
 
+def _shell_match(text: str, match: re.Match[str], arithmetic_stop: int, reading: _Reading | None) -> re.Match[str]:
+    kind = match.lastgroup
+    line_break = (kind, match.group()) == LINE_BREAK
+    if match.start() < arithmetic_stop and (kind in ARITHMETIC_PLAIN or line_break):
+        return PLAIN_TEXT_RE.match(text, match.start())
+    if reading is None or match.start() in (reading.heredocs if kind == "heredoc" else reading.breaks):
+        return match
+    return PLAIN_TEXT_RE.match(text, match.start()) if kind == "heredoc" or line_break else match
+
+
+@lru_cache(maxsize=16)
+def _shell_reading(text: str) -> _Reading:
+    marks = list(_read_marks(text, 0))
+    return _Reading(
+        frozenset(start for kind, start in marks if kind == "heredoc"),
+        frozenset(start for kind, start in marks if kind == "separator"),
+    )
+
+
+def _read_marks(text: str, offset: int) -> Iterator[tuple[str, int]]:
+    for token in shell_tokens(text):
+        if token.match is None:
+            continue
+        if token.match.lastgroup == "heredoc" or (token.match.lastgroup, token.match.group()) == LINE_BREAK:
+            yield token.match.lastgroup, offset + token.match.start()
+        for start, body in _code_bodies(text, token):
+            yield from _read_marks(body, offset + start)
+
+
+def _code_bodies(text: str, token: ShellToken) -> list[tuple[int, str]]:
+    match = token.match
+    if match.lastgroup in {"subst", "procsub"}:
+        return [_substitution_body(text, match.end(), token.end - 1)]
+    if match.lastgroup == "backtick":
+        return [(match.start() + 1, match.group()[1:].removesuffix("`"))]
+    if match.lastgroup == "double":
+        word = text[match.start():token.end]
+        return [(match.start() + start, body) for _, _, start, body in _substitution_parts(word)]
+    return []
+
+
+def _substitution_body(text: str, opened: int, closed: int) -> tuple[int, str]:
+    if text.startswith("$((", opened - 2) and _arithmetic_end(text, opened - 1) == closed + 1:
+        return opened - 1, text[opened - 1:closed + 1]
+    return opened, text[opened:closed]
+
+
 @lru_cache(maxsize=16)
 def shell_words(command: str) -> tuple[str, ...]:
     fragments: list[str] = []
-    quoted: dict[str, str] = {}
+    saved: dict[str, str] = {}
     marker = "\0"
     while marker in command:
         marker += "\0"
+
+    def stash(text: str) -> str:
+        slot = f"{marker}{len(saved)}{marker}"
+        saved[slot] = text
+        return slot
+
     start = 0
     for token in shell_tokens(command):
         source = command[start:token.end]
         start = token.end
-        if token.match is not None and token.match.lastgroup == "double":
-            slot = f"{marker}{len(quoted)}{marker}"
-            quoted[slot] = source
-            fragments.append(f" {slot} ")
+        if token.match is not None and token.match.lastgroup in QUOTED_WORDS:
+            fragments.append(f" {stash(source)} ")
             continue
         fragments.append(WORD_FRAGMENT_RE.sub(
-            lambda match: f" {match.group()} " if match.group()[0] in "\"'" else match.group(),
+            lambda match: _word_fragment(match.group(), stash),
             source,
         ))
     try:
         lexer = shlex.shlex("".join(fragments), posix=False, punctuation_chars=";&|()>")
         lexer.whitespace_split = True
-        return tuple(quoted.get(word, word) for word in lexer)
+        slots = re.compile(rf"{marker}[0-9]+{marker}")
+        return tuple(slots.sub(lambda match: saved.get(match.group(), match.group()), word) for word in lexer)
     except ValueError:
         return tuple(command.split())
+
+
+def _word_fragment(text: str, stash: Callable[[str], str]) -> str:
+    if text in ESCAPED_WORD_SPACE:
+        return stash(text)
+    return f" {text} " if text[0] in "\"'" else text
 
 
 def shell_text(command: str) -> str:
@@ -248,7 +330,7 @@ class _Scanner:
         if match.lastgroup == "backtick":
             body = match.group()[1:].removesuffix("`")
         else:
-            body = self.command[match.end():token.end - 1]
+            _, body = _substitution_body(self.command, match.end(), token.end - 1)
         if match.lastgroup == "procsub":
             self.parts.insert(self.command_part, f"( {_scan(body)}\n) | ")
             self.command_part += 1
@@ -292,13 +374,22 @@ def _substitutions(text: str) -> list[str]:
 
 
 def _substitution_spans(text: str) -> Iterator[tuple[int, int, str]]:
+    for start, end, _, body in _substitution_parts(text):
+        yield start, end, body
+
+
+def _substitution_parts(text: str) -> Iterator[tuple[int, int, int, str]]:
     cursor = 0
     while (match := SUBSTITUTION_RE.search(text, cursor)) is not None:
         cursor = match.end()
         if match.group().startswith("\\"):
             continue
-        end = BACKTICK_BODY_RE.match(text, cursor).end() if match.group() == "`" else _closing_paren(text, cursor)
-        yield match.start(), end + 1, text[cursor:end]
+        if match.group() == "`":
+            end = BACKTICK_BODY_RE.match(text, cursor).end()
+            yield match.start(), end + 1, cursor, text[cursor:end]
+        else:
+            end = _closing_paren(text, cursor)
+            yield match.start(), end + 1, *_substitution_body(text, cursor, end)
         cursor = end + 1
 
 
@@ -316,15 +407,16 @@ def _quoted_substitutions(word: str) -> str:
 def _closing_paren(text: str, cursor: int) -> int:
     depth = 1
     pending: list[_Heredoc] = []
+    arithmetic = _arithmetic_around(text, cursor)
     while cursor < len(text):
         char = text[cursor]
-        if char == "\n" and pending:
+        if char == "\n" and pending and cursor >= arithmetic:
             cursor += 1
             for heredoc in pending:
                 _, cursor, _ = _heredoc_body(text, cursor, heredoc)
             pending.clear()
             continue
-        if text.startswith("<<", cursor):
+        if text.startswith("<<", cursor) and cursor >= arithmetic:
             match = SCAN_RE.match(text, cursor)
             if match is not None and match.lastgroup == "heredoc":
                 pending.append(_Heredoc(_delimiter(match), bool(match.group("strip")), False))
@@ -333,18 +425,53 @@ def _closing_paren(text: str, cursor: int) -> int:
         if char == "\\":
             cursor += 2
             continue
+        if text.startswith("$'", cursor):
+            cursor = ANSI_C_RE.match(text, cursor).end()
+            continue
         if char in {"'", '"', "`"}:
             cursor = _quote_end(text, cursor + 1, char)
             continue
-        if char == "#" and (cursor == 0 or text[cursor - 1] in " \t\n;&|()"):
+        if char == "#" and cursor >= arithmetic and (cursor == 0 or text[cursor - 1] in " \t\n;&|()"):
             newline = text.find("\n", cursor)
             cursor = len(text) if newline < 0 else newline
             continue
+        if text.startswith("((", cursor) and 0 <= arithmetic <= cursor:
+            arithmetic = _arithmetic_reach(text, cursor)
         depth += {"(": 1, ")": -1}.get(char, 0)
         if depth == 0:
             return cursor
         cursor += 1
     return len(text)
+
+
+def _arithmetic_around(text: str, cursor: int) -> int:
+    opened = cursor >= 1 and text.startswith("((", cursor - 1) and text[cursor - 2:cursor - 1] not in ("<", ">")
+    return _arithmetic_reach(text, cursor - 1) if opened else 0
+
+
+def _arithmetic_end(text: str, start: int) -> int:
+    return max(_arithmetic_reach(text, start), 0)
+
+
+def _arithmetic_reach(text: str, start: int) -> int:
+    depth = 1
+    cursor = start + 2
+    while cursor < len(text):
+        char = text[cursor]
+        if char == "\\":
+            cursor += 2
+            continue
+        if char == "$" and text.startswith(("$(", "$'"), cursor):
+            cursor = _closing_paren(text, cursor + 2) + 1 if text[cursor + 1] == "(" else ANSI_C_RE.match(text, cursor).end()
+            continue
+        if char in {"'", '"', "`"}:
+            cursor = _quote_end(text, cursor + 1, char)
+            continue
+        depth += {"(": 1, ")": -1}.get(char, 0)
+        if depth == 0:
+            return cursor + 2 if text.startswith("))", cursor) else 0
+        cursor += 1
+    return -1
 
 
 def _quote_end(text: str, cursor: int, quote: str) -> int:

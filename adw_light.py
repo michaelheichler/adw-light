@@ -1,10 +1,13 @@
 import os
 import sys
 from argparse import ArgumentParser
+from contextlib import ExitStack, contextmanager
 from importlib import import_module
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
+CLI_STARTED_AT = monotonic() if __name__ == "__main__" else None
 ROOT = Path(__file__).resolve().parent
 EVENTS = {
     "SessionStart": "session_start",
@@ -20,6 +23,13 @@ EVENTS = {
 }
 
 
+AFTER_RUN_MODULES = frozenset({"record", "batch"})
+
+
+def _deadline(started_at: float) -> float:
+    return import_module("lib.stop_scan").deadline(started_at)
+
+
 def observe_reply(event: str, payload: dict[str, Any], settings: dict[str, Any]) -> None:
     config_api = import_module("lib.config")
     reporting = import_module("lib.reporting")
@@ -33,7 +43,7 @@ def observe_reply(event: str, payload: dict[str, Any], settings: dict[str, Any])
     markup = import_module("lib.markup")
     prose, _ = markup.reply_lines(markup.markdown_lines(message))
     turn_id = payload.get("turn_id")
-    for finding in scanner.scan_all("assistant-reply.md", prose, config):
+    for finding in scanner.scan_all("assistant-reply.md", prose, config, document=False):
         if config_api.resolve_outcome(finding, config) != "block":
             continue
         reporting.record_decision(
@@ -44,11 +54,17 @@ def observe_reply(event: str, payload: dict[str, Any], settings: dict[str, Any])
         )
 
 
-def run(event: str, payload: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+def run(
+    event: str, payload: dict[str, Any], settings: dict[str, Any], *, started_at: float | None = None,
+) -> dict[str, Any]:
+    if started_at is None:
+        started_at = monotonic()
     hookio = import_module("lib.hookio")
 
     if event in {"Stop", "SubagentStop"}:
+        until = _deadline(started_at)
         observe_reply(event, payload, settings)
+        return import_module(EVENTS[event]).run(payload, settings, until=until)
     module_name = EVENTS.get(event)
     if event == "PostToolUse" and payload.get("tool_name", "").startswith("mcp__"):
         module_name = "mcp_success"
@@ -58,7 +74,14 @@ def run(event: str, payload: dict[str, Any], settings: dict[str, Any]) -> dict[s
     handler = module.run
     if event == "SessionStart":
         return handler(payload, settings, drift=lambda: "")
-    result = handler(payload, settings)
+    if module_name in AFTER_RUN_MODULES:
+        result = handler(payload, settings, until=_deadline(started_at))
+    else:
+        result = handler(payload, settings)
+    if event == "PostToolUseFailure" and payload.get("tool_name") == "Bash":
+        import_module("lib.after_run").post(payload, settings, event, until=_deadline(started_at))
+    if result.pop("_after_run_block", False):
+        return result
     if event == "PostToolBatch":
         return module.cli_response(result)
     if event == "PreToolUse":
@@ -82,36 +105,75 @@ def overflow_response(event: str, payload: dict, config: dict) -> dict:
     return hookio.system_message(reason)
 
 
-def main() -> None:
-    parser = ArgumentParser()
-    parser.add_argument("event", nargs="?", choices=EVENTS)
-    parser.add_argument("--host", choices=("claude", "codex"), default="claude")
-    parser.add_argument("--state-dir", type=Path, default=ROOT / ".state")
-    args = parser.parse_args()
-    plugin = os.environ.get("CLAUDE_PLUGIN_ROOT")
-    if plugin and args.state_dir.resolve().is_relative_to(Path(plugin).resolve()):
-        parser.error("Choose a state directory outside the plugin tree.")
-    sys.path.insert(0, str(ROOT / "engine"))
-    os.umask(0o077)
-    state_dir = import_module("lib.config_roots").migrated_state_dir(args.state_dir).resolve()
-    os.environ["ADW_STATE_ROOT"] = str(state_dir)
-    os.environ["ADW_CODEX_HOOK"] = "1" if args.host == "codex" else ""
+def _dispatch(event, payload, config, *, started_at: float | None = None):
     hookio = import_module("lib.hookio")
-
-    payload = hookio.read_payload()
-    event = args.event or (payload.get("hook_event_name", "") if isinstance(payload, dict) else "")
-    config = {"adw_model": "", "state_root": str(state_dir / "state"),
-              "ledger_root": str(state_dir / "ledger")}
+    if not isinstance(payload, dict):
+        payload = hookio.PARSE_FAILURE
+    event = event or payload.get("hook_event_name", "")
     if payload is hookio.INPUT_OVERFLOW:
-        result = overflow_response(event, payload, config)
-    elif payload is hookio.PARSE_FAILURE:
+        return overflow_response(event, payload, config)
+    if payload is hookio.PARSE_FAILURE:
         reason = "ADW Lite could not read the hook event."
         result = hookio.claude_pretool_response(hookio.deny(reason)) if event == "PreToolUse" else hookio.stop_block(reason)
         if event in {"PostToolUse", "PostToolBatch"}:
             result = hookio.advise(reason, event)
-    else:
-        result = run(event, payload, config)
-    hookio.write_payload(result)
+        return result
+    return run(event, payload, config, started_at=started_at)
+
+
+@contextmanager
+def _hook_context(host, state_dir):
+    plugin = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if plugin and state_dir.resolve().is_relative_to(Path(plugin).resolve()):
+        raise ValueError("Choose a state directory outside the plugin tree.")
+    if host not in {"claude", "codex"}:
+        raise ValueError("Unknown hook host.")
+    engine = str(ROOT / "engine")
+    previous = {key: os.environ.get(key) for key in ("ADW_STATE_ROOT", "ADW_CODEX_HOOK")}
+    sys.path.insert(0, engine)
+    mask = os.umask(0o077)
+    try:
+        state_dir = import_module("lib.config_roots").migrated_state_dir(state_dir).resolve()
+        os.environ["ADW_STATE_ROOT"] = str(state_dir)
+        os.environ["ADW_CODEX_HOOK"] = "1" if host == "codex" else ""
+        yield {"adw_model": "", "state_root": str(state_dir / "state"), "ledger_root": str(state_dir / "ledger")}
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        os.umask(mask)
+        sys.path.remove(engine)
+
+
+def _with_view(event, payload, config, git_view, *, started_at: float | None = None):
+    with import_module("lib.git_port").using_view(git_view):
+        return _dispatch(event, payload, config, started_at=started_at)
+
+
+def run_hook(event, payload, host="claude", state_dir=ROOT / ".state", git_view=None):
+    started_at = monotonic()
+    with _hook_context(host, Path(state_dir)) as config:
+        return _with_view(event, payload, config, git_view, started_at=started_at)
+
+
+def main() -> None:
+    parser = ArgumentParser(allow_abbrev=False)
+    parser.add_argument("event", nargs="?", choices=EVENTS)
+    parser.add_argument("--host", choices=("claude", "codex"), default="claude")
+    parser.add_argument("--state-dir", type=Path, default=ROOT / ".state")
+    parser.add_argument("--git-view", type=Path)
+    with ExitStack() as stack:
+        try:
+            args = parser.parse_args()
+            config = stack.enter_context(_hook_context(args.host, args.state_dir))
+            view = import_module("lib.git_port").FakeGitView.from_file(args.git_view) if args.git_view is not None else None
+        except ValueError as error:
+            parser.error(str(error))
+        hookio = import_module("lib.hookio")
+        payload = hookio.read_payload()
+        hookio.write_payload(_with_view(args.event, payload, config, view, started_at=CLI_STARTED_AT))
 
 
 if __name__ == "__main__":

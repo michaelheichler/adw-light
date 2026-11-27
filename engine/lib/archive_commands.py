@@ -5,11 +5,15 @@ import re
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from lib.archive_members import PATCH, TAR, ZIP, ArchiveRead
+from lib.archive_members import CPIO, PATCH, TAR, ZIP, ArchiveRead
 
 STDIN = "-"
 TAR_HAZARDS = ("--transform", "--xform", "--absolute-names", "--insecure", "--to-command", "--use-compress-program")
 TAR_HAZARD_LETTERS = frozenset("PsI")
+TAR_ABSOLUTE_LETTER = "P"
+TAR_ABSOLUTE_FLAG = "--absolute-names"
+DITTO_VALUE_FLAGS = frozenset({"--arch", "--bom", "--zlibCompressionLevel"})
+PATCH_DRY_FLAGS = frozenset({"--dry-run", "--check", "-C"})
 TAR_VALUE_LETTERS = frozenset("fCbTXgKNVH")
 TAR_LONG_VALUES = {"--file": "f", "--directory": "C", "--strip-components": "strip"}
 UNZIP_VALUE_FLAGS = frozenset({"-P", "-I", "-O", "-d"})
@@ -71,6 +75,43 @@ def tar_read(words: list[str], stdin: str | None) -> ArchiveRead | None:
     if source is None or directory is None or not strip.isdigit():
         return None
     return ArchiveRead(TAR, source, directory, int(strip), _tar_selection(rest, fields, members))
+
+
+def absolute_tar_read(words: list[str], stdin: str | None) -> ArchiveRead | None:
+    kept = [_absolute_dropped(word, position == 0) for position, word in enumerate(words) if word != TAR_ABSOLUTE_FLAG]
+    kept = [word for word in kept if word]
+    if kept == words:
+        return None
+    read = tar_read(kept, stdin)
+    return None if read is None else read._replace(absolute=True)
+
+
+def _absolute_dropped(word: str, first: bool) -> str:
+    if word.startswith("--") or not (first or word.startswith("-")):
+        return word
+    if not word.startswith("-"):
+        return word.replace(TAR_ABSOLUTE_LETTER, "")
+    cluster = word[1:]
+    cut = next((index for index, letter in enumerate(cluster) if letter in TAR_VALUE_LETTERS), len(cluster))
+    letters = cluster[:cut].replace(TAR_ABSOLUTE_LETTER, "") + cluster[cut:]
+    return "-" + letters if letters else ""
+
+
+def ditto_reads(words: list[str]) -> list[ArchiveRead]:
+    flags: list[str] = []
+    operands: list[str] = []
+    position = 0
+    while position < len(words):
+        word = words[position]
+        position += 2 if word in DITTO_VALUE_FLAGS else 1
+        if word not in DITTO_VALUE_FLAGS:
+            (flags if word.startswith("-") else operands).append(word)
+    letters = "".join(flag[1:] for flag in flags if not flag.startswith("--"))
+    destination = _plain(operands[-1]) if operands else None
+    if "x" not in letters or len(operands) < 2 or destination is None:
+        return []
+    kind = ZIP if "k" in letters else CPIO
+    return [ArchiveRead(kind, source, destination) for source in map(_plain, operands[:-1]) if source is not None]
 
 
 def _tar_selection(words: list[str], fields: dict[str, str], members: list[str]) -> tuple[str, ...]:
@@ -199,6 +240,8 @@ def git_apply_read(rest: list[str], stdin: str | None) -> ArchiveRead | None:
 
 
 def patch_plan(words: list[str], stdin: str | None) -> PatchPlan | None:
+    if PATCH_DRY_FLAGS.intersection(words):
+        return PatchPlan((), None)
     fields, positional = _patch_fields(words)
     if fields is None or len(positional) > 2:
         return None

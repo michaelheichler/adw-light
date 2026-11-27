@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 try:
     from . import config_roots as config_paths
@@ -13,7 +15,9 @@ from .find_matches import MAX_ENTRIES, MAX_SECONDS
 from .protected import CONFIG_SEAL_BASENAME, WIRING_FILES
 from .shell_expansion import Expansions, Tree
 from .shell_syntax import _bare, _basename, _command_word_index, _without_redirects
-from .temp_scope import Directories, joined_paths, segment_directories
+from .temp_scope import Directories, EXPANDING_RE, joined_paths, segment_directories
+from . import git_port
+from .tests_policy import outside_project, project_root, temp_scratch_repo
 
 TREE_VERBS = frozenset({"rm", "mv", "rsync"})
 RECURSIVE_FLAGS = frozenset({"-r", "-R", "--recursive"})
@@ -22,8 +26,9 @@ RSYNC_VALUE_FLAGS = frozenset({
     "-e", "--rsh", "--exclude", "--include", "--filter", "-f", "--exclude-from", "--include-from",
     "--files-from", "--rsync-path", "--log-file", "--backup-dir", "--suffix", "--chmod", "--chown",
 })
+SCP_VALUE_FLAGS = frozenset({"-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"})
+VERB_VALUE_FLAGS = {"rsync": RSYNC_VALUE_FLAGS, "scp": SCP_VALUE_FLAGS}
 END_OF_OPTIONS = "--"
-STATE_FOLDERS = (".adw", ".agent-discipline")
 STATE_PART = ".adw"
 WATCHER_PART = "agent-discipline"
 AGENT_FOLDER = "agents"
@@ -72,7 +77,7 @@ def _split_operands(verb: str, args: list[str]) -> tuple[list[str], list[str]]:
         if word == END_OF_OPTIONS:
             return flags, operands + args[position + 1:]
         (flags if word.startswith("-") else operands).append(word if word.startswith("-") else args[position])
-        valued = word in TARGET_DIR_FLAGS or (verb == "rsync" and word in RSYNC_VALUE_FLAGS)
+        valued = word in TARGET_DIR_FLAGS or word in VERB_VALUE_FLAGS.get(verb, frozenset())
         position += 2 if valued else 1
     return flags, operands
 
@@ -88,11 +93,45 @@ def _rsync_operands(flags: list[str], operands: list[str]) -> list[tuple[str, bo
 
 
 def _tree(segment: list[str], folders: Directories, scope: _Scope) -> Tree:
-    parts = [_operand(operand, folders, scope) for operand in recursive_operands(segment)]
+    operands = recursive_operands(segment)
+    removing = _basename(segment[_command_word_index(segment)]) == "rm"
+    parts = [_operand(operand, folders, scope) for operand in operands
+             if not (removing and _scratch_removal(operand[0], scope.cwd))]
     return Tree(
         tuple(segment), tuple(path for part in parts for path in part.named),
         tuple(path for part in parts for path in part.files), tuple(word for part in parts for word in part.unknown),
     )
+
+
+def _scratch_removal(raw: str, cwd: str) -> bool:
+    literal = None if EXPANDING_RE.search(raw) else Expansions({}, environment=False, well_known=False).path(raw)
+    if not literal:
+        return False
+    target = Path(literal)
+    if not target.is_absolute() or ".." in target.parts or not target.is_dir():
+        return False
+    real = target.resolve(strict=True)
+    roots = (Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve())
+    if not any(root in real.parents for root in roots):
+        return False
+    home = config_paths.home_root()
+    guarded = (Path(project_root(cwd)), config_paths.state_root(), *config_paths.protected_roots(home))
+    return all(not _overlaps(real, root.resolve()) for root in guarded) and scratch_tree_directory(real, Path(cwd))
+
+
+def scratch_tree_directory(target: Path, cwd: Path) -> bool:
+    if not (outside_project(str(target), str(cwd)) or temp_scratch_repo(str(target), str(cwd))):
+        return False
+    project = Path(project_root(str(cwd)))
+    if not (project / ".git").exists():
+        return True
+    roots = git_port.view().worktree_roots(project)
+    return bool(roots) and all(not _overlaps(target.resolve(), root.resolve()) for root in roots)
+
+
+def _overlaps(left: Path, right: Path) -> bool:
+    a, b = (Path(str(path).casefold()) for path in (left, right))
+    return a.is_relative_to(b) or b.is_relative_to(a)
 
 
 def _operand(operand: tuple[str, bool], folders: Directories, scope: _Scope) -> Tree:
@@ -125,26 +164,39 @@ def descendants(root: str) -> list[str] | None:
     return walk.files
 
 
-def _scan(walk: _Walk, folder: str) -> bool:
+def followed_descendants(root: str) -> list[str] | None:
+    walk = _Walk(time.monotonic() + MAX_SECONDS, [root], [], [0])
+    visited: set[str] = set()
+    while walk.pending:
+        folder = walk.pending.pop()
+        real = os.path.realpath(folder)
+        if real in visited:
+            continue
+        visited.add(real)
+        if not _scan(walk, folder, follow=True):
+            return None
+    return walk.files
+
+
+def _scan(walk: _Walk, folder: str, *, follow: bool = False) -> bool:
     try:
         with os.scandir(folder) as entries:
-            children = list(entries)
+            for child in entries:
+                walk.seen[0] += 1
+                if walk.seen[0] > MAX_ENTRIES or time.monotonic() > walk.deadline:
+                    return False
+                paths = walk.pending if child.is_dir(follow_symlinks=follow) else walk.files
+                paths.append(child.path)
     except OSError:
         return False
-    walk.seen[0] += len(children)
-    if walk.seen[0] > MAX_ENTRIES or time.monotonic() > walk.deadline:
-        return False
-    walk.pending.extend(child.path for child in children if child.is_dir(follow_symlinks=False))
-    walk.files.extend(child.path for child in children if not child.is_dir(follow_symlinks=False))
     return True
 
 
 def _protected_roots(cwd: str) -> list[str]:
-    home = str(config_paths.home_root())
     start = os.path.abspath(cwd)
     configs = [os.path.join(folder, CONFIG_SEAL_BASENAME) for folder in (start, *_parents(start))]
     governing = next((path for path in configs if os.path.lexists(path)), None)
-    return [*([governing] if governing else []), *(os.path.join(home, name) for name in STATE_FOLDERS)]
+    return [*([governing] if governing else []), str(config_paths.adw_home())]
 
 
 def _parents(path: str) -> list[str]:

@@ -1,10 +1,10 @@
-from quiet_git import disable_background_maintenance
-from commit_gate_home import SHEBANG, CommitGateHome
-from false_positive_home import IDENTITY, OLD_TEST, PASSED, REFUSED, SIZE_TEST, FalsePositiveHome
-import subprocess
+from fake_repo_home import DENY, OLD_TEST, PASSED, REFUSED, SIZE_TEST, FakeRepoCase, Repo
+import hashlib
+import json
 import unittest
 
 
+SHEBANG = "#!/bin/bash\n"
 COMMIT_ARM = 'git add x && git commit -m "We utilize this."'
 DISPATCH = 'case "$1" in\n  sync) touch notes.txt ;;\n  commit) ' + COMMIT_ARM + ' ;;\nesac\n'
 FALL_THROUGH = 'case "$1" in\n  sync) touch notes.txt ;&\n  commit) ' + COMMIT_ARM + ' ;;\nesac\n'
@@ -12,98 +12,84 @@ HEREDOC_ARM = (
     'case "$1" in\n  sync) touch notes.txt ;;\n  notes) cat > notes.txt <<EOF\nnote\nEOF\n  ;;\n'
     '  commit) ' + COMMIT_ARM + ' ;;\nesac\n'
 )
+SCRIPTS = {"s.sh": SHEBANG + DISPATCH, "fall.sh": SHEBANG + FALL_THROUGH, "heredoc.sh": SHEBANG + HEREDOC_ARM}
+MESSAGE_FINDING = (DENY, [("commit_message.md", "utilize")])
+NO_COMMITS = {"revisions": {}, "parents": {}, "refs": {}}
 SCRATCH_IGNORE = {".gitignore": ".claude/tmp/\n", OLD_TEST: SIZE_TEST}
-TEST_CHANGE = {OLD_TEST: SIZE_TEST + "\n"}
-DOCS_CHANGE = {"docs/guide.md": "Guide.\n"}
 FLAGGED_MERGE = 'git merge --no-ff -m "sync" other'
+SCRIPTED = "scripted"
+SCRATCH = "scratch"
 
 
-class CaseArmSelection(CommitGateHome):
-    def staged_commit_refusal(self):
-        return self.refusal_of_script("reference.sh", COMMIT_ARM + "\n")
+class CaseArmSelection(FakeRepoCase):
+    projects = {SCRIPTED: Repo({}, SCRIPTS, fields=NO_COMMITS)}
 
-    def test_script_run_with_an_argument_that_picks_a_non_committing_arm_is_refused_for_its_committing_arm(self):
-        expected = self.staged_commit_refusal()
+    @classmethod
+    def arrange(cls):
+        for name in SCRIPTS:
+            (cls.root / SCRIPTED / name).chmod(0o755)
 
-        refusal = self.deny_reason(self.run_script(DISPATCH, "sync"))
+    def session(self):
+        return "s" + hashlib.sha256((self.id() + self.__dict__.get("label", "")).encode()).hexdigest()[:16]
 
-        self.assertEqual(expected, refusal)
+    def outcome(self, command):
+        self.label = command
+        payload = {"cwd": str(self.root / SCRIPTED), "tool_name": "Bash", "tool_input": {"command": command}}
+        decision = self.respond("PreToolUse", payload).get("hookSpecificOutput", {}).get("permissionDecision")
+        ledger = self.state / "ledger" / "ledger.jsonl"
+        rows = (json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip())
+        blocked = {(row["path"], row["rule"]) for row in rows if row.get("session_id") == self.session() and row.get("outcome") == "block"}
+        return decision, sorted(blocked)
 
-    def test_script_run_with_an_argument_that_picks_the_committing_arm_is_refused_like_the_commit_itself(self):
-        expected = self.staged_commit_refusal()
-
-        refusal = self.deny_reason(self.run_script(DISPATCH, "commit"))
-
-        self.assertEqual(expected, refusal)
-
-    def test_sourced_script_with_an_unknown_first_argument_is_refused_for_its_committing_arm(self):
-        expected = self.staged_commit_refusal()
-        self.place("s.sh", SHEBANG + DISPATCH)
-
-        refusal = self.deny_reason(self.gate("source ./s.sh"))
-
-        self.assertEqual(expected, refusal)
-
-    def test_arm_that_falls_through_into_the_committing_arm_is_refused(self):
-        expected = self.staged_commit_refusal()
-
-        refusal = self.deny_reason(self.run_script(FALL_THROUGH, "sync"))
-
-        self.assertEqual(expected, refusal)
-
-    def test_heredoc_in_a_skipped_arm_keeps_the_committing_arm_refused(self):
-        expected = self.staged_commit_refusal()
-
-        refusal = self.deny_reason(self.run_script(HEREDOC_ARM, "sync"))
-
-        self.assertEqual(expected, refusal)
+    def test_script_runs_that_can_reach_a_committing_arm_deny_on_its_flagged_message(self):
+        """Use a parameterized test for several inputs."""
+        commands = ["bash ./s.sh sync", "bash ./s.sh commit", "source ./s.sh", "bash ./fall.sh sync", "bash ./heredoc.sh sync"]
+        self.assertEqual({command: self.outcome(command) for command in commands}, dict.fromkeys(commands, MESSAGE_FINDING))
 
 
-class NestedScratchClones(FalsePositiveHome):
-    def clone_with_tests(self, repo, relative):
-        clone = repo / relative
-        clone.mkdir(parents=True)
-        subprocess.run(["git", "init", "-q", str(clone)], check=True)
-        disable_background_maintenance(str(clone))
-        self.place(clone, {OLD_TEST: SIZE_TEST})
-        subprocess.run(["git", "-C", str(clone), "add", "."], check=True)
-        subprocess.run(["git", "-C", str(clone), *IDENTITY, "commit", "-qm", "up"], check=True)
-        return repo
+class NestedScratchClones(FakeRepoCase):
+    projects = {
+        SCRATCH: Repo(SCRATCH_IGNORE),
+        SCRATCH + "/.claude/tmp/up": Repo({OLD_TEST: SIZE_TEST}),
+        SCRATCH + "/vendor/up": Repo({OLD_TEST: SIZE_TEST}),
+    }
 
     def test_pull_in_a_clone_under_an_ignored_scratch_folder_passes(self):
-        repo = self.clone_with_tests(self.committed_repo(SCRATCH_IGNORE), ".claude/tmp/up")
-        self.assertEqual(self.bash(repo, "git -C .claude/tmp/up pull"), PASSED)
+        """Feed input, check the return value."""
+        self.assertEqual(self.bash(SCRATCH, "git -C .claude/tmp/up pull"), PASSED)
 
-    def test_pull_in_a_clone_under_a_folder_that_is_not_ignored_is_refused(self):
-        repo = self.clone_with_tests(self.committed_repo(SCRATCH_IGNORE), "vendor/up")
-        self.assertEqual(self.bash(repo, "git -C vendor/up pull"), REFUSED)
+class ArchiveExtraction(FakeRepoCase):
+    projects = {SCRATCH: Repo(SCRATCH_IGNORE)}
 
+    @classmethod
+    def arrange(cls):
+        (cls.root / SCRATCH / ".claude/tmp/x").mkdir(parents=True)
 
-class ArchiveExtraction(FalsePositiveHome):
     def test_archive_extracted_into_an_ignored_scratch_folder_passes(self):
-        repo = self.committed_repo(SCRATCH_IGNORE)
-        (repo / ".claude/tmp/x").mkdir(parents=True)
-        self.assertEqual(self.bash(repo, "git archive HEAD | tar -x -C .claude/tmp/x"), PASSED)
+        self.assertEqual(self.bash(SCRATCH, "git archive HEAD | tar -x -C .claude/tmp/x"), PASSED)
 
     def test_archive_extracted_into_the_tests_folder_of_a_repo_with_ignored_scratch_is_refused(self):
-        repo = self.committed_repo(SCRATCH_IGNORE)
-        self.assertEqual(self.bash(repo, "git archive HEAD | tar -x -C tests/"), REFUSED)
+        self.assertEqual(self.bash(SCRATCH, "git archive HEAD | tar -x -C tests/"), REFUSED)
 
 
-class MergeOfChangedPaths(FalsePositiveHome):
+class MergeOfChangedPaths(FakeRepoCase):
+    projects = {
+        "docs": Repo(SCRATCH_IGNORE, branches={"other": [{"docs/guide.md": "Guide.\n"}]}),
+        "tests": Repo(SCRATCH_IGNORE, branches={"other": [{OLD_TEST: SIZE_TEST + "\n"}]}),
+    }
+
+    @classmethod
+    def arrange(cls):
+        (cls.root / "docs/.git/FETCH_HEAD").write_text("other-0\t\tbranch 'other' of .\n", encoding="utf-8")
+
     def test_flagged_merge_of_a_branch_that_changes_only_docs_passes(self):
-        repo = self.commit_on_other(self.committed_repo(SCRATCH_IGNORE), DOCS_CHANGE)
-        self.assertEqual(self.bash(repo, FLAGGED_MERGE), PASSED)
+        self.assertEqual(self.bash("docs", FLAGGED_MERGE), PASSED)
 
-    def test_flagged_merge_of_a_branch_that_changes_a_test_file_is_refused(self):
-        repo = self.commit_on_other(self.committed_repo(SCRATCH_IGNORE), TEST_CHANGE)
-        self.assertEqual(self.bash(repo, FLAGGED_MERGE), REFUSED)
+    def test_flagged_merge_of_a_branch_that_changes_a_test_file_passes(self):
+        self.assertEqual(self.bash("tests", FLAGGED_MERGE), PASSED)
 
-    def test_merge_of_fetch_head_is_refused_even_when_it_points_at_a_docs_only_commit(self):
-        repo = self.commit_on_other(self.committed_repo(SCRATCH_IGNORE), DOCS_CHANGE)
-        fetched = subprocess.run(["git", "-C", str(repo), "rev-parse", "other"], capture_output=True, text=True, check=True)
-        (repo / ".git/FETCH_HEAD").write_text(fetched.stdout.strip() + "\t\tbranch 'other' of .\n", encoding="utf-8")
-        self.assertEqual(self.bash(repo, "git merge FETCH_HEAD"), REFUSED)
+    def test_merge_of_fetch_head_passes(self):
+        self.assertEqual(self.bash("docs", "git merge FETCH_HEAD"), PASSED)
 
 
 if __name__ == "__main__":

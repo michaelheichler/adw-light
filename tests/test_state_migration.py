@@ -263,8 +263,9 @@ class WatcherStateWriteTests(unittest.TestCase):
     def test_a_write_into_the_new_state_folder_is_denied_as_state_mutation(self):
         self.assertEqual(self.write_decision(".adw-lite/state/ledger/ledger.jsonl"), ("deny", True))
 
-    def test_a_write_into_the_new_cache_folder_is_denied_as_state_mutation(self):
-        self.assertEqual(self.write_decision(".adw-lite/cache/entry.json"), ("deny", True))
+    def test_a_write_into_the_new_cache_folder_passes_because_the_cache_holds_no_state(self):
+        """Observable behavior is an operation or a state that helps a client reach one of its goals."""
+        self.assertEqual(self.write_decision(".adw-lite/cache/entry.json"), (None, False))
 
     def test_a_write_into_the_legacy_state_folder_is_denied_as_state_mutation(self):
         self.assertEqual(self.write_decision(".local/state/adw-lite/ledger/ledger.jsonl"), ("deny", True))

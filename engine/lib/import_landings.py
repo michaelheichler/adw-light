@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from pathlib import Path
 
+from lib import git_port
 from lib.archive_commands import stdin_source, tar_read, unzip_read
 from lib.archive_members import ArchiveRead, landed_paths
 from lib.captured_output import captured_outputs
@@ -20,7 +20,6 @@ UNSAFE_NAME_CHARS = frozenset("$`*?[~{")
 REMOTE_URL_RE = re.compile(r"^(?:https?|ftp)://", re.IGNORECASE)
 REMOTE_REPO_RE = re.compile(r"^(?:(?:https?|ssh|git)://|[\w.-]+@[\w.-]+:)", re.IGNORECASE)
 LOCAL_URL_RE = re.compile(r"^file:", re.IGNORECASE)
-CHECK_IGNORE_SECONDS = 5
 CLONE_VALUE_FLAGS = frozenset({
     "-b", "--branch", "--depth", "-o", "--origin", "-c", "--config", "--reference", "--separate-git-dir",
     "-j", "--jobs", "--filter", "--template", "-u", "--upload-pack",
@@ -41,14 +40,7 @@ def external_landings(command: str, cwd: Cwd, authored: frozenset[str]) -> list[
 def ignored_paths(paths: list[str], base: Path) -> list[str]:
     if not paths:
         return []
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(base), "check-ignore", "--stdin", "-z"],
-            input="\0".join(paths) + "\0", capture_output=True, text=True, timeout=CHECK_IGNORE_SECONDS, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    ignored = {path for path in result.stdout.split("\0") if path}
+    ignored = git_port.view().ignored_paths(base, paths)
     return [path for path in paths if path in ignored]
 
 

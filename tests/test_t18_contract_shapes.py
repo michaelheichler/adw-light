@@ -10,6 +10,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+NO_REPOSITORY_VIEW = Path(__file__).resolve().parent / "fixtures" / "no_repository_view.json"
 CONTEXT_CAP = 4000
 SHAPE_TOKENS = frozenset({"25", "because", "NOTE", "URL", "hence", "#123", "TODO", "FIXME", "HACK"})
 REJECTED_TAGS = frozenset({"DONE", "XXX", "BUG", "OPTIMIZE"})
@@ -53,7 +54,7 @@ class ContractDelivery(unittest.TestCase):
     def deliver(self, event, **fields):
         payload = {"session_id": "contract", "cwd": str(self.project), "hook_event_name": event, **fields}
         call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), event, "--host", "claude", "--state-dir", str(self.root / "state")],
+            [sys.executable, "-ISB", str(SCRIPT), event, "--host", "claude", "--state-dir", str(self.root / "state"), "--git-view", str(NO_REPOSITORY_VIEW)],
             input=json.dumps(payload), text=True, capture_output=True, check=False, timeout=60,
             env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
         )

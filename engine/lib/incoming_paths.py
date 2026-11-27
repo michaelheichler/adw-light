@@ -3,12 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import NamedTuple
 
-from lib.git_globs import _git_list
-from lib.shell_parse import _bare, _basename, _command_word_index
-from lib.write_targets import _git_base
+try:
+    from . import git_port
+    from .shell_parse import _bare, _basename, _command_word_index
+    from .write_targets import _git_base
+except ImportError:
+    from lib import git_port
+    from lib.shell_parse import _bare, _basename, _command_word_index
+    from lib.write_targets import _git_base
 
 MERGE = "merge"
 CHERRY_PICK = "cherry-pick"
+REVERT = "revert"
+STASH_REF = "refs/stash"
 MERGE_FLAGS = frozenset({
     "--no-ff", "--ff", "--ff-only", "--no-edit", "--edit", "-e", "-q", "--quiet", "--no-commit", "--commit", "--squash",
     "--no-squash", "--no-verify", "--stat", "--no-stat", "-n", "--log", "--no-log", "-v", "--verbose", "--progress",
@@ -18,7 +25,7 @@ PICK_FLAGS = frozenset({
     "-x", "--ff", "-n", "--no-commit", "-e", "--edit", "--no-edit", "-s", "--signoff", "--allow-empty",
     "--keep-redundant-commits",
 })
-FLAGS_OF = {MERGE: MERGE_FLAGS, CHERRY_PICK: PICK_FLAGS}
+FLAGS_OF = {MERGE: MERGE_FLAGS, CHERRY_PICK: PICK_FLAGS, REVERT: frozenset({"--no-edit"})}
 MESSAGE_FLAG = "-m"
 MESSAGE_PREFIX = "--message="
 UNREADABLE_REFS = frozenset({"FETCH_HEAD", "MERGE_HEAD", "ORIG_HEAD", "CHERRY_PICK_HEAD", "-"})
@@ -40,7 +47,7 @@ def incoming(segment: list[str]) -> Incoming | None:
         return None
     verb = words[position]
     refs = _refs(verb, words[position + 1:])
-    return Incoming(verb, refs) if refs else None
+    return Incoming(verb, refs) if refs and (verb != REVERT or len(refs) == 1) else None
 
 
 def _refs(verb: str, rest: list[str]) -> tuple[str, ...]:
@@ -63,16 +70,37 @@ def _refs(verb: str, rest: list[str]) -> tuple[str, ...]:
 def changed_paths(coming: Incoming, directory: Path) -> list[str] | None:
     found: list[str] = []
     for ref in coming.refs:
-        if coming.verb == CHERRY_PICK and not _single_parent(ref, directory):
+        if coming.verb != MERGE and not _single_parent(ref, directory):
             return None
         span = [f"HEAD...{ref}"] if coming.verb == MERGE else [f"{ref}^", ref]
-        listed = _git_list(["diff", "--name-only", "-z", "--no-renames", *span, "--"], directory)
+        listed = git_port.view().diff_paths(directory, span)
         if listed is None:
+            return None
+        if coming.verb == REVERT and not _revert_paths_are_stable(directory, ref, listed):
             return None
         found.extend(listed)
     return found
 
 
+def _revert_paths_are_stable(directory: Path, ref: str, paths: list[str]) -> bool:
+    if not paths:
+        return True
+    changed = set(paths)
+    for tree in (ref, "HEAD"):
+        entries = git_port.view().tree_paths(directory, tree, paths)
+        if entries is None or not changed.issubset(entries):
+            return False
+    return True
+
+
+def missing_stash(directory: Path) -> bool:
+    common = git_port.view().common_dir(directory)
+    if common is None:
+        return False
+    stores = (STASH_REF, "logs/refs/stash", "packed-refs", "reftable")
+    return all(not (common / name).exists() for name in stores)
+
+
 def _single_parent(ref: str, directory: Path) -> bool:
-    listed = _git_list(["rev-list", "--parents", "-n", "1", "--end-of-options", ref, "--"], directory)
-    return listed is not None and len(listed) == 1 and len(listed[0].split()) == 2
+    parents = git_port.view().commit_parents(directory, ref)
+    return parents is not None and len(parents) == 1

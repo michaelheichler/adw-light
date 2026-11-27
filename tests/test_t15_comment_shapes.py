@@ -10,6 +10,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+NO_REPOSITORY_VIEW = Path(__file__).resolve().parent / "fixtures" / "no_repository_view.json"
 SHAPE = "comment_shape"
 MARKER = "deferred_work_comment"
 OBSERVED = "would_block"
@@ -88,7 +89,7 @@ class CommentShapeGate(unittest.TestCase):
             "tool_input": {"file_path": str(self.repo / name), "content": content},
         }
         call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state)],
+            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state), "--git-view", str(NO_REPOSITORY_VIEW)],
             input=json.dumps(payload), text=True, capture_output=True, check=False,
             env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
         )

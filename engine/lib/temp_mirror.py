@@ -2,21 +2,21 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from functools import lru_cache
+from pathlib import Path
 
 try:
+    from . import git_port
     from .temp_scope import FIXED_TEMP_ROOTS
     from .tests_policy import is_test_path, project_root
 except ImportError:
+    import git_port
     from temp_scope import FIXED_TEMP_ROOTS
     from tests_policy import is_test_path, project_root
 
 TEMP_ROOTS = tuple(root for root in FIXED_TEMP_ROOTS if root.endswith("/tmp"))
 DYNAMIC_RE = re.compile(r"[$`*?\[{\\\"']")
 MIN_NAME_CHARS = 4
-GIT_SECONDS = 5
-REVISION = "HEAD"
 
 
 def mirrored_temp(path: str, token: str) -> bool:
@@ -38,14 +38,10 @@ def literal_prefix(token: str) -> str | None:
     return prefix if len(prefix) - len(root) - 1 >= MIN_NAME_CHARS else None
 
 
-@lru_cache(maxsize=32)
 def tracked_sources(root: str, prefix: str) -> tuple[str, ...]:
-    command = ["git", "-C", root, "grep", "-l", "-z", "-F", "-e", prefix, REVISION, "--"]
-    try:
-        result = subprocess.run(command, capture_output=True, timeout=GIT_SECONDS, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return ()
-    if result.returncode != 0:
-        return ()
-    names = result.stdout.decode("utf-8", "replace").split("\0")
-    return tuple(name.split(":", 1)[1] for name in names if name.startswith(REVISION + ":"))
+    return _view_sources(git_port.view(), root, prefix)
+
+
+@lru_cache(maxsize=32)
+def _view_sources(git_view: git_port.GitView, root: str, prefix: str) -> tuple[str, ...]:
+    return tuple(git_view.grep_tracked(Path(root), prefix))

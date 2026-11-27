@@ -1,99 +1,159 @@
 from __future__ import annotations
 
-import os
-import re
 import shlex
-import subprocess
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import takewhile
 from pathlib import Path
-from typing import NamedTuple
 
-from .commit_functions import Function, extract_functions, with_positional
-from .commit_inputs import (
-    DYNAMIC_SCRIPT,
-    PLAIN_COMMIT,
-    SCRIPT_READERS,
-    Command,
-    Input,
-    InputScope,
-    UnreadableCommit,
-    is_dynamic,
-    normalized,
-    shell_input,
-)
-from .commit_processes import MAX_ROUNDS, UNSETTLED, Touched, WalkRun
-from .commit_segments import (
-    alias_definitions as _alias_definitions,
-)
-from .commit_segments import (
-    bind_input as _bind_input,
-)
-from .commit_segments import (
-    command_words as _command_words,
-)
-from .commit_segments import (
-    is_assignment as _is_assignment,
-)
-from .commit_segments import (
-    segments as _segments,
-)
-from .commit_writes import changes_files as _changes_files
-from .path_policy import anchored
-from .script_files import shebang_shell
-from .shell_operators import SEPARATORS
-from .shell_syntax import SHELL_C_INTERPRETERS, WRAPPER_COMMANDS, _basename
-from .shell_syntax import _payload_command_index as _command_index
-from .shell_text import heredoc_value, split_redirects
+try:
+    from .commit_index_source import commit_reads_worktree
+    from .commit_functions import Function, extract_functions, with_positional
+    from .commit_inputs import (
+        PLAIN_COMMIT,
+        SCRIPT_READERS,
+        Command,
+        Input,
+        InputScope,
+        RelocatedCommit,
+        UnreadableCommit,
+        is_dynamic,
+        normalized,
+        shell_input,
+    )
+    from .commit_processes import MAX_ROUNDS, UNSETTLED, Touched, WalkRun
+    from .commit_segments import (
+        alias_definitions as _alias_definitions,
+    )
+    from .commit_segments import (
+        bind_input as _bind_input,
+    )
+    from .commit_segments import (
+        command_words as _command_words,
+    )
+    from .commit_segments import (
+        is_assignment as _is_assignment,
+    )
+    from .commit_segments import (
+        segments as _segments,
+    )
+    from .commit_writes import (
+        changes_files as _changes_files,
+        config_command,
+        config_path,
+        git_environment,
+        operand_writes,
+        read_only_git_metadata,
+        reads_stdin_operands,
+        write_keys,
+    )
+    from .tests_policy import project_root
+    from .path_policy import anchored
+    from .script_files import shebang_shell
+    from .shell_operators import SEPARATORS
+    from .shell_syntax import SHELL_C_INTERPRETERS, _basename
+    from .shell_text import split_redirects
+    from .temp_scope import sealed_temp_tail
+    from .commit_command_words import (
+        DECLARERS, FILE_NEUTRAL_VERBS, VARIABLE_RE,
+        _assignments, _cached_index, _expanded, _expanded_words, _file_neutral, _payload_command_index,
+        _physical_mode,
+    )
+    from .commit_git_resolution import (
+        BUILTIN_VERBS, CHDIR_FLAGS, CONFIG_ENV_PREFIXES, DIRECTORY_MOVE, DYNAMIC_DIRECTORY, DYNAMIC_INDEX, GIT_LOCATION_ENV_VARS,
+        GIT_TIMEOUT_SECONDS, GIT_VALUE_FLAGS, LOCATION_OVERRIDE, MAX_ALIAS_DEPTH, PATH_FLAGS, SHELL_ALIAS, GitCall,
+        _GitContext, _alias, _alias_env, _exec_value, _flag_cwd, _git_call, _git_payloads, init_folders,
+        _located_verb, _location_override, _moves_directory, _refuse_location_override, _resolved,
+        _skip_git_flag,
+    )
+    from .commit_walk_keys import (
+        _command_key, _process_key, _function_key, _left_state, _variable_changes,
+    )
+except ImportError:
+    from lib.commit_index_source import commit_reads_worktree
+    from lib.commit_functions import Function, extract_functions, with_positional
+    from lib.commit_inputs import (
+        PLAIN_COMMIT,
+        SCRIPT_READERS,
+        Command,
+        Input,
+        InputScope,
+        RelocatedCommit,
+        UnreadableCommit,
+        is_dynamic,
+        normalized,
+        shell_input,
+    )
+    from lib.commit_processes import MAX_ROUNDS, UNSETTLED, Touched, WalkRun
+    from lib.commit_segments import (
+        alias_definitions as _alias_definitions,
+    )
+    from lib.commit_segments import (
+        bind_input as _bind_input,
+    )
+    from lib.commit_segments import (
+        command_words as _command_words,
+    )
+    from lib.commit_segments import (
+        is_assignment as _is_assignment,
+    )
+    from lib.commit_segments import (
+        segments as _segments,
+    )
+    from lib.commit_writes import (
+        changes_files as _changes_files,
+        config_command,
+        config_path,
+        git_environment,
+        operand_writes,
+        read_only_git_metadata,
+        reads_stdin_operands,
+        write_keys,
+    )
+    from lib.tests_policy import project_root
+    from lib.path_policy import anchored
+    from lib.script_files import shebang_shell
+    from lib.shell_operators import SEPARATORS
+    from lib.shell_syntax import SHELL_C_INTERPRETERS, _basename
+    from lib.shell_text import split_redirects
+    from lib.temp_scope import sealed_temp_tail
+    from lib.commit_command_words import (
+        DECLARERS, FILE_NEUTRAL_VERBS, VARIABLE_RE,
+        _assignments, _cached_index, _expanded, _expanded_words, _file_neutral, _payload_command_index,
+        _physical_mode,
+    )
+    from lib.commit_git_resolution import (
+        BUILTIN_VERBS, CHDIR_FLAGS, CONFIG_ENV_PREFIXES, DIRECTORY_MOVE, DYNAMIC_DIRECTORY, DYNAMIC_INDEX, GIT_LOCATION_ENV_VARS,
+        GIT_TIMEOUT_SECONDS, GIT_VALUE_FLAGS, LOCATION_OVERRIDE, MAX_ALIAS_DEPTH, PATH_FLAGS, SHELL_ALIAS, GitCall,
+        _GitContext, _alias, _alias_env, _exec_value, _flag_cwd, _git_call, _git_payloads, init_folders,
+        _located_verb, _location_override, _moves_directory, _refuse_location_override, _resolved,
+        _skip_git_flag,
+    )
+    from lib.commit_walk_keys import (
+        _command_key, _process_key, _function_key, _left_state, _variable_changes,
+    )
 
 __all__ = ["SHELL_ALIAS", "GitCall", "UnreadableCommit", "git_calls"]
 
-GIT_TIMEOUT_SECONDS = 30
 MAX_NESTING = 10
-MAX_ALIAS_DEPTH = 8
 MAX_FUNCTION_DEPTH = 32
-SHELL_ALIAS = "!"
 PIPES = frozenset({"|", "|&"})
 DIRECTORY_VERBS = frozenset({"cd", "pushd", "popd"})
-FILE_NEUTRAL_VERBS = frozenset({
-    "[", "[[", "test", "true", "false", ":", "echo", "printf", "pwd", "ls", "cat", "grep", "rg", "head", "tail", "wc",
-    "type", "which", "export", "local", "readonly", "declare", "typeset", "set", "shopt", "unset", "exit", "return",
-    "read", "sleep", "date", "uname", "id", "whoami", "fi", "done", "esac", "}", "then", "else",
-})
 OUTPUT_OPERATORS = frozenset({">", ">>", ">|", "<>"})
-GIT_VALUE_FLAGS = frozenset({"-c", "--namespace", "--config-env"})
-PATH_FLAGS = frozenset({"-C", "--work-tree", "--git-dir"})
-GIT_LOCATION_ENV_VARS = frozenset({"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"})
-DECLARERS = frozenset({"export", "declare", "typeset", "local", "readonly"})
-CONFIG_ENV_PREFIXES = ("GIT_", "HOME", "XDG_CONFIG_HOME")
-CHDIR_FLAGS = {"env": ("-C", "--chdir"), "sudo": ("-D", "--chdir")}
-COMMAND_RUNNERS = frozenset({
-    "caffeinate", "doas", "find", "flock", "ionice", "parallel", "setsid", "stdbuf", "unbuffer", "watch", "xargs",
-})
-BUILTIN_VERBS = frozenset(["add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch", "bundle", "cat-file", "check-attr", "check-ignore", "checkout", "cherry", "cherry-pick", "clean", "clone", "commit", "commit-tree", "config", "count-objects", "describe", "diff", "diff-files", "diff-index", "diff-tree", "difftool", "fetch", "for-each-ref", "format-patch", "fsck", "gc", "grep", "hash-object", "help", "init", "log", "ls-files", "ls-remote", "ls-tree", "maintenance", "merge", "merge-base", "mv", "notes", "prune", "pull", "push", "range-diff", "read-tree", "rebase", "reflog", "remote", "repack", "replace", "rerere", "reset", "restore", "rev-list", "rev-parse", "revert", "rm", "shortlog", "show", "show-ref", "sparse-checkout", "stage", "stash", "status", "submodule", "switch", "symbolic-ref", "tag", "update-index", "update-ref", "var", "version", "whatchanged", "worktree", "write-tree"])
-POSITIONAL_RE = re.compile(r"\$(?:[@*]|\d|\{(?:[@*]|\d+)[^}]*\})")
-VARIABLE_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
 
 TOO_DEEP = f"This command nests shells or scripts deeper than the commit gate reads. {PLAIN_COMMIT}"
-HIDDEN_COMMIT = f"This command runs git commit through another program, so the commit gate cannot scan it. {PLAIN_COMMIT}"
-DYNAMIC_PROGRAM = f"This command takes its program or git subcommand from a variable or substitution, so the commit gate cannot see whether it commits. {PLAIN_COMMIT}"
-LOCATION_OVERRIDE = (
-    "GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, or another git location variable moves the commit's repository or index, "
-    "so the commit gate cannot tell which index it records. Commit without them."
-)
-DIRECTORY_MOVE = "env -C or sudo -D moves the commit into another directory. Run cd in its own step, then commit."
-DYNAMIC_DIRECTORY = f"This command moves into a folder named by a variable or substitution, so the commit gate cannot tell which repository commits. {PLAIN_COMMIT}"
 PHYSICAL_CONTEXT = "set -P"
 UNSET = "\0unset"
 AMBIGUOUS_FUNCTION = f"This function has different readable definitions, so the commit gate cannot resolve its call. {PLAIN_COMMIT}"
 
 
-class GitCall(NamedTuple):
-    cwd: Path
-    verb: str
-    args: list[str]
-    stdin: str | None = None
+def bash_command(payload: dict) -> str | list[str]:
+    tool_input = payload.get("tool_input") or payload.get("toolInput") or payload.get("input") or {}
+    for key in ("command", "cmd", "input"):
+        if key in tool_input:
+            command = tool_input[key]
+            return list(command) if isinstance(command, list) else str(command)
+    return ""
 
 
 def git_calls(command: str | list[str], cwd: Path) -> list[GitCall]:
@@ -110,6 +170,8 @@ def git_calls(command: str | list[str], cwd: Path) -> list[GitCall]:
 
 
 def _walked_calls(command: str | list[str], cwd: Path) -> list[GitCall]:
+    if isinstance(command, str):
+        command = sealed_temp_tail(command, cwd)
     run, touched, unseen_writes = WalkRun(), frozenset(), False
     for _round in range(MAX_ROUNDS):
         run.new_round()
@@ -135,15 +197,6 @@ def _calls(command: str | list[str], walk: _Walk) -> list[GitCall]:
     for segment in segments:
         walk.step(list(segment))
     return walk.calls
-
-
-def _payload_command_index(words: list[str]) -> int:
-    return _cached_index(tuple(words))
-
-
-@lru_cache(maxsize=65536)
-def _cached_index(words: tuple[str, ...]) -> int:
-    return _command_index(list(words))
 
 
 @lru_cache(maxsize=4096)
@@ -176,14 +229,15 @@ class _Walk:
     declarations: dict[str, Function] = field(default_factory=dict)
     function_stack: tuple[str, ...] = ()
     local_variables: set[str] = field(default_factory=set)
-    relocated: bool = False
-    commit_variable: bool = False
+    relocated: str | None = None
     inspected_command: bool = False
     unseen_writes: bool = False
     shell: str = ""
     physical: bool = False
     fds_replaced: bool = False
     run: WalkRun = field(default_factory=WalkRun)
+    created: frozenset[Path] = frozenset()
+    initialized: frozenset[Path] = frozenset()
 
     def step(self, segment: list[str]) -> None:
         if segment in (["("], [")"]):
@@ -195,13 +249,15 @@ class _Walk:
         if not segment:
             return
         self.run.tick()
+        prior_writes = self.unseen_writes or bool(self.touched)
         self.inspected_command = False
-        command, declaration = self._read(segment)
+        command, declaration, nonwriting = self._read(segment)
         if declaration is not None:
             self._define(declaration)
         else:
-            self._command(command)
-        self._note_writes(command, declaration is not None)
+            self._command(command, nonwriting)
+        skip_operands = nonwriting or declaration is not None or reads_stdin_operands(segment, self.cwd)
+        self._note_writes(command, skip_operands, prior_writes)
         self.previous, self.feed = command, None
 
     def _group(self, token: str) -> None:
@@ -219,7 +275,7 @@ class _Walk:
         self.exported_functions = snapshot.exported_functions
         self.alternates = snapshot.alternates
         self.local_variables, self.fds = snapshot.local_variables, snapshot.fds
-        self.relocated, self.commit_variable = snapshot.relocated, snapshot.commit_variable
+        self.relocated = snapshot.relocated
         self.physical = snapshot.physical
 
     def _define(self, declaration: Function) -> None:
@@ -229,7 +285,7 @@ class _Walk:
             self.alternates[name] = (*known, declaration)
         self.functions[name] = declaration
 
-    def _read(self, segment: list[str]) -> tuple[Command, Function | None]:
+    def _read(self, segment: list[str]) -> tuple[Command, Function | None, bool]:
         words, redirects = split_redirects(_command_words(segment))
         index = _payload_command_index(words)
         declaration = self.declarations.get(words[index]) if index < len(words) else None
@@ -237,9 +293,15 @@ class _Walk:
         for redirect in redirects:
             _bind_input(inputs, redirect._replace(target=_expanded(redirect.target, self.variables)))
         outputs = [_expanded(redirect.target, self.variables) for redirect in redirects if redirect.operator in OUTPUT_OPERATORS]
-        return Command(_expanded_words(words, self.variables), inputs, outputs), declaration
+        nonwriting = (
+            not redirects and index < len(words) and words[index] in {"shift", "break", "continue", "getopts", "wait"}
+            and all(_is_assignment(word) for word in words[:index])
+        )
+        if not self.run.git_configured:
+            nonwriting = nonwriting or read_only_git_metadata(words, self.variables)
+        return Command(_expanded_words(words, self.variables), inputs, outputs), declaration, nonwriting
 
-    def _command(self, command: Command) -> None:
+    def _command(self, command: Command, nonwriting: bool) -> None:
         words = command.words
         index = _payload_command_index(words)
         verb = words[index] if index < len(words) else ""
@@ -260,41 +322,59 @@ class _Walk:
         if words == ["exec"]:
             self.fds, self.fds_replaced = command.inputs, True
             return
-        self._run(command)
+        self._run(command, nonwriting)
 
-    def _run(self, command: Command) -> None:
+    def _run(self, command: Command, nonwriting: bool) -> None:
         self._export_functions(command.words)
         self.physical = _physical_mode(command.words, self.physical)
         assigned = _assignments(command.words)
         self.variables.update(assigned)
         if command.words[:1] == ["local"]:
             self.local_variables.update(word.partition("=")[0] for word in command.words[1:])
-        self.relocated = self.relocated or any(name in GIT_LOCATION_ENV_VARS for name, _value in assigned)
-        self.commit_variable = self.commit_variable or any("commit" in value for _name, value in assigned)
+        if any(name in GIT_LOCATION_ENV_VARS for name, _value in assigned):
+            self.relocated = LOCATION_OVERRIDE
+        elif any(name == "GIT_INDEX_FILE" for name, _value in assigned):
+            self.relocated = self.relocated or DYNAMIC_INDEX
         found = _segment_calls(command, self)
-        self.unseen_writes = self.unseen_writes or not (self.inspected_command or _file_neutral(command.words))
-        if self.relocated and any(call.verb == "commit" for call in found):
-            raise UnreadableCommit(LOCATION_OVERRIDE)
+        self.created |= _mkdir_folders(command.words, self.cwd)
+        initialized = init_folders(found)
+        self.initialized |= initialized
+        self.created |= frozenset(folder for folder in initialized if not folder.exists())
+        self.unseen_writes = self.unseen_writes or not (self.inspected_command or nonwriting or _file_neutral(command.words))
+        commits = [call.cwd for call in found if call.verb == "commit"]
+        if self.relocated == LOCATION_OVERRIDE and commits:
+            raise RelocatedCommit(self.relocated)
+        if self.relocated and commits:
+            raise UnreadableCommit(self.relocated, commits[0])
         self.calls.extend(found)
 
-    def _note_writes(self, command: Command, declaration: bool = False) -> None:
+    def _note_writes(self, command: Command, skip_operands: bool, prior_writes: bool) -> None:
+        if command.words[:1] == ["export"]:
+            for name in command.words[1:]:
+                if "=" not in name and git_environment(name):
+                    self.variables.setdefault(name, f"${name}")
+        self.run.git_configured |= config_command(command.words)
         written = [*command.outputs]
-        if not self.inspected_command and not declaration and _changes_files(command.words):
-            arguments = command.words[_payload_command_index(command.words) + 1:]
-            written.extend(word for word in arguments if not word.startswith("-"))
-        self.touched.update(normalized(self.cwd, word) for word in written if word)
+        if not self.inspected_command and not skip_operands and _changes_files(command.words):
+            written.extend(operand_writes(command.words, self.cwd, self.variables, self.run.git_configured, prior_writes))
+        keys = [key for word in written if word for key in write_keys(self.cwd, word)]
+        self.run.git_configured |= any(config_path(key) for key in keys)
+        self.touched.update(keys)
 
     def nested(self, shell_depth: int = 0) -> _Walk:
         return _Walk(
             self.cwd, self.depth + shell_depth, self.touched,
             variables=dict(self.variables), aliases=dict(self.aliases), functions=dict(self.functions),
             exported_functions=set(self.exported_functions), alternates=dict(self.alternates),
-            function_stack=self.function_stack, relocated=self.relocated, commit_variable=self.commit_variable,
+            function_stack=self.function_stack, relocated=self.relocated,
             unseen_writes=self.unseen_writes, shell=self.shell, physical=self.physical, run=self.run,
+            created=self.created, initialized=self.initialized,
         )
 
     def absorb(self, child: _Walk, function: bool = False) -> None:
         self.cwd = child.cwd
+        self.created |= child.created
+        self.initialized |= child.initialized
         self.functions = child.functions
         self.aliases = child.aliases
         self.exported_functions = child.exported_functions
@@ -304,7 +384,6 @@ class _Walk:
         if not function:
             self.local_variables.update(child.local_variables)
         self.relocated = self.relocated or child.relocated
-        self.commit_variable = self.commit_variable or child.commit_variable
         self.unseen_writes = self.unseen_writes or child.unseen_writes
         self.physical = child.physical
         if child.fds_replaced:
@@ -349,7 +428,6 @@ class _Walk:
         self.calls.extend(found)
         self.unseen_writes = self.unseen_writes or any(child.unseen_writes for child in children)
         self.absorb(children[-1], function=True)
-        self.commit_variable = self.commit_variable or any(child.commit_variable for child in children)
         for name in unknown:
             self.variables.pop(name, None)
 
@@ -385,47 +463,54 @@ class _Walk:
         self.cwd = anchored(args[-1], self.cwd) if args else self.cwd
 
 
+def _mkdir_folders(words: list[str], cwd: Path) -> frozenset[Path]:
+    index = _payload_command_index(words)
+    if index >= len(words) or _basename(words[index]) != "mkdir":
+        return frozenset()
+    args = words[index + 1:]
+    parents = bool(args and args[0] in {"-p", "--parents"})
+    operands = args[int(parents):]
+    if operands[:1] == ["--"]:
+        operands = operands[1:]
+    if any(not word or word.startswith("-") or is_dynamic(word) or set(word) & set("*?[]{}") for word in operands):
+        return frozenset()
+    paths = [anchored(word, cwd).resolve() for word in operands]
+    if parents:
+        return frozenset(part for path in paths for part in (path, *path.parents) if not part.exists())
+    return frozenset(paths)
+
+
 def _segment_calls(command: Command, walk: _Walk) -> list[GitCall]:
     words = command.words
     payload = _shell_input(command, _scope(walk, walk.feed), walk.run)
     walk.run.check_clock()
     if payload is not None:
         return _shell_calls(payload, command, walk)
-    call = _git_call(words, walk.cwd)
+    call = _git_call(words, walk.cwd, walk.created, walk.initialized)
     if call is None:
-        _refuse_hidden_commit(words, walk.commit_variable)
-        _refuse_runner_shell_commit(command, walk)
         return []
-    nested = (found for payload in _git_payloads(call) for found in _calls(payload, _process_child(walk, "sh", shared=True)))
-    if any(found.verb == "commit" for found in nested):
-        raise UnreadableCommit(HIDDEN_COMMIT)
+    if call.verb != "commit":
+        return [call]
     source = command.inputs.get(0)
-    return [call._replace(stdin=source.text if source is not None else None)]
-
-
-def _refuse_runner_shell_commit(command: Command, walk: _Walk) -> None:
-    index = _payload_command_index(command.words)
-    words = command.words[index:]
-    if not words or _basename(words[0]) not in COMMAND_RUNNERS:
-        return
-    for offset, word in enumerate(words[1:], start=1):
-        if _basename(word) not in SHELL_C_INTERPRETERS:
-            continue
-        payload = _shell_input(command._replace(words=words[offset:]), _scope(walk, None), walk.run)
-        walk.run.check_clock()
-        if payload is None:
-            continue
-        child = _process_child(walk, _basename(word))
-        found = _process_calls(payload, child, command.words[:index])
-        walk.unseen_writes = walk.unseen_writes or child.unseen_writes
-        if any(call.verb == "commit" for call in found):
-            raise UnreadableCommit(HIDDEN_COMMIT)
+    call = call._replace(stdin=source.text if source is not None else None)
+    if call.new_folder:
+        return [call]
+    root = call.parent_repo or Path(project_root(str(call.cwd))).resolve()
+    writes = walk.unseen_writes or any(
+        is_dynamic(path) or Path(normalized(walk.cwd, path)).resolve().is_relative_to(root)
+        for path in (*walk.touched, *command.outputs)
+    )
+    if call.parent_repo is not None and writes and (call.index_file is not None or commit_reads_worktree(call.args)):
+        return [call._replace(index_only=True)]
+    if call.index_file is not None and writes:
+        raise UnreadableCommit("Run the index write separately so the commit gate can scan the final index.", call.cwd)
+    if commit_reads_worktree(call.args) and writes:
+        raise UnreadableCommit("Run the worktree write separately so the commit gate can read its content.", call.cwd)
+    return [call]
 
 
 def _shell_calls(payload: str, command: Command, walk: _Walk) -> list[GitCall]:
     walk.inspected_command = True
-    if walk.commit_variable and is_dynamic(next(iter(payload.split()), "")):
-        raise UnreadableCommit(DYNAMIC_PROGRAM)
     words = command.words
     index = _payload_command_index(words)
     shared = index < len(words) and words[index] in {*SCRIPT_READERS, "eval", "trap"}
@@ -436,7 +521,7 @@ def _shell_calls(payload: str, command: Command, walk: _Walk) -> list[GitCall]:
         walk.absorb(child)
     commits = any(call.verb == "commit" for call in found)
     if commits and words[index] == "trap":
-        raise UnreadableCommit(HIDDEN_COMMIT)
+        return []
     if commits:
         _refuse_location_override(words[:index])
     return found
@@ -451,33 +536,13 @@ def _process_child(walk: _Walk, shell: str, shared: bool = False) -> _Walk:
 
 def _shell_input(command: Command, scope: InputScope, run: WalkRun) -> str | None:
     key = (_command_key(command), _command_key(scope.feed), scope.cwd, scope.script_kind, scope.unseen_writes, scope.shell, scope.context)
-    text, reads = run.payload(key, scope.touched, lambda: shell_input(command, scope))
-    if any(is_dynamic(read) for read in reads):
-        raise UnreadableCommit(DYNAMIC_SCRIPT)
+    text, _ = run.payload(key, scope.touched, lambda: shell_input(command, scope))
     return text
-
-
-def _command_key(command: Command | None) -> tuple[object, ...] | None:
-    if command is None:
-        return None
-    return tuple(command.words), frozenset(command.inputs.items()), tuple(command.outputs)
 
 
 def _scope(walk: _Walk, feed: Command | None) -> InputScope:
     context = PHYSICAL_CONTEXT if walk.physical else ""
     return InputScope(walk.cwd, feed, walk.touched, unseen_writes=walk.unseen_writes, shell=walk.shell, context=context)
-
-
-def _physical_mode(words: list[str], physical: bool) -> bool:
-    if words[:1] != ["set"]:
-        return physical
-    for index, word in enumerate(words[1:], start=1):
-        option = words[index + 1] if index + 1 < len(words) else ""
-        if word in {"-o", "+o"} and option == "physical":
-            physical = word == "-o"
-        elif word[:1] in {"-", "+"} and not word.startswith(("--", "++")) and "P" in word:
-            physical = word.startswith("-")
-    return physical
 
 
 def _process_shell(word: str, cwd: Path) -> str:
@@ -496,225 +561,9 @@ def _process_calls(payload: str, child: _Walk, prefix: list[str]) -> list[GitCal
     return list(visited.calls)
 
 
-def _process_key(payload: str, child: _Walk) -> tuple[object, ...]:
-    functions = tuple(sorted((name, function.body) for name, function in child.functions.items()))
-    alternates = tuple(sorted((name, tuple(function.body for function in bodies)) for name, bodies in child.alternates.items()))
-    return (
-        payload, str(child.cwd), child.shell, functions, alternates, tuple(sorted(child.exported_functions)),
-        child.relocated, child.commit_variable, child.unseen_writes,
-    )
-
-
-def _function_key(walk: _Walk, function: Function, inputs: dict[int, Input], args: list[str]) -> tuple[object, ...]:
-    return (
-        function, tuple(args), walk.cwd, frozenset(walk.variables.items()), frozenset(walk.functions.items()),
-        frozenset(walk.aliases.items()), frozenset(walk.exported_functions), frozenset(walk.alternates.items()),
-        walk.function_stack, walk.depth, walk.relocated, walk.commit_variable, walk.unseen_writes, walk.physical,
-        walk.shell, frozenset(inputs.items()),
-    )
-
-
 def _copied(walk: _Walk) -> _Walk:
     copy = walk.nested()
     copy.local_variables = set(walk.local_variables)
     copy.fds, copy.fds_replaced = dict(walk.fds), walk.fds_replaced
     copy.calls = list(walk.calls)
     return copy
-
-
-def _left_state(walk: _Walk) -> tuple[object, ...]:
-    return (
-        walk.cwd, walk.functions, walk.aliases, walk.exported_functions, walk.alternates,
-        walk.relocated, walk.physical, walk.fds if walk.fds_replaced else None,
-    )
-
-
-def _variable_changes(walk: _Walk, entry: dict[str, str]) -> dict[str, str]:
-    return {name: value for name, value in walk.variables.items()
-            if name not in walk.local_variables and entry.get(name) != value}
-
-
-def _file_neutral(words: list[str]) -> bool:
-    index = _payload_command_index(words)
-    return index >= len(words) or words[index] in FILE_NEUTRAL_VERBS
-
-
-def _expanded(word: str, variables: dict[str, str]) -> str:
-    heredoc = heredoc_value(word)
-    if heredoc is not None:
-        return heredoc
-    return VARIABLE_RE.sub(lambda match: variables.get(match.group(1) or match.group(2), match.group()), word)
-
-
-def _expanded_words(words: list[str], variables: dict[str, str]) -> list[str]:
-    expanded = [_expanded(word, variables) for word in words]
-    index = _payload_command_index(expanded)
-    if index < len(expanded) and expanded[index] != words[index] and " " in expanded[index]:
-        return [*expanded[:index], *expanded[index].split(), *expanded[index + 1:]]
-    return expanded
-
-
-def _git_payloads(call: GitCall) -> list[str]:
-    if call.verb == "rebase":
-        return [value for index, arg in enumerate(call.args) if (value := _exec_value(call.args, index, arg)) is not None]
-    runner = {"submodule": "foreach", "bisect": "run"}.get(call.verb)
-    if runner not in call.args:
-        return []
-    return [" ".join(arg for arg in call.args[call.args.index(runner) + 1:] if not arg.startswith("-"))]
-
-
-def _exec_value(args: list[str], index: int, arg: str) -> str | None:
-    name, separator, inline = arg.partition("=")
-    if separator and len(name) > 3 and "--exec".startswith(name):
-        return inline
-    if arg == "-x" or (len(arg) > 3 and "--exec".startswith(arg)):
-        return args[index + 1] if index + 1 < len(args) else ""
-    return arg[2:] if arg.startswith("-x") and len(arg) > 2 else None
-
-
-@dataclass(frozen=True, slots=True)
-class _GitContext:
-    cwd: Path
-    prefix: list[str]
-    depth: int = 0
-
-
-def _git_call(words: list[str], cwd: Path) -> GitCall | None:
-    index = _payload_command_index(words)
-    if index >= len(words) or _basename(words[index]) != "git":
-        return None
-    prefix = words[:index]
-    call = _resolved(words[index:], _GitContext(cwd, prefix))
-    if call is not None and call.verb == "commit":
-        _refuse_location_override(prefix)
-        if is_dynamic(str(call.cwd)):
-            raise UnreadableCommit(DYNAMIC_DIRECTORY)
-    return call
-
-
-def _resolved(git_words: list[str], context: _GitContext) -> GitCall | None:
-    located = _located_verb(git_words, context.cwd)
-    if located is None:
-        return None
-    location, cursor = located
-    verb, args, flags = git_words[cursor], git_words[cursor + 1:], git_words[1:cursor]
-    if is_dynamic(verb):
-        raise UnreadableCommit(DYNAMIC_PROGRAM)
-    alias = None if verb in BUILTIN_VERBS else _alias(verb, flags, context)
-    if alias is None:
-        return GitCall(location, verb, args)
-    if alias.startswith("!"):
-        return GitCall(location, _shell_alias(verb, alias), args)
-    if context.depth >= MAX_ALIAS_DEPTH:
-        raise UnreadableCommit(f"git {verb} expands through more aliases than the commit gate follows. {PLAIN_COMMIT}")
-    return _resolved(["git", *flags, *_alias_words(verb, alias), *args], replace(context, depth=context.depth + 1))
-
-
-def _located_verb(git_words: list[str], cwd: Path) -> tuple[Path, int] | None:
-    current, pinned, cursor = cwd, False, 1
-    while cursor < len(git_words) and git_words[cursor].startswith("-"):
-        step = _skip_git_flag(git_words, cursor, current)
-        if step is None:
-            return None
-        cursor, candidate, pins = step
-        current = candidate if pins or not pinned else current
-        pinned = pinned or pins
-    return (current, cursor) if cursor < len(git_words) else None
-
-
-def _skip_git_flag(words: list[str], cursor: int, current: Path) -> tuple[int, Path, bool] | None:
-    token = words[cursor]
-    if token.startswith("-C") and len(token) > 2:
-        return cursor + 1, anchored(token[2:], current), False
-    name, separator, inline = token.partition("=")
-    if separator and name in PATH_FLAGS:
-        return cursor + 1, _flag_cwd(name, current, inline), name == "--work-tree"
-    if token in PATH_FLAGS:
-        if cursor + 1 >= len(words):
-            return None
-        return cursor + 2, _flag_cwd(token, current, words[cursor + 1]), token == "--work-tree"
-    if token in GIT_VALUE_FLAGS:
-        return cursor + 2, current, False
-    return cursor + 1, current, False
-
-
-def _flag_cwd(flag: str, current: Path, value: str) -> Path:
-    resolved = anchored(value, current)
-    if flag == "--git-dir" and resolved.name == ".git":
-        return resolved.parent
-    return resolved
-
-
-def _alias(verb: str, flags: list[str], context: _GitContext) -> str | None:
-    try:
-        done = subprocess.run(
-            ["git", *flags, "config", "--get", f"alias.{verb}"], cwd=context.cwd, env=_alias_env(verb, context.prefix),
-            capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS, check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise UnreadableCommit(f"The commit gate could not check whether git {verb} is an alias: {exc}. {PLAIN_COMMIT}") from exc
-    return done.stdout.strip() if done.returncode == 0 else None
-
-
-def _alias_env(verb: str, prefix: list[str]) -> dict[str, str]:
-    assigned = dict(token.split("=", 1) for token in prefix if _is_assignment(token))
-    if any(name.startswith(CONFIG_ENV_PREFIXES) and is_dynamic(value) for name, value in assigned.items()):
-        raise UnreadableCommit(f"This command sets git configuration from a shell variable, so the commit gate cannot resolve git {verb}. {PLAIN_COMMIT}")
-    return {**os.environ, **assigned}
-
-
-def _shell_alias(verb: str, alias: str) -> str:
-    if "commit" in alias:
-        raise UnreadableCommit(f"git {verb} is a shell alias that runs commit, so the commit gate cannot read it. {PLAIN_COMMIT}")
-    return SHELL_ALIAS
-
-
-def _alias_words(verb: str, alias: str) -> list[str]:
-    try:
-        return shlex.split(alias)
-    except ValueError as exc:
-        raise UnreadableCommit(f"The commit gate cannot read the quoting of the git {verb} alias. {PLAIN_COMMIT}") from exc
-
-
-def _refuse_location_override(prefix: list[str]) -> None:
-    reason = _location_override(prefix)
-    if reason is not None:
-        raise UnreadableCommit(reason)
-
-
-def _location_override(prefix: list[str]) -> str | None:
-    if any(token.partition("=")[0] in GIT_LOCATION_ENV_VARS for token in prefix if _is_assignment(token)):
-        return LOCATION_OVERRIDE
-    return DIRECTORY_MOVE if _moves_directory(prefix) else None
-
-
-def _moves_directory(prefix: list[str]) -> bool:
-    wrapper = ""
-    for token in prefix:
-        wrapper = _basename(token) if _basename(token) in WRAPPER_COMMANDS else wrapper
-        if token.startswith(CHDIR_FLAGS.get(wrapper, ())):
-            return True
-    return False
-
-
-def _assignments(words: list[str]) -> list[tuple[str, str]]:
-    if words[:1] and words[0] in DECLARERS:
-        declared = words[1:]
-    elif words and all(_is_assignment(word) for word in words):
-        declared = words
-    else:
-        return []
-    return [(name, value) for name, separator, value in (word.partition("=") for word in declared) if separator]
-
-
-def _refuse_hidden_commit(words: list[str], commit_variable: bool) -> None:
-    names = [_basename(word) for word in words[_payload_command_index(words):]]
-    if not names:
-        return
-    if POSITIONAL_RE.search(words[_payload_command_index(words)]):
-        raise UnreadableCommit(DYNAMIC_PROGRAM)
-    if is_dynamic(names[0]) and ("commit" in names or commit_variable):
-        raise UnreadableCommit(DYNAMIC_PROGRAM)
-    programs = [index for index, name in enumerate(names) if name == "git" or is_dynamic(name)]
-    if names[0] in COMMAND_RUNNERS and programs and "commit" in names[programs[0]:]:
-        raise UnreadableCommit(HIDDEN_COMMIT)

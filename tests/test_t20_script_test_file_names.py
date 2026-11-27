@@ -1,10 +1,11 @@
 import unittest
 
-from t20_layer_home import BLOCK, DENY, LIBRARY_NEEDED, LIBRARY_READY, LOOP, NONE, LayerHome, Outcome
+from t20_layer_home import BLOCK, CITATION, DENY, LIBRARY_NEEDED, LIBRARY_READY, LOOP, NONE, LayerHome, Outcome
 
 
 BRACELESS_LOOP = "test(\"doubles\", () => {\n  for (const v of [1, 2]) expect(double(v)).toBe(v * 2);\n});\n"
-LOOP_DENIAL = Outcome(DENY, ((LOOP, BLOCK, 2),))
+CITED_BRACELESS_LOOP = CITATION + "\n" + BRACELESS_LOOP
+LOOP_DENIAL = Outcome(DENY, ((LOOP, BLOCK, 3),))
 NO_FINDING = Outcome(NONE, ())
 TEST_NAMED_FILES = (
     ("test_ts", "src/calc.test.ts"),
@@ -22,34 +23,43 @@ PLAIN_FILES = (
 )
 
 
-def outcome(case, relative, exact):
-    return LayerHome(case, exact=exact).outcome(relative, BRACELESS_LOOP)
+class LayerCases:
+    exact = True
+
+    @classmethod
+    def setUpClass(cls):
+        cls.home = LayerHome.open(cls, cls.exact)
+
+    def outcome(self, relative, content):
+        return self.home.outcome(self, relative, content)
 
 
 @unittest.skipUnless(LIBRARY_READY, LIBRARY_NEEDED)
-class TestNamedScriptFilesOutsideATestFolderReachTheLayer(unittest.TestCase):
-    pass
+class TestNamedScriptFilesOutsideATestFolderReachTheLayer(LayerCases, unittest.TestCase):
+    exact = True
 
 
 @unittest.skipUnless(LIBRARY_READY, LIBRARY_NEEDED)
-class PlainScriptFilesGetNoTestUnitsFromTheLayer(unittest.TestCase):
-    pass
+class PlainScriptFilesGetNoTestUnitsFromTheLayer(LayerCases, unittest.TestCase):
+    exact = True
 
 
-class BracelessLoopWithoutTheLibrary(unittest.TestCase):
+class BracelessLoopWithoutTheLibrary(LayerCases, unittest.TestCase):
+    exact = False
+
     def test_lexer_alone_misses_the_one_statement_loop_body(self):
-        self.assertEqual(outcome(self, "src/calc.test.ts", exact=False), NO_FINDING)
+        self.assertEqual(self.outcome("src/calc.test.ts", CITED_BRACELESS_LOOP), NO_FINDING)
 
 
 def denies_on_the_assertion_line(relative):
     def test(self):
-        self.assertEqual(outcome(self, relative, exact=True), LOOP_DENIAL)
+        self.assertEqual(self.outcome(relative, CITED_BRACELESS_LOOP), LOOP_DENIAL)
     return test
 
 
 def passes(relative):
     def test(self):
-        self.assertEqual(outcome(self, relative, exact=True), NO_FINDING)
+        self.assertEqual(self.outcome(relative, BRACELESS_LOOP), NO_FINDING)
     return test
 
 

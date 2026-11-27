@@ -1,16 +1,22 @@
-from quiet_git import disable_background_maintenance
-import json
+import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import NamedTuple
+from unittest import mock
 import unittest
 
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+sys.path.insert(0, str(PROJECT / "engine"))
 
-SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+from adw_light import run_hook
+from lib.git_port import FakeGitView
+
+
 LISTED_RULE_RE = re.compile(r"^\d+\. .*\((\w+)\)$", re.M)
+LISTED_ROW_RE = re.compile(r"^\d+\. \S+:(\d+) .*\((\w+)\)$", re.M)
 DENY = "deny"
 OBSERVE = "observe"
 NONE = "none"
@@ -165,9 +171,9 @@ CASES = (
     Case("c_real_reason_unless_with_a_named_subject_passes", "app.js", "// Safari caches 301s forever unless the URL changes\nconst row = 1;\n", NONE, ()),
     Case("c_real_reason_which_with_a_noun_lead_passes", "app.js", "// The server drops idle sockets, which breaks long polls\nconst row = 1;\n", NONE, ()),
     Case("c_real_reason_above_the_interval_it_explains_passes", "app.js", "// Probe runs every hour because the token expires\nsetInterval(probe, HOUR);\n", NONE, ()),
-    Case("qa_label_line_status_is_no_throat_clearing_opener", "notes.md", "Status: passed\n", DENY, ("prose_colon",)),
-    Case("qa_label_line_note_is_no_throat_clearing_opener", "notes.md", "Note: rerun after deploy\n", DENY, ("prose_colon",)),
-    Case("qa_numbered_label_line_is_no_throat_clearing_opener", "notes.md", "1. Build: passed\n", DENY, ("prose_colon",)),
+    Case("qa_label_line_status_is_no_throat_clearing_opener", "notes.md", "Status: passed\n", NONE, ()),
+    Case("qa_label_line_note_is_no_throat_clearing_opener", "notes.md", "Note: rerun after deploy\n", NONE, ()),
+    Case("qa_numbered_label_line_is_no_throat_clearing_opener", "notes.md", "1. Build: passed\n", NONE, ()),
     Case("qa_comma_aside_after_is_is_no_throat_clearing_opener", "notes.md", "The default is, by design, off.\n", NONE, ()),
     Case("qa_you_can_run_this_but_is_no_reader_frame", "notes.md", "You can run this, but the tests need git.\n", NONE, ()),
     Case("qa_rest_of_this_file_is_no_document_frame", "notes.md", "The rest of this file holds the tests.\n", NONE, ()),
@@ -227,21 +233,30 @@ def outcome_of(response):
 
 
 class RuleCharacterization(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         workspace = TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name)
-        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
-        disable_background_maintenance(self.root)
+        cls.addClassCleanup(workspace.cleanup)
+        cls.root = Path(workspace.name)
+        cls.git = FakeGitView({"roots": {}})
+        (cls.root / "home").mkdir()
+        environment = mock.patch.dict(os.environ, {"HOME": str(cls.root / "home")})
+        environment.start()
+        cls.addClassCleanup(environment.stop)
+
+    def write_response(self, path, content):
+        payload = {"cwd": str(self.root), "session_id": self._testMethodName, "hook_event_name": "PreToolUse",
+                   "tool_name": "Write", "tool_input": {"file_path": str(self.root / path), "content": content}}
+        return run_hook("PreToolUse", payload, state_dir=self.root / ".adw-state", git_view=self.git)
 
     def write_outcome(self, path, content):
-        payload = {"cwd": str(self.root), "session_id": "rule-characterization", "hook_event_name": "PreToolUse",
-                   "tool_name": "Write", "tool_input": {"file_path": str(self.root / path), "content": content}}
-        call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.root / ".adw-state")],
-            input=json.dumps(payload), text=True, capture_output=True, check=True,
-        )
-        return outcome_of(json.loads(call.stdout))
+        return outcome_of(self.write_response(path, content))
+
+    def test_preposition_to_off_passes_but_set_up_is_reported(self):
+        response = self.write_response("notes.md", "The flag moves from on to off.\n\nWe set up the job.\n")
+
+        notice = response.get("hookSpecificOutput", {}).get("additionalContext", "")
+        self.assertEqual([("3", "ste_phrasal_verb")], LISTED_ROW_RE.findall(notice))
 
 
 def characterization(case):

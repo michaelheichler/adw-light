@@ -28,6 +28,7 @@ SCRIPT_READERS = frozenset({"source", "."})
 SHELL_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O"})
 STDIN_PATHS = frozenset({"-", "/dev/stdin"})
 FD_PATH_RE = re.compile(r"/dev/fd/(\d+)")
+COMMIT_WORD_RE = re.compile(r"\bcommit\b", re.IGNORECASE)
 
 PLAIN_COMMIT = "Run git commit as its own plain command."
 PIPED_SHELL = f"This command pipes text that names commit into a shell, so the commit gate cannot read it. {PLAIN_COMMIT}"
@@ -37,7 +38,6 @@ MISSING_SCRIPT = (
     "This command runs a script that does not exist yet, after a step the commit gate cannot follow that may create it. "
     "Create the script in its own tool call, then run it."
 )
-DYNAMIC_SCRIPT = f"This command runs a script from a path the commit gate cannot resolve. {PLAIN_COMMIT}"
 STALE_SCRIPT = (
     "This command changes a script or its folder and then runs it in the same call, so the commit gate would read "
     "the old script. Change the script in its own tool call, then run it."
@@ -45,6 +45,16 @@ STALE_SCRIPT = (
 
 
 class UnreadableCommit(Exception):
+    def __init__(self, reason: str = "", cwd: Path | None = None):
+        super().__init__(reason)
+        self.cwd = cwd
+
+
+class InvalidCommitFolder(UnreadableCommit):
+    pass
+
+
+class RelocatedCommit(UnreadableCommit):
     pass
 
 
@@ -186,8 +196,11 @@ def _mentions_commit(feed: Command, cwd: Path) -> bool:
 def _script_file(word: str, read: _ScriptRead) -> str | None:
     scope = read.scope
     word = resolve_literal_directories(word, "\n".join([" ".join(read.command.words), scope.context]))
+    names_commit_word = any("commit" in part for part in read.command.words)
     if is_dynamic(word):
-        raise UnreadableCommit(DYNAMIC_SCRIPT)
+        if any(COMMIT_WORD_RE.search(part) for part in read.positional):
+            raise UnreadableCommit(NAMED_SCRIPT)
+        return None
     path = Path(normalized(scope.cwd, word))
     if any(str(candidate) in scope.touched for candidate in (path, *path.parents)):
         raise UnreadableCommit(STALE_SCRIPT)
@@ -199,7 +212,7 @@ def _script_file(word: str, read: _ScriptRead) -> str | None:
         raise UnreadableCommit(MISSING_SCRIPT)
     if not missing and not oversized(path):
         raise UnreadableCommit(UNREAD_SCRIPT)
-    if any("commit" in part for part in read.command.words) or names_commit(path):
+    if names_commit_word or names_commit(path):
         raise UnreadableCommit(NAMED_SCRIPT)
     return None
 

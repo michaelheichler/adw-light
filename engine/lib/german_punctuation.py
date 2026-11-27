@@ -12,7 +12,7 @@ except ImportError:
 DASH_CLUSTER_MIN_COUNT = 5
 DASH_CLUSTER_MIN_PER_1000_WORDS = 15.0
 
-ENGLISH_ONLY_RULES = frozenset({"prose_semicolon", "prose_colon"})
+ENGLISH_ONLY_RULES = frozenset({"prose_semicolon"})
 GEDANKENSTRICH_RE = re.compile("(?:^|(?<=\\s))\u2013(?=\\s|$)")
 BIS_STRICH_RE = re.compile("(?<=[\\w.])–(?=\\w)")
 GERMAN_QUOTED_RE = re.compile("\u201e[^\u201e\u201c\u201d\\n]*\u201c|\u201a[^\u201a\u2018\u2019\\n]*\u2018")

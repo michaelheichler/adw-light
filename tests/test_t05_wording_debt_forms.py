@@ -1,22 +1,31 @@
-from quiet_git import disable_background_maintenance
 import json
 import os
-import subprocess
 import sys
-import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
+import unittest
+
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+sys.path.insert(0, str(PROJECT / "engine"))
+
+from adw_light import run_hook
+from lib.git_port import FakeGitView
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+NO_REPOSITORY = FakeGitView({"roots": {}})
+
 LOCK = "wording_debt_lock"
-DENY = "deny"
+OBSERVED = "would_block"
+NOTED = (None, [(LOCK, 1)], [(LOCK, OBSERVED)])
 WRITER = "adw-test-writer"
 SESSION = "debt-forms"
 OLD_TEST = "tests/test_old.py"
 NEW_TEST = "tests/test_new.py"
 PRODUCTION = "src/app.py"
-NEW_BEHAVIOR = "def test_sum():\n    assert 1 + 1 == 2\n"
+CITATION = '    """A test must verify what the code does for its client, never how it does it."""\n'
+NEW_BEHAVIOR = "def test_sum():\n" + CITATION + "    assert 1 + 1 == 2\n"
 SENTENCE = " ".join(("the", "value", "is", "not", "allowed", "here"))
 LOG_SENTENCE = " ".join(("the", "job", "was", "skipped", "because", "the", "queue", "is", "empty"))
 TYPED_LOCATION = "/".join(("pkg", "mod.py")) + ":12"
@@ -39,62 +48,69 @@ TRANSFORMATION = module(
 )
 
 
+PROJECTS = {
+    "exception": EXCEPTION_MATCH, "log": LOG_ASSERTION, "location": LOCATION_ASSERTION,
+    "derived": TRANSFORMATION, "production": TRANSFORMATION,
+}
+
+
 class WordingDebtForms(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         workspace = TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name).resolve()
-        self.state = self.root / "state"
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self.repo = self.root / "repo"
-        (self.repo / "tests").mkdir(parents=True)
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
-        disable_background_maintenance(str(self.repo))
+        cls.addClassCleanup(workspace.cleanup)
+        cls.root = Path(workspace.name).resolve()
+        cls.state = cls.root / "state"
+        (cls.root / "home").mkdir()
+        for name, old_test in PROJECTS.items():
+            (cls.root / name / ".git").mkdir(parents=True)
+            (cls.root / name / "tests").mkdir()
+            (cls.root / name / OLD_TEST).write_text(old_test, encoding="utf-8")
+        (cls.root / "production" / "src").mkdir()
+        (cls.root / "production" / PRODUCTION).write_text(f"TITLE = {json.dumps(TITLED)}\n", encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"HOME": str(cls.root / "home")})
+        environment.start()
+        cls.addClassCleanup(environment.stop)
 
-    def place(self, relative, text):
-        target = self.repo / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+    def reports(self):
+        return set((self.state / "reports").glob("*.json"))
 
-    def rows(self):
-        reports = (self.state / "reports").glob("*.json")
-        return [row for report in reports for row in json.loads(report.read_text(encoding="utf-8"))]
+    def ledger(self):
+        path = self.state / "ledger" / "ledger.jsonl"
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
-    def hook(self, event, payload):
-        call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), event, "--host", "claude", "--state-dir", str(self.state)],
-            input=json.dumps({"session_id": SESSION, "hook_event_name": event, "cwd": str(self.repo), **payload}),
-            text=True, capture_output=True, check=True,
-            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
-        )
-        return json.loads(call.stdout)
+    def hook(self, repo, event, payload):
+        body = {"session_id": self._testMethodName, "hook_event_name": event, "cwd": str(repo), **payload}
+        return run_hook(event, body, state_dir=self.state, git_view=NO_REPOSITORY)
 
-    def new_test_verdict(self, old_test):
-        self.place(OLD_TEST, old_test)
-        self.hook("SessionStart", {"source": "startup"})
-        tool_input = {"file_path": str(self.repo / NEW_TEST), "content": NEW_BEHAVIOR}
-        output = self.hook("PreToolUse", {
+    def new_test_verdict(self, name):
+        repo = self.root / name
+        self.hook(repo, "SessionStart", {"source": "startup"})
+        tool_input = {"file_path": str(repo / NEW_TEST), "content": NEW_BEHAVIOR}
+        earlier = self.reports()
+        written = len(self.ledger())
+        output = self.hook(repo, "PreToolUse", {
             "tool_name": "Write", "tool_input": tool_input, "agent_id": "a1", "agent_type": WRITER,
         })
+        rows = [row for report in self.reports() - earlier for row in json.loads(report.read_text(encoding="utf-8"))]
         decision = output.get("hookSpecificOutput", {}).get("permissionDecision")
-        return decision, [(row["rule"], row["line"]) for row in self.rows() if row["rule"] == LOCK]
+        noted = [(row["rule"], row["outcome"]) for row in map(json.loads, self.ledger()[written:]) if row.get("rule") == LOCK]
+        return decision, [(row["rule"], row["line"]) for row in rows if row["rule"] == LOCK], noted
 
-    def test_exception_match_on_a_sentence_locks_new_tests(self):
-        self.assertEqual(self.new_test_verdict(EXCEPTION_MATCH), (DENY, [(LOCK, 1)]))
+    def test_exception_match_on_a_sentence_is_noted_without_blocking_a_new_test(self):
+        self.assertEqual(self.new_test_verdict("exception"), NOTED)
 
-    def test_log_sentence_assertion_locks_new_tests(self):
-        self.assertEqual(self.new_test_verdict(LOG_ASSERTION), (DENY, [(LOCK, 1)]))
+    def test_log_sentence_assertion_is_noted_without_blocking_a_new_test(self):
+        self.assertEqual(self.new_test_verdict("log"), NOTED)
 
-    def test_typed_out_location_assertion_locks_new_tests(self):
-        self.assertEqual(self.new_test_verdict(LOCATION_ASSERTION), (DENY, [(LOCK, 1)]))
+    def test_typed_out_location_assertion_is_noted_without_blocking_a_new_test(self):
+        self.assertEqual(self.new_test_verdict("location"), NOTED)
 
-    def test_text_function_test_with_derived_expected_text_does_not_lock(self):
-        self.assertEqual(self.new_test_verdict(TRANSFORMATION), (None, []))
+    def test_text_function_test_with_derived_expected_text_is_not_debt(self):
+        self.assertEqual(self.new_test_verdict("derived"), (None, [], []))
 
-    def test_text_function_test_whose_expected_text_sits_in_production_code_locks(self):
-        self.place(PRODUCTION, f"TITLE = {json.dumps(TITLED)}\n")
-        self.assertEqual(self.new_test_verdict(TRANSFORMATION), (DENY, [(LOCK, 1)]))
+    def test_text_function_test_whose_expected_text_sits_in_production_code_is_noted(self):
+        self.assertEqual(self.new_test_verdict("production"), NOTED)
 
 
 if __name__ == "__main__":

@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import NamedTuple
 
 try:
+    from .catalog_phrases import PHRASES
     from . import config, german_rules
 except ImportError:
+    from catalog_phrases import PHRASES
     import config
     import german_rules
 
@@ -16,6 +18,10 @@ class Entry(NamedTuple):
 
 
 RULES: dict[str, Entry] = {
+    "after_run_deferred": Entry(
+        "Commit scan incomplete",
+        "The commit scan could not finish and must run again at Stop",
+    ),
     "ai_closer": Entry(
         "Wrap-up flourish",
         "Cuts the closing gesture that restates the point instead of ending",
@@ -24,42 +30,7 @@ RULES: dict[str, Entry] = {
         "Assertion inside a loop",
         "Flags a test loop whose first failing case hides the rest",
     ),
-    "banned_adverb": Entry(
-        "Empty intensifiers",
-        "Cuts really, just, literally, simply, actually, and similar intensifiers when they add no meaning",
-    ),
-    "binary_contrast": Entry(
-        "Not X but Y framing",
-        "Cuts the false either-or that sounds decisive and says little",
-    ),
-    "business_jargon": Entry(
-        "Corporate vocabulary",
-        "Cuts navigate the, unpack the, lean into, and the X landscape",
-    ),
-    "choppy_sentences": Entry(
-        "Telegram-style sentences",
-        "Flags a run of short main clauses that a comma, because, which, or and would join",
-    ),
-    "corporate_idiom": Entry(
-        "Office idiom",
-        "Cuts stock office phrasing that carries no specific claim",
-    ),
-    "dash_cluster": Entry(
-        "Pile of German dashes",
-        "Reports German prose that leans on the spaced Gedankenstrich past the density limit",
-    ),
-    "de_repeated_connector": Entry(
-        "Repeated German connector",
-        "Flags a paragraph opening more than one sentence on the same connector",
-    ),
-    "de_parataxis": Entry(
-        "German telegram style",
-        "Flags a run of short German main clauses that a comma, weil, die, or und would join",
-    ),
-    "de_uniform_paragraphs": Entry(
-        "Uniform German paragraph length",
-        "Flags German paragraphs that all run close to the same length",
-    ),
+    **{key: Entry(*value) for key, value in PHRASES.items()},
     "de_uniform_rhythm": Entry(
         "Uniform German sentence rhythm",
         "Flags German sentences whose lengths barely vary across the document",
@@ -248,65 +219,21 @@ RULES: dict[str, Entry] = {
         "Marker density too high",
         "Reports prose where weighted generated-text markers cluster past the threshold",
     ),
-    "cap_override": Entry(
-        "Discipline cap overridden",
-        "Raises a cap or escape on the command line instead of fixing the code shape",
-    ),
-    "commit_gate_bypass": Entry(
-        "Commit skips the gate",
-        "Drops the pre-commit gate through a no-verify flag",
-    ),
     "config_seal": Entry(
-        "Config edit routes around a gate",
-        "Edits policy to disable a rule that no project config may weaken",
-    ),
-    "decode_pipe_write": Entry(
-        "Decode pipe writes a file",
-        "Pipes decoded content into a file, which hides the body from the scanner",
+        "Project config is sealed",
+        "Blocks creating a governing config or editing its enforcement settings",
     ),
     "docstring_narration": Entry(
         "Docstring narrates the code",
         "States what the code does rather than why it exists",
     ),
-    "dynamic_heredoc_write": Entry(
-        "Dynamic heredoc writes a file",
-        "Aims an expanded or unterminated heredoc at a file the scanner cannot read",
-    ),
-    "dynamic_write_target": Entry(
-        "Write destination unknown before the run",
-        "Writes to a path that a variable, substitution, glob, or unknown folder decides only at run time",
-    ),
     "file_too_long": Entry(
         "File past the hard limit",
         "Grows a file beyond the length the policy allows",
     ),
-    "inline_interpreter_write": Entry(
-        "Inline interpreter can write",
-        "Hands python, node, or a peer a payload that can write or cannot be read",
-    ),
-    "inplace_edit_write": Entry(
-        "In-place editor rewrites a file",
-        "Rewrites through sed -i, awk -i, or a peer, which skips the scanner",
-    ),
-    "install_without_sandbox_home": Entry(
-        "Installer aimed at the real HOME",
-        "Runs an installer or merge script against the live home directory",
-    ),
-    "interpreter_heredoc_write": Entry(
-        "Heredoc feeds an interpreter",
-        "Feeds interpreter stdin a body that can write or that nothing can read",
-    ),
-    "opaque_source_write": Entry(
-        "Unscannable write source",
-        "Copies from a source the scanner cannot read, such as process substitution",
-    ),
     "prose_comment_block": Entry(
         "Comment block reads as prose",
         "Carries paragraphs of narration where the code should speak",
-    ),
-    "shell_payload_block": Entry(
-        "Shell payload unreadable",
-        "Nests a shell -c payload past one level or hides it behind a variable",
     ),
     "state_deletion": Entry(
         "Watcher state deleted",
@@ -325,8 +252,12 @@ RULES: dict[str, Entry] = {
         "Changes a test while the project policy reserves tests for the test writer agent",
     ),
     "wording_debt_lock": Entry(
-        "Test write locked by wording debt",
-        "Blocks a test write that does not lower the count of wording tests while the project still carries them",
+        "Existing wording tests",
+        "Reports existing wording tests without blocking test changes",
+    ),
+    "wording_test_gap": Entry(
+        "Test file the gate could not scan",
+        "Reports a test file the gate could not parse and leaves it out of the wording test count",
     ),
     "test_writer_definition": Entry(
         "Test writer definition edited",
@@ -379,12 +310,19 @@ RULES: dict[str, Entry] = {
     ),
     "hard_coded_path": Entry(
         "Hard-coded machine path",
-        "Blocks code or tests that name an absolute path, a home path, a drive letter, or a local username, because they fail on every other machine",
+        "Flags a literal home path, a drive letter, or a local username",
+    ),
+    "hard_coded_system_path": Entry(
+        "Hard-coded system path",
+        "Notes a literal system or temporary path that may differ between machines",
     ),
     "wording_assertion": Entry(
         "Test checks wording",
         "Blocks a test whose expected value is a prose sentence, because a text edit turns it red while the code still works",
     ),
+    "test_principle_citation": Entry("Missing test principle", "Requires a verified quote from the unit testing skill on each changed test"),
+    "test_builds_repo": Entry("Test builds a repository", "Blocks test code that creates or changes a Git repository"),
+    "test_builds_tree": Entry("Setup writes a temporary tree", "Reports per-test setup that writes files into a temporary directory"),
     "snapshot_assertion": Entry(
         "Test compares against a stored copy",
         "Reports a test that checks output against a snapshot or golden file, without blocking the write",
@@ -419,7 +357,7 @@ UNGATED_RULES: dict[str, Entry] = {
     "dash_break": Entry("Double hyphen as a dash", "Blocks a double hyphen used as a clause break"),
     "spaced_hyphen": Entry("Spaced hyphen as a dash", "Blocks a hyphen with spaces standing in for a dash"),
     "prose_semicolon": Entry("Semicolon in prose", "Blocks a semicolon joining two clauses"),
-    "prose_colon": Entry("Colon inside a sentence", "Blocks a colon in the middle of a prose sentence"),
+    "prose_colon": Entry("Colon inside a sentence", "Allows sentence colons in Markdown documents and blocks other text above the configured count"),
     "pronoun_apostrophe": Entry("Apostrophe on a pronoun", "Blocks an apostrophe on a possessive pronoun"),
     "decade_apostrophe": Entry("Apostrophe on a decade", "Blocks a decade written as a possessive"),
     "dead_metaphor": Entry("Worn-out metaphor", "Cuts a stock image that names nothing concrete"),

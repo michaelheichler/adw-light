@@ -4,20 +4,25 @@ import os
 import re
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
 from lib.baseline import split_against
-from lib.commit_command import UnreadableCommit, git_calls
-from lib.commit_index_source import takes_content_outside_index
+from lib.commit_command import GitCall, UnreadableCommit, bash_command, git_calls
+from lib import payloads, shell_snapshot
+from lib.commit_index_source import INDEX_WRITERS, commit_blobs, commit_reads_worktree, index_blobs, staged_additions
+from lib.commit_inputs import InvalidCommitFolder, RelocatedCommit, is_dynamic
 from lib.config import SURFACE_COMMIT, StorageRoots, effective_config
 from lib.fixture_prose import index_scan_config
+from lib.git_port import view
 from lib.hookio import (
     PARSE_FAILURE, advise, allow, claude_pretool_response, deny, fail_closed, read_payload, write_payload,
 )
 from lib.merge_state import incoming_commits, revision_text, session_started
 from lib.regular_file import read_regular_text
+from lib.payloads import cwd
 from lib.path_policy import anchored
 from lib.reporting import inherited_advice, record_findings, run_with_ledger, verdict_message
 from lib.scan_input import is_binary_content
@@ -37,9 +42,7 @@ STAGE_SEPARATELY = (
     "The commit gate scans the index before this command runs, so it cannot judge content the same command stages "
     "or reads from the worktree. Stage in its own tool call, then commit without paths, -a, -i, -o, or -p."
 )
-
-NOT_A_REPOSITORY_EXIT_CODE = 128
-
+UNREAD_INDEX = "The commit gate could not read the index of {repo}, which lies outside the project the after-run check covers."
 
 @dataclass(frozen=True, slots=True)
 class _CommitRunContext:
@@ -59,7 +62,7 @@ def run(
         config=config,
         roots=StorageRoots(state=state_root, ledger=ledger_root),
     )
-    return fail_closed("commit", lambda: _checked_run(context))
+    return fail_closed("commit", lambda: _checked_run(context), cwd(payload))
 
 
 def _checked_run(context: _CommitRunContext) -> dict:
@@ -80,24 +83,45 @@ def _run(context: _CommitRunContext) -> dict:
 
 def _index_checked_gate(context: _CommitRunContext, turn_id: str) -> dict:
     try:
-        calls = git_calls(_bash_command(context.payload), _payload_cwd(context.payload))
-    except UnreadableCommit as exc:
+        calls = git_calls(bash_command(context.payload), _payload_cwd(context.payload))
+    except (InvalidCommitFolder, RelocatedCommit) as exc:
         return deny(f"{COMMIT_REFUSED}{exc}")
-    if takes_content_outside_index(calls):
-        return deny(STAGE_SEPARATELY)
-    commit_cwds = [call.cwd for call in calls if call.verb == "commit"]
-    return _gate(context, turn_id, commit_cwds) if commit_cwds else allow()
+    except UnreadableCommit as exc:
+        if exc.cwd is None or _covered(context.payload, _repo_root(exc.cwd) or exc.cwd):
+            return allow()
+        return deny(f"{COMMIT_REFUSED}{exc}")
+    return _gate(context, turn_id, calls) if any(call.verb == "commit" for call in calls) else allow()
 
 
-def _gate(context: _CommitRunContext, turn_id: str, commit_cwds: list[Path]) -> dict:
+def _covered(payload: dict, repo: Path, *, named: bool = False) -> bool:
+    if not payloads.session_id(payload) or not payloads.tool_use_id(payload):
+        return False
+    if named:
+        return True
+    location = shell_snapshot.project_location(_payload_cwd(payload).resolve())
+    return location is not None and Path(repo).resolve().is_relative_to(location[0])
+
+
+def _gate(context: _CommitRunContext, turn_id: str, commit_cwds: list[GitCall]) -> dict:
     started = time.monotonic()
     cwd = _payload_cwd(context.payload)
-    repo_rows = _repo_findings_by_repo(commit_cwds, context.config, _session_start(context))
     outer_cfg = effective_config(context.config, cwd)
+    messages, covered = {}, {}
+    for i, call in enumerate(commit_cwds):
+        if call.verb != "commit":
+            continue
+        covered[i] = call.new_folder or _covered(context.payload, call.repo() or call.cwd, named=call.parent_repo is not None)
+        try:
+            messages[i] = _call_message(call)
+        except UnreadableCommit as exc:
+            if not covered[i]:
+                return deny(f"{COMMIT_REFUSED}{exc}")
+            messages[i] = None
     try:
-        message_findings = _message_findings(_bash_command(context.payload), outer_cfg, cwd)
+        repo_rows, receipts = _repo_findings_by_repo(commit_cwds, context.config, _session_start(context), messages, covered)
     except UnreadableCommit as exc:
         return deny(f"{COMMIT_REFUSED}{exc}")
+    message_findings = [row for text in messages.values() for row in _scan_message(text, outer_cfg)]
     stamp = _RecordStamp(
         session_id=str(context.payload.get("session_id") or ""),
         tool_use_id=str(context.payload.get("tool_use_id") or ""),
@@ -110,6 +134,10 @@ def _gate(context: _CommitRunContext, turn_id: str, commit_cwds: list[Path]) -> 
     kind, message = verdict_message(decisions, outer_cfg) if decisions else ("release", "")
     if kind == "block":
         return deny(message)
+    if receipts:
+        from lib.after_commit import record_receipt
+        for repo, parent, text, blobs in receipts:
+            record_receipt(context.payload, context.roots.state, repo, parent, text, blobs)
     notice = _inherited_notice(scan)
     if kind == "observe":
         return advise("\n".join(part for part in (message, notice) if part), "PreToolUse")
@@ -167,30 +195,80 @@ def _session_start(context: _CommitRunContext) -> float | None:
     return session_started(session_id, context.roots.state) if session_id else None
 
 
-def _repo_findings_by_repo(commit_cwds: list[Path], config: dict | None, started_at: float | None) -> list[_RepoScan]:
-    rows: list[_RepoScan] = []
-    seen: set[Path] = set()
-    for commit_cwd in commit_cwds:
-        repo = _repo_root(commit_cwd)
-        if repo is None or repo in seen:
+def _commit_content(repo: Path, call: GitCall, previous: list[GitCall], covered: bool) -> dict[str, bytes] | None:
+    try:
+        with _scan_index(call.index_file):
+            if not call.index_only:
+                added = staged_additions(repo, call, previous, STAGE_SEPARATELY)
+                return dict(commit_blobs(repo, call, STAGE_SEPARATELY, added))
+    except (UnreadableCommit, OSError, subprocess.SubprocessError):
+        pass
+    if not covered and (call.index_only or commit_reads_worktree(call.args)
+                        or any(earlier.verb in INDEX_WRITERS for earlier in previous)):
+        raise UnreadableCommit(STAGE_SEPARATELY)
+    try:
+        with _scan_index(call.index_file):
+            return dict(index_blobs(repo, call, STAGE_SEPARATELY))
+    except (UnreadableCommit, OSError, subprocess.SubprocessError) as exc:
+        if covered:
+            return None
+        raise UnreadableCommit(UNREAD_INDEX.format(repo=repo)) from exc
+
+
+def _repo_findings_by_repo(calls: list[GitCall], config: dict | None, started_at: float | None, messages: dict, covered: dict):
+    rows, receipts = [], []
+    seen = set()
+    for i, call in enumerate(calls):
+        if call.verb != "commit" or call.new_folder or (repo := call.repo()) is None:
             continue
-        seen.add(repo)
         cfg = effective_config(config, repo)
-        rows.append(_RepoScan(cfg, *_repo_findings(repo, cfg, started_at)))
-    return rows
+        blobs = _commit_content(repo, call, calls[:i], covered[i])
+        if blobs is None:
+            continue
+        amended = "--amend" in call.args
+        parents = view().commit_parents(repo, "HEAD") if amended else ["HEAD"]
+        if parents is None and not covered[i]:
+            raise UnreadableCommit(UNREAD_INDEX.format(repo=repo))
+        if parents is None:
+            continue
+        base = parents[:1]
+        key = (repo, tuple(base), frozenset(blobs.items()))
+        if key not in seen:
+            rows.append(_RepoScan(cfg, *_repo_findings(repo, cfg, started_at, blobs, base)))
+            seen.add(key)
+        text = messages[i]
+        parent = view().resolve_commit(repo, "HEAD")
+        if text is not None and parent and not amended and len(messages) == 1:
+            receipts.append((repo, parent, text + ("\n" if text and not text.endswith("\n") else ""), blobs))
+    return rows, receipts
 
 
-def _repo_findings(repo: Path, cfg: dict, started_at: float | None) -> tuple[list[dict], list[dict]]:
+@contextmanager
+def _scan_index(path: Path | None):
+    if path is None:
+        yield
+        return
+    previous = os.environ.get("GIT_INDEX_FILE")
+    os.environ["GIT_INDEX_FILE"] = os.fspath(path)
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ["GIT_INDEX_FILE"]
+        else:
+            os.environ["GIT_INDEX_FILE"] = previous
+
+
+def _repo_findings(repo: Path, cfg: dict, started_at: float | None, blobs: dict[str, bytes], base: list[str]) -> tuple[list[dict], list[dict]]:
     incoming = incoming_commits(repo, started_at)
     findings: list[dict] = []
     inherited: list[dict] = []
-    for path in _staged(repo):
-        raw = _staged_bytes(repo, path)
+    for path, raw in blobs.items():
         if is_binary_content(path, raw):
             continue
         text = raw.decode("utf-8", errors="replace")
         scanned = file_length_findings(path, text) if scannable_text(text, cfg) is None else scan_all(path, text, index_scan_config(cfg, path, repo))
-        previous = [revision_text(repo, revision, path) for revision in ("HEAD", *incoming)]
+        previous = [revision_text(repo, revision, path) for revision in (*base, *incoming)]
         owned, carried = split_against(previous, path, scanned, cfg, text)
         findings.extend({**finding, "path": path} for finding in owned)
         if incoming:
@@ -198,14 +276,13 @@ def _repo_findings(repo: Path, cfg: dict, started_at: float | None) -> tuple[lis
     return findings, inherited
 
 
-def _message_findings(command: str | list[str], cfg: dict, cwd: Path | None = None) -> list[dict]:
-    text = "\n\n".join(_commit_messages(command, cwd))
+def _scan_message(text: str | None, cfg: dict) -> list[dict]:
     if not text:
         return []
     return [
         {**finding, "path": COMMIT_MESSAGE_PATH, "surface": SURFACE_COMMIT}
         for finding in scan_all(
-            COMMIT_MESSAGE_PATH, text, cfg, hidden_ranges=_commit_metadata_ranges(text)
+            COMMIT_MESSAGE_PATH, text, cfg, document=False, hidden_ranges=_commit_metadata_ranges(text)
         )
     ]
 
@@ -241,9 +318,13 @@ def _trailer_metadata_ranges(text: str) -> tuple[tuple[int, int], ...]:
     return tuple(ranges)
 
 
-def _commit_messages(command: str | list[str], cwd: Path | None = None) -> list[str]:
-    calls = git_calls(command, cwd or Path.cwd())
-    return [value for call in calls if call.verb == "commit" for value in _message_values(call.args, call.cwd, call.stdin)]
+def _call_message(call: GitCall) -> str | None:
+    values = _message_values(call.args, call.cwd, call.stdin, literal_only=call.new_folder)
+    if values:
+        return "\n\n".join(values)
+    if not call.new_folder and "--amend" in call.args:
+        return view().commit_message(call.parent_repo or call.cwd, "HEAD")
+    return None
 
 
 def _file_message(value: str, cwd: Path | None, stdin: str | None) -> str:
@@ -257,6 +338,8 @@ def _file_message(value: str, cwd: Path | None, stdin: str | None) -> str:
     literal = base / name
     if literal != path and literal.exists():
         raise UnreadableCommit("commit message path has both literal and expanded home targets; use an absolute path")
+    if not base.is_dir():
+        path = path.parent.resolve() / path.name
     try:
         return read_regular_text(path)
     except (OSError, UnicodeDecodeError) as exc:
@@ -279,10 +362,15 @@ def _message_file_at(tokens: list[str], cursor: int) -> tuple[str | None, int]:
     return None, cursor + 1
 
 
-def _message_value_at(tokens: list[str], cursor: int, cwd: Path | None = None, stdin: str | None = None) -> tuple[str | None, int]:
+def _message_value_at(tokens: list[str], cursor: int, cwd: Path | None = None, stdin: str | None = None, *,
+                      literal_only: bool = False) -> tuple[str | None, int]:
     token = tokens[cursor]
     file_name, next_cursor = _message_file_at(tokens, cursor)
     if file_name is not None:
+        if literal_only:
+            return None, next_cursor
+        if is_dynamic(file_name):
+            raise UnreadableCommit("Unresolved commit message file.")
         return _file_message(file_name, cwd, stdin), next_cursor
     if token in {"-m", "--message"} or _is_message_bundle(token):
         next_cursor = cursor + 2
@@ -292,24 +380,34 @@ def _message_value_at(tokens: list[str], cursor: int, cwd: Path | None = None, s
     name, separator, inline = token.partition("=")
     if separator and name == "--message":
         return decode_ansi_c_value(inline), cursor + 1
-    if token.startswith("-m") and len(token) > 2:
-        return decode_ansi_c_value(token[2:]), cursor + 1
+    flags, marker, value = token[1:].partition("m")
+    if token.startswith("-") and marker and value and all(flag in _BOOLEAN_BUNDLE_CHARS for flag in flags):
+        return decode_ansi_c_value(value), cursor + 1
     return None, cursor + 1
 
 
-def _message_values(tokens: list[str], cwd: Path | None = None, stdin: str | None = None) -> list[str]:
+def _message_values(tokens: list[str], cwd: Path | None = None, stdin: str | None = None, *,
+                    literal_only: bool = False) -> list[str]:
     values: list[str] = []
     cursor = 0
     while cursor < len(tokens):
         if tokens[cursor] == "--":
             break
-        value, cursor = _message_value_at(tokens, cursor, cwd, stdin)
+        if tokens[cursor] in {"--author", "--date", "--cleanup"}:
+            cursor += 2
+            continue
+        previous = cursor
+        value, cursor = _message_value_at(tokens, cursor, cwd, stdin, literal_only=literal_only)
         if value is not None:
+            if is_dynamic(value) and not _message_file_at(tokens, previous)[0]:
+                if literal_only:
+                    continue
+                raise UnreadableCommit("Unresolved commit message.")
             values.append(value)
     return values
 
 
-_BOOLEAN_BUNDLE_CHARS = frozenset("anqvoes")
+_BOOLEAN_BUNDLE_CHARS = frozenset("ainqvoes")
 
 
 def _is_message_bundle(token: str) -> bool:
@@ -320,54 +418,12 @@ def _is_message_bundle(token: str) -> bool:
     return all(char in _BOOLEAN_BUNDLE_CHARS for char in token[1:-1])
 
 
-def _bash_command(payload: dict) -> str | list[str]:
-    tool_input = payload.get("tool_input") or payload.get("toolInput") or payload.get("input") or {}
-    for key in ("command", "cmd", "input"):
-        if key in tool_input:
-            command = tool_input[key]
-            return list(command) if isinstance(command, list) else str(command)
-    return ""
-
-
 def _payload_cwd(payload: dict) -> Path:
     return Path(payload.get("cwd") or os.getcwd())
 
 
-NOT_A_GIT_REPOSITORY_MESSAGE = "not a git repository"
-
-
-def _run_git(args: list[str], cwd: Path, errors: str) -> subprocess.CompletedProcess | None:
-    try:
-        return subprocess.run(
-            ["git", *args], cwd=cwd, text=True, capture_output=True, check=True, timeout=30, errors=errors,
-        )
-    except subprocess.CalledProcessError as exc:
-        if exc.returncode == NOT_A_REPOSITORY_EXIT_CODE and NOT_A_GIT_REPOSITORY_MESSAGE in (exc.stderr or "").lower():
-            return None
-        raise
-
-
 def _repo_root(cwd: Path) -> Path | None:
-    result = _run_git(["rev-parse", "--show-toplevel"], cwd, "strict")
-    if result is None:
-        return None
-    root = result.stdout.strip()
-    return Path(root) if root else None
-
-
-def _staged(cwd: Path) -> list[str]:
-    result = _run_git(["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"], cwd, "strict")
-    if result is None:
-        return []
-    return [path for path in result.stdout.split("\0") if path]
-
-
-def _staged_bytes(repo: Path, path: str) -> bytes:
-    result = subprocess.run(
-        ["git", "show", ":" + path], cwd=repo,
-        capture_output=True, check=True, timeout=30,
-    )
-    return result.stdout
+    return view().toplevel(cwd, strict=True)
 
 
 if __name__ == "__main__":

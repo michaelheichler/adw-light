@@ -4,9 +4,9 @@ import json
 import os
 import re
 import shlex
-import subprocess
 from pathlib import Path
 
+from lib import git_port
 from lib.comment_rules import scan_comment_contract
 from lib.regular_file import open_regular
 from lib.shell_lines import command_lines
@@ -60,7 +60,6 @@ INLINE_CODE_RE = re.compile(
 )
 DIRECTORY_CHANGE_RE = re.compile(r"(?<![\w./-])(?:cd|pushd|popd)(?![\w.-])")
 MODULE_FLAG = "-m"
-GIT_SECONDS = 5
 
 
 def captured_outputs(command: str, base: Path) -> list[str]:
@@ -194,18 +193,10 @@ def _runs_pristine_script(args: list[str], base: Path) -> bool:
 def _pristine(path: Path, base: Path) -> bool:
     if not path.is_file():
         return False
-    try:
-        tracked = subprocess.run(
-            ["git", "-C", str(base), "ls-files", "--error-unmatch", "--", str(path)],
-            capture_output=True, timeout=GIT_SECONDS, check=False,
-        )
-        changed = subprocess.run(
-            ["git", "-C", str(base), "diff", "--quiet", "HEAD", "--", str(path)],
-            capture_output=True, timeout=GIT_SECONDS, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return tracked.returncode == 0 and changed.returncode == 0
+    git_view = git_port.view()
+    tracked = git_view.is_tracked(base, str(path))
+    unchanged = git_view.is_unchanged(base, str(path))
+    return tracked and unchanged
 
 
 def _is_passthrough(segment: list[str], base: Path) -> bool:

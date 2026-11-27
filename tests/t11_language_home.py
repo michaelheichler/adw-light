@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+NO_REPOSITORY_VIEW = Path(__file__).resolve().parent / "fixtures" / "no_repository_view.json"
 PACK = "tree_sitter_language_pack"
 BUNDLE = "tree-sitter-language-pack"
 SITE = Path("lib") / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
@@ -19,6 +20,7 @@ LIBRARY_READY = (VENV / SITE / PACK).is_dir() and (GRAMMARS / BUNDLE).is_dir()
 BUNDLE_READY = LIBRARY_READY and any((GRAMMARS / BUNDLE).glob("v*/bundles/*"))
 BUNDLE_NEEDED = "needs a grammar cache that holds the downloaded parser bundle (ADW_TEST_GRAMMAR_CACHE)"
 GRAMMAR_WAIT_SECONDS = 30
+FETCH_WAIT_SECONDS = 0.1
 LIBRARY_NEEDED = "needs the pinned tree-sitter venv and a filled grammar cache (ADW_TEST_LANGUAGE_VENV, ADW_TEST_GRAMMAR_CACHE)"
 DENY = "deny"
 COMMENT_RULES = ("narration_comment", "what_comment")
@@ -29,8 +31,9 @@ NESTED_TEMPLATE = "const help = `${'`'}\n" + LINE + "\n`;\n"
 
 
 class HookHome:
-    def __init__(self, case):
+    def __init__(self, case, fetch_seconds=FETCH_WAIT_SECONDS):
         self.case = case
+        self.fetch_seconds = fetch_seconds
         workspace = TemporaryDirectory()
         case.addCleanup(workspace.cleanup)
         self.root = Path(workspace.name)
@@ -38,6 +41,7 @@ class HookHome:
         self.state = self.root / "state"
         self.home = self.root / "home"
         self.repo.mkdir()
+        (self.repo / "pyproject.toml").write_text("[project]\nname = \"fixture\"\n", encoding="utf-8")
         self.adw = self.home / ".adw-lite"
         (self.adw / "install").mkdir(parents=True)
         (self.adw / "cache").mkdir(parents=True)
@@ -112,9 +116,9 @@ class HookHome:
         if agent:
             payload["agent_type"] = agent
         return subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state)],
+            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state), "--git-view", str(NO_REPOSITORY_VIEW)],
             input=json.dumps(payload), text=True, capture_output=True, timeout=120,
-            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
+            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", ""), "ADW_FETCH_SECONDS": str(self.fetch_seconds)},
         )
 
     def verdict(self, relative, content, agent=None):

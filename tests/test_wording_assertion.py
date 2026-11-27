@@ -1,21 +1,28 @@
-from quiet_git import disable_background_maintenance
 import json
 import os
-import shutil
 import stat
 import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 import unittest
 
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+sys.path.insert(0, str(PROJECT / "engine"))
 
-SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+from adw_light import run_hook
+from lib.git_port import FakeGitView
+
+
+NO_REPOSITORY = FakeGitView({"roots": {}})
+
 RULE = "wording_assertion"
 DENY = "deny"
 AGENT = "adw-test-writer"
 TEST_FILE = "tests/test_probe.py"
-BODY_START = 8
+BODY_START = 9
 SENTENCE = " ".join(("the", "cache", "is", "empty"))
 VERSIONED = " ".join(("Requires", "Python", "3.11", "or", "later"))
 SOURCE_LINE = 3
@@ -27,7 +34,8 @@ ALLOWED_SHAPES = (
     "a = b", "x == y or z", "a b", "SELECT name FROM users", "SELECT * FROM users",
     "--help for more", "run with -v for more",
 )
-HEADER = ("import re", "import unittest", "", "", "class Probe(unittest.TestCase):", "", "    def test_probe(self):")
+HEADER = ("import re", "import unittest", "", "", "class Probe(unittest.TestCase):", "", "    def test_probe(self):",
+          '        """A test must verify what the code does for its client, never how it does it."""')
 SHOUTED = " ".join(("THE", "FILE", "IS", "NOT", "IN", "THE", "CACHE"))
 SHOUTED_COMMAND = " ".join(("DELETE", "THE", "OLD", "FILE", "NOW"))
 SHOUTED_CLAUSE = " ".join(("THE", "ROW", "FROM", "THE", "TABLE"))
@@ -38,6 +46,17 @@ AMPERSAND_SENTENCE = " ".join(("Save", "&", "exit", "to", "continue"))
 AND_OPERATOR = " ".join(("Save", "&&", "exit", "to", "continue"))
 FILLER_DIR = "aaa"
 FILLER_FILES = 25
+PLAIN = "plain"
+APP_PROJECT = "app_source"
+SHELL_PROJECT = "shell_source"
+OTHER_TEST_PROJECT = "other_test"
+EDITED_PROJECT = "edited_source"
+UNMARKED_PROJECT = "unmarked"
+EMPTY_PROJECT = "empty"
+BUDGET_PROJECT = "budget"
+APP_TEXT = "import os\n\nMESSAGE = " + json.dumps(SENTENCE + " for now") + "\n"
+MOVED_APP_TEXT = "import os\nimport re\n\n\nMESSAGE = " + json.dumps(SENTENCE + " for now") + "\n"
+SHELL_TEXT = "#!/bin/sh\nset -e\necho " + json.dumps(SENTENCE + " for now") + "\n"
 FILLER_LINE = "echo " + json.dumps(" ".join(("filler", "words", "for", "the", "budget", "row"))) + "\n"
 
 
@@ -50,53 +69,92 @@ def probe_module(*body, top=()):
     return "\n".join(lines) + "\n"
 
 
+def place(folder, relative, text):
+    target = folder / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+
+
+def project(root, name, files=(), marked=True):
+    folder = root / name
+    (folder / "tests").mkdir(parents=True)
+    if marked:
+        (folder / ".git").mkdir()
+    for relative, text in files:
+        place(folder, relative, text)
+    return folder
+
+
+def filled_budget_files(limit):
+    lines = FILLER_LINE * (limit // len(FILLER_LINE))
+    padded = lines + "#" * (limit - len(lines) - 1) + "\n"
+    return [(f"{FILLER_DIR}/filler_{number:02d}.sh", padded) for number in range(FILLER_FILES)]
+
+
 class WordingAssertionGate(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         workspace = TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name)
-        self.repo = self.root / "repo"
-        self.state = self.root / "state"
-        self.home = self.root / "home"
-        self.home.mkdir()
-        (self.repo / "tests").mkdir(parents=True)
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
-        disable_background_maintenance(str(self.repo))
+        cls.addClassCleanup(workspace.cleanup)
+        cls.root = Path(workspace.name).resolve()
+        cls.state = cls.root / "state"
+        (cls.root / "home").mkdir()
+        project(cls.root, PLAIN)
+        project(cls.root, APP_PROJECT, [(APP_SOURCE, APP_TEXT)])
+        project(cls.root, SHELL_PROJECT, [(SHELL_SOURCE, SHELL_TEXT)])
+        project(cls.root, OTHER_TEST_PROJECT, [("tests/test_other.py", APP_TEXT)])
+        project(cls.root, EDITED_PROJECT, [(APP_SOURCE, APP_TEXT)])
+        project(cls.root, EMPTY_PROJECT)
+        project(cls.root, UNMARKED_PROJECT, [(APP_SOURCE, APP_TEXT)], marked=False)
+        project(cls.root, BUDGET_PROJECT, [(APP_SOURCE, APP_TEXT), *filled_budget_files(1_000_000)])
+        environment = mock.patch.dict(os.environ, {"HOME": str(cls.root / "home")})
+        environment.start()
+        cls.addClassCleanup(environment.stop)
 
-    def place(self, relative, text):
-        target = self.repo / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+    def own_state(self):
+        return self.root / ("state-" + self._testMethodName)
 
-    def write_test(self, content):
+    def wording_rows(self, content, name=PLAIN, state=None):
+        state = state or self.state
+        repo = self.root / name
         payload = {
-            "cwd": str(self.repo), "session_id": "wording", "hook_event_name": "PreToolUse",
+            "cwd": str(repo), "session_id": self._testMethodName, "hook_event_name": "PreToolUse",
             "agent_type": AGENT, "tool_name": "Write",
-            "tool_input": {"file_path": str(self.repo / TEST_FILE), "content": content},
+            "tool_input": {"file_path": str(repo / TEST_FILE), "content": content},
         }
-        call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state)],
-            input=json.dumps(payload), text=True, capture_output=True, check=True,
-            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
-        )
-        return json.loads(call.stdout)
-
-    def wording_rows(self):
-        rows = [row for report in sorted((self.state / "reports").glob("*.json"))
-                for row in json.loads(report.read_text(encoding="utf-8"))]
-        return [row for row in rows if row["rule"] == RULE]
+        earlier = set((state / "reports").glob("*.json"))
+        response = run_hook("PreToolUse", payload, state_dir=state, git_view=NO_REPOSITORY)
+        added = sorted(set((state / "reports").glob("*.json")) - earlier)
+        rows = [row for report in added for row in json.loads(report.read_text(encoding="utf-8"))]
+        return response, [row for row in rows if row["rule"] == RULE]
 
     def verdict(self, content):
-        output = self.write_test(content)
-        decision = output.get("hookSpecificOutput", {}).get("permissionDecision")
-        return decision, tuple(row["line"] for row in self.wording_rows())
+        response, rows = self.wording_rows(content)
+        decision = response.get("hookSpecificOutput", {}).get("permissionDecision")
+        return decision, tuple(row["line"] for row in rows)
 
-    def first_row(self, content):
-        self.write_test(content)
-        return self.wording_rows()[0]
+    def first_row(self, content, name=PLAIN):
+        return self.wording_rows(content, name)[1][0]
 
-    def matches(self):
-        return tuple(sorted(row.get("match") for row in self.wording_rows()))
+    def match_in_new_process(self, content, name):
+        repo = self.root / name
+        payload = {
+            "cwd": str(repo), "session_id": self._testMethodName, "hook_event_name": "PreToolUse",
+            "agent_type": AGENT, "tool_name": "Write",
+            "tool_input": {"file_path": str(repo / TEST_FILE), "content": content},
+        }
+        earlier = set((self.state / "reports").glob("*.json"))
+        subprocess.run(
+            [sys.executable, "-ISB", str(PROJECT / "adw_light.py"), "PreToolUse", "--state-dir", str(self.state)],
+            input=json.dumps(payload), text=True, capture_output=True, check=True,
+            env={"HOME": str(self.root / "home"), "PATH": os.environ.get("PATH", "")},
+        )
+        added = sorted(set((self.state / "reports").glob("*.json")) - earlier)
+        rows = [row for report in added for row in json.loads(report.read_text(encoding="utf-8"))]
+        return tuple(row.get("match") for row in rows if row["rule"] == RULE)
+
+    def match_of(self, content, name):
+        return tuple(row.get("match") for row in self.wording_rows(content, name)[1])
 
     def index_modes(self):
         return {stat.S_IMODE(path.stat().st_mode) for path in (self.state / INDEX_DIR).glob("*.json")}
@@ -168,19 +226,16 @@ class WordingAssertionGate(unittest.TestCase):
         self.assertEqual(self.verdict(content), (DENY, (BODY_START + 1,)))
 
     def test_match_names_the_python_source_that_holds_the_text(self):
-        self.place(APP_SOURCE, "import os\n\nMESSAGE = " + quoted(SENTENCE + " for now") + "\n")
         content = probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)")
-        self.assertEqual(self.first_row(content)["match"], f"{APP_SOURCE}:{SOURCE_LINE}")
+        self.assertEqual(self.first_row(content, APP_PROJECT)["match"], f"{APP_SOURCE}:{SOURCE_LINE}")
 
     def test_match_names_the_shell_source_that_holds_the_text(self):
-        self.place(SHELL_SOURCE, "#!/bin/sh\nset -e\necho " + quoted(SENTENCE + " for now") + "\n")
         content = probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)")
-        self.assertEqual(self.first_row(content)["match"], f"{SHELL_SOURCE}:{SOURCE_LINE}")
+        self.assertEqual(self.first_row(content, SHELL_PROJECT)["match"], f"{SHELL_SOURCE}:{SOURCE_LINE}")
 
     def test_text_held_only_by_another_test_file_is_not_named_as_source(self):
-        self.place("tests/test_other.py", "import os\n\nMESSAGE = " + quoted(SENTENCE + " for now") + "\n")
         content = probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)")
-        self.assertNotIn("match", self.first_row(content))
+        self.assertNotIn("match", self.first_row(content, OTHER_TEST_PROJECT))
 
     def test_sentence_without_a_source_match_still_denies(self):
         content = probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)")
@@ -234,39 +289,33 @@ class WordingAssertionGate(unittest.TestCase):
         self.assertEqual(self.verdict(content), (None, ()))
 
     def test_second_run_reports_the_same_match_as_the_first(self):
-        self.place(APP_SOURCE, "import os\n\nMESSAGE = " + quoted(SENTENCE + " for now") + "\n")
-        self.write_test(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"))
-        self.write_test(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"))
-        self.assertEqual(self.matches(), (f"{APP_SOURCE}:{SOURCE_LINE}",) * 2)
+        content = probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)")
+        runs = self.match_of(content, APP_PROJECT) + self.match_of(content, APP_PROJECT)
+        self.assertEqual(runs, (f"{APP_SOURCE}:{SOURCE_LINE}",) * 2)
 
     def test_edited_source_moves_the_match_on_the_next_run(self):
-        self.place(APP_SOURCE, "import os\n\nMESSAGE = " + quoted(SENTENCE + " for now") + "\n")
-        self.write_test(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"))
-        self.place(APP_SOURCE, "import os\nimport re\n\n\nMESSAGE = " + quoted(SENTENCE + " for now") + "\n")
-        self.write_test(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"))
-        self.assertEqual(self.matches(), (f"{APP_SOURCE}:{SOURCE_LINE}", f"{APP_SOURCE}:{MOVED_LINE}"))
+        content = probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)")
+        first = self.match_in_new_process(content, EDITED_PROJECT)
+        place(self.root / EDITED_PROJECT, APP_SOURCE, MOVED_APP_TEXT)
+        second = self.match_in_new_process(content, EDITED_PROJECT)
+        self.assertEqual(first + second, (f"{APP_SOURCE}:{SOURCE_LINE}", f"{APP_SOURCE}:{MOVED_LINE}"))
 
     def test_sentence_without_a_source_match_has_no_match_field(self):
         self.assertNotIn("match", self.first_row(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)")))
 
     def test_sentence_without_a_source_match_leaves_no_index_folder(self):
-        self.write_test(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"))
-        self.assertFalse((self.state / INDEX_DIR).exists())
+        self.wording_rows(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"), EMPTY_PROJECT, self.own_state())
+        self.assertFalse((self.own_state() / INDEX_DIR).exists())
 
     def test_project_without_git_has_no_match_field(self):
-        self.place("src/app.py", "import os\n\nMESSAGE = " + quoted(SENTENCE + " for now") + "\n")
-        shutil.rmtree(self.repo / ".git")
-        self.assertNotIn("match", self.first_row(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)")))
+        self.assertNotIn("match", self.first_row(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"), UNMARKED_PROJECT))
 
     def test_project_without_git_leaves_no_index_folder(self):
-        self.place("src/app.py", "import os\n\nMESSAGE = " + quoted(SENTENCE + " for now") + "\n")
-        shutil.rmtree(self.repo / ".git")
-        self.write_test(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"))
-        self.assertFalse((self.state / INDEX_DIR).exists())
+        self.wording_rows(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"), UNMARKED_PROJECT, self.own_state())
+        self.assertFalse((self.own_state() / INDEX_DIR).exists())
 
     def test_index_files_are_private_to_the_owner(self):
-        self.place("src/app.py", "import os\n\nMESSAGE = " + quoted(SENTENCE + " for now") + "\n")
-        self.write_test(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"))
+        self.wording_rows(probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)"), APP_PROJECT)
         self.assertEqual(self.index_modes(), {0o600})
 
     def test_assert_equal_with_keyword_operands_denies(self):
@@ -343,12 +392,6 @@ class WordingAssertionGate(unittest.TestCase):
     def pair_verdict(self, method, first, second):
         return self.verdict(probe_module("computed = render()", f"self.{method}({first}, {second})"))
 
-    def fill_earlier_folder(self, limit):
-        lines = FILLER_LINE * (limit // len(FILLER_LINE))
-        padded = lines + "#" * (limit - len(lines) - 1) + "\n"
-        for number in range(FILLER_FILES):
-            self.place(f"{FILLER_DIR}/filler_{number:02d}.sh", padded)
-
     def test_all_caps_sentence_expected_value_denies(self):
         self.assertEqual(self.expected_value_verdict(quoted(SHOUTED)), (DENY, (BODY_START + 1,)))
 
@@ -421,10 +464,8 @@ class WordingAssertionGate(unittest.TestCase):
         self.assertEqual(self.expected_value_verdict(quoted(AND_OPERATOR)), (None, ()))
 
     def test_src_match_survives_an_earlier_folder_that_exhausts_the_read_budget(self):
-        self.place(APP_SOURCE, "import os\n\nMESSAGE = " + quoted(SENTENCE + " for now") + "\n")
-        self.fill_earlier_folder(1_000_000)
         content = probe_module("computed = render()", f"self.assertIn({quoted(SENTENCE)}, computed)")
-        self.assertEqual(self.first_row(content).get("match"), f"{APP_SOURCE}:{SOURCE_LINE}")
+        self.assertEqual(self.first_row(content, BUDGET_PROJECT).get("match"), f"{APP_SOURCE}:{SOURCE_LINE}")
 
 
 if __name__ == "__main__":

@@ -1,60 +1,16 @@
 from __future__ import annotations
 
 import ast
-import re
 
 from .python_imports import imports_are_trusted
 from .python_safe_modules import (
-    BYTES_METHODS, FILE_METHODS, IMPORTABLE, ITEMS, JSON_ELEMENT_METHODS, JSON_METHODS, OBJECT_KINDS,
+    BYTES_METHODS, FILE_METHODS, IMPORTABLE, JSON_ELEMENT_METHODS, JSON_METHODS,
     PATH_CLASS_METHODS, PATH_METHODS, TEXT_METHODS, Kind, callable_result, from_import_kind, import_binding,
-    member_kind, text_method_result,
+    member_kind, text_method_result, assignable_kind, common_kind, describe_node, item_kind, stdout_arguments,
+    READ_ONLY_OPEN_MODE_CHARS, OPEN_KEYWORDS, SAFE_IMPORTS, SYS_ATTRIBUTES, JSON_FUNCTIONS, DUMPS_KEYWORDS,
+    PATH_CLASSES, SORT_HELPERS, CONTAINER_LITERALS, UNASSIGNED_HINT, SAFE_BUILTINS, SAFE_EXCEPTIONS,
+    JSON_ERROR, FIXED_BUILTIN_KINDS, SAFE_LITERAL_TYPES, SUSPICIOUS_BARE_LITERAL_RE, Comprehension,
 )
-
-READ_ONLY_OPEN_MODE_CHARS = frozenset("rbtU")
-OPEN_KEYWORDS = frozenset({"buffering", "encoding", "errors", "newline", "closefd"})
-SAFE_IMPORTS = {"json": "json_module", "sys": "sys_module"}
-SYS_ATTRIBUTES: dict[str, Kind] = {
-    "stdin": "file", "argv": ("sequence", ("text",)), "executable": "text", "maxsize": "value",
-    "platform": "text", "version": "text", "version_info": "value", "exit": "sys_exit",
-}
-JSON_FUNCTIONS = frozenset({"dumps", "load", "loads"})
-DUMPS_KEYWORDS = frozenset({"allow_nan", "ensure_ascii", "indent", "separators", "skipkeys", "sort_keys"})
-PATH_CLASSES = frozenset({"Path", "PurePath"})
-SORT_HELPERS = frozenset({"max", "min", "sorted"})
-CONTAINER_LITERALS = (ast.Dict, ast.DictComp, ast.List, ast.ListComp)
-UNASSIGNED_HINT = ", which is never assigned in this payload. Define it or inline the value"
-SAFE_BUILTINS = frozenset({
-    "abs", "all", "any", "bool", "bytes", "dict", "enumerate", "float", "int", "isinstance", "iter", "len", "list", "max",
-    "min", "next", "print", "range", "repr", "round", "set", "sorted", "str", "sum", "tuple", "type", "zip",
-})
-SAFE_EXCEPTIONS = frozenset({
-    "ArithmeticError", "AssertionError", "AttributeError", "Exception", "FileNotFoundError", "IndexError", "KeyError",
-    "LookupError", "OSError", "StopIteration", "SystemExit", "TypeError", "UnicodeDecodeError", "ValueError", "ZeroDivisionError",
-})
-JSON_ERROR = "JSONDecodeError"
-FIXED_BUILTIN_KINDS: dict[str, Kind] = {"str": "text", "repr": "text", "bytes": "bytes", "range": ("sequence", ("value",))}
-SAFE_LITERAL_TYPES = (str, bytes, int, float, complex, bool, type(None))
-ASSIGNABLE_KINDS = frozenset({"bytes", "file", "json", "path", "text", "value"}) | OBJECT_KINDS
-
-SUSPICIOUS_BARE_LITERAL_RE = re.compile(r"(?:\b(?:write|exec|eval)\s*\(|__)")
-
-Comprehension = ast.GeneratorExp | ast.ListComp | ast.SetComp | ast.DictComp
-
-
-def common_kind(kinds: list[Kind] | tuple[Kind, ...]) -> Kind:
-    return kinds[0] if kinds and all(kind == kinds[0] for kind in kinds) else "value"
-
-
-def item_kind(kind: Kind | None) -> Kind | None:
-    if isinstance(kind, tuple):
-        return kind[1][0] if kind[0] == "sequence" else common_kind(kind[1])
-    return {"text": "text", "bytes": "value", "file": "text", "json": "json", **ITEMS}.get(kind)
-
-
-def assignable_kind(kind: Kind | None) -> bool:
-    if isinstance(kind, tuple):
-        return all(assignable_kind(item) for item in kind[1])
-    return kind in ASSIGNABLE_KINDS
 
 
 def is_known_read_only_python(source: str, *, cwd: str | None = None, isolated: bool = False) -> bool:
@@ -72,14 +28,6 @@ def python_rejection(source: str, *, cwd: str | None = None, isolated: bool = Fa
     if not (isolated or imports_are_trusted(cwd)):
         return "a project module that shadows a standard library import"
     return ""
-
-
-def describe_node(node: ast.AST) -> str:
-    try:
-        text = " ".join(ast.unparse(node).split())
-    except (RecursionError, ValueError):
-        text = ""
-    return f"{type(node).__name__} \"{text[:80]}\" on line {getattr(node, 'lineno', '?')}"
 
 
 def describe_rejection(checker: _ExpressionKinds) -> str:
@@ -215,6 +163,9 @@ class _ExpressionKinds:
         return ("sequence", (kind,)) if assignable_kind(kind) else None
 
     def call(self, node: ast.Call) -> Kind | None:
+        values = stdout_arguments(node, self.bindings)
+        if values is not None:
+            return "value" if self.arguments(values, node.keywords) else None
         keywords = [keyword for keyword in node.keywords if not self.sort_key(node, keyword)]
         if not self.arguments(node.args, keywords):
             return None

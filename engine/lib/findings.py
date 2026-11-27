@@ -38,23 +38,26 @@ class FindingDict(_RequiredFindingDict, total=False):
     match: str
     language: str
     end_line: int
+    occurrences: int
+    units: list[str]
 
 
 _FINDING_KEYS = frozenset({
     "family", "rule", "line", "detail", "force", "snippet", "action",
     "path", "severity", "surface", "_tool_use_id",
-    "content_hash", "match", "language", "end_line",
+    "content_hash", "match", "language", "end_line", "occurrences", "units",
 })
 _REQUIRED_KEYS = frozenset(_RequiredFindingDict.__annotations__)
 BLOCK_RULES = frozenset({
+    "after_run_deferred",
     "unresolved_doc_reference", "added_docstring", "throat_clearing_opener", "meta_commentary",
     "low_sentence_variance", "uniform_paragraph_endings", "oversized_list", "three_item_list",
     "choppy_sentences", "de_parataxis", "de_uniform_rhythm", "de_uniform_paragraphs",
-    "de_repeated_connector", "de_exclamation_staccato", "dash_cluster",
+    "prose_colon", "de_repeated_connector", "de_exclamation_staccato", "dash_cluster",
     "prose_comment_block", "docstring_narration", "function_too_long", "hollow_test",
     "assert_in_loop", "if_statements_in_tests", "multiple_act_sections_in_unit_test",
     "wording_assertion", "wording_exception_match", "wording_log_assertion", "literal_location",
-    "wording_ui_locator", "wording_debt_lock", "hard_coded_path", "agent_marker_author",
+    "test_principle_citation", "test_builds_repo", "wording_ui_locator", "hard_coded_path", "agent_marker_author",
 })
 
 
@@ -87,6 +90,8 @@ class Finding:
     match: str | None = None
     language: str | None = None
     end_line: int | None = None
+    occurrences: int | None = None
+    units: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.family:
@@ -125,6 +130,8 @@ class Finding:
                 match=row.get("match"),
                 language=row.get("language"),
                 end_line=row.get("end_line"),
+                occurrences=row.get("occurrences"),
+                units=None if row.get("units") is None else tuple(row["units"]),
             )
         except KeyError as error:
             raise ValueError(f"finding is missing required key: {error.args[0]}") from error
@@ -147,11 +154,11 @@ class Finding:
     def to_dict(self) -> dict:
         fields = (
             ("family", self.family), ("rule", self.rule), ("line", self.line),
-            ("end_line", self.end_line), ("detail", self.detail), ("force", self.force),
+            ("occurrences", self.occurrences), ("end_line", self.end_line), ("detail", self.detail), ("force", self.force),
             ("snippet", self.snippet), ("match", self.match), ("action", self.action),
             ("path", self.path), ("severity", self.severity), ("surface", self.surface),
             ("language", self.language), ("_tool_use_id", self.tool_use_id),
-            ("content_hash", self.content_hash),
+            ("content_hash", self.content_hash), ("units", None if self.units is None else list(self.units)),
         )
         return {key: value for key, value in fields if value is not None or key in _REQUIRED_KEYS}
 

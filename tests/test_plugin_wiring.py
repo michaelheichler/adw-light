@@ -10,19 +10,22 @@ import unittest
 from ast import Assign, Name, literal_eval, parse
 from pathlib import Path
 
+from t2325_fixtures import small_payload_probe
+
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS_JSON = ROOT / "hooks" / "hooks.json"
 CODEX_HOOKS_JSON = ROOT / "hooks" / "codex-hooks.json"
 PLUGIN_MANIFEST = ROOT / ".claude-plugin" / "plugin.json"
 ENTRY = ROOT / "adw_light.py"
 BUILD = ROOT / "tools" / "build_release.sh"
-SMOKE = ROOT / "tools" / "smoke_probe.py"
 
 CLAUDE_EVENTS = frozenset({
     "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolBatch",
     "PostToolUseFailure", "SubagentStart", "SubagentStop", "Stop", "SessionEnd",
 })
 CODEX_EVENTS = CLAUDE_EVENTS - {"PostToolBatch", "PostToolUseFailure"}
+CLAUDE_CONFIG_EVENT = "UserPromptExpansion"
+CODEX_CONFIG_EVENT = "UserPromptSubmit"
 POST_TOOL_MATCHER = "^(Write|Edit|MultiEdit|NotebookEdit|apply_patch|Bash|mcp__.*)$"
 EXPECTED_MATCHERS_AND_TIMEOUTS = {
     "SessionStart": ("startup|resume|clear|compact", [10]),
@@ -35,6 +38,7 @@ EXPECTED_MATCHERS_AND_TIMEOUTS = {
     "SubagentStop": (None, [10]),
     "Stop": (None, [10]),
     "SessionEnd": (None, [10]),
+    "UserPromptExpansion": ("^adw-light:config$", [10]),
 }
 RELEASE_EXCLUDED_NAMES = frozenset({".git", ".state", ".agents", ".claude", ".gitnexus", ".caliber", "tests"})
 SCRUBBED_ENV = ("CLAUDE_PLUGIN_ROOT", "ADW_STATE_ROOT", "ADW_CODEX_HOOK", "ADW_PYTHON", "ADW_ALLOW_PROTECTED_EDIT")
@@ -47,6 +51,7 @@ PROMPT_HOOK = ("UserPromptSubmit", None, {"type": "prompt", "prompt": "Reject re
 FOREIGN = (BRANCH_GUARD, CLAUDE_SPEAK, IMPECCABLE, CALIBER, PROMPT_HOOK)
 LEGACY_INTERPRETER = ("Stop", None, {"type": "command", "command": "python3 -I -S -B /Users/sample/Development/projects/adw-light/adw_light.py Stop --host claude"})
 STALE_RUN_SH = ("PreToolUse", None, {"type": "command", "command": '"/Users/sample/Development/projects/adw-light/hooks/run.sh" PreToolUse'})
+PLUGIN_CACHE_RUN_SH = Path.home().joinpath(".host", "plugins", "cache", "adw-light", "adw-light", "0.1.2", "hooks", "run.sh")
 
 
 def read_json(path):
@@ -63,6 +68,11 @@ def entry_events():
 def registered_commands(config):
     return {event: [handler["command"] for group in groups for handler in group["hooks"]]
             for event, groups in config["hooks"].items()}
+
+
+def run_sh_events(config):
+    return {event for event, commands in registered_commands(config).items()
+            if any("/hooks/run.sh " in command for command in commands)}
 
 
 def matchers_and_timeouts(config):
@@ -105,15 +115,16 @@ def command_pairs(data):
 
 
 class PluginManifestWiringTests(unittest.TestCase):
-    def test_claude_hooks_register_exactly_the_ten_supported_events(self):
-        self.assertEqual(set(read_json(HOOKS_JSON)["hooks"]), CLAUDE_EVENTS)
+    def test_claude_hooks_register_the_ten_engine_events_and_the_config_expansion(self):
+        self.assertEqual(set(read_json(HOOKS_JSON)["hooks"]), CLAUDE_EVENTS | {CLAUDE_CONFIG_EVENT})
 
-    def test_every_claude_command_runs_run_sh_with_its_own_event(self):
+    def test_every_claude_command_runs_its_hook_script_with_its_own_event(self):
         expected = {event: ['"${CLAUDE_PLUGIN_ROOT}"/hooks/run.sh ' + event] for event in CLAUDE_EVENTS}
+        expected[CLAUDE_CONFIG_EVENT] = ['"${CLAUDE_PLUGIN_ROOT}"/hooks/adw-config ' + CLAUDE_CONFIG_EVENT]
         self.assertEqual(registered_commands(read_json(HOOKS_JSON)), expected)
 
-    def test_every_registered_event_is_dispatched_by_the_entry_script(self):
-        self.assertEqual(set(read_json(HOOKS_JSON)["hooks"]) - entry_events(), set())
+    def test_every_event_routed_to_run_sh_is_dispatched_by_the_entry_script(self):
+        self.assertEqual(run_sh_events(read_json(HOOKS_JSON)) - entry_events(), set())
 
     def test_claude_matchers_and_timeouts_match_the_expected_table(self):
         self.assertEqual(matchers_and_timeouts(read_json(HOOKS_JSON)), EXPECTED_MATCHERS_AND_TIMEOUTS)
@@ -125,6 +136,7 @@ class PluginManifestWiringTests(unittest.TestCase):
 
     def test_codex_hooks_register_the_eight_events_through_the_skill_dir_placeholder(self):
         expected = {event: [f'ADW_CODEX_HOOK=1 "__SKILL_DIR__"/hooks/run.sh {event}'] for event in CODEX_EVENTS}
+        expected[CODEX_CONFIG_EVENT].append(f'ADW_CODEX_HOOK=1 "__SKILL_DIR__"/hooks/adw-config {CODEX_CONFIG_EVENT}')
         self.assertEqual(registered_commands(read_json(CODEX_HOOKS_JSON)), expected)
 
 
@@ -208,6 +220,7 @@ class MergeContract:
     script: Path
     target_flag: str
     events: frozenset
+    config_event: str
     prefix: str
     retained_on_install: set
 
@@ -228,7 +241,9 @@ class MergeContract:
 
     def installed_pairs(self):
         run_sh = shlex.quote(str(ROOT / "hooks" / "run.sh"))
-        return {(event, f"{self.prefix}{run_sh} {event}") for event in self.events}
+        adw_config = shlex.quote(str(ROOT / "hooks" / "adw-config"))
+        config_pair = (self.config_event, f"{self.prefix}{adw_config} {self.config_event}")
+        return {(event, f"{self.prefix}{run_sh} {event}") for event in self.events} | {config_pair}
 
     def test_install_keeps_every_foreign_handler_with_its_matcher(self):
         self.merge()
@@ -249,10 +264,12 @@ class MergeContract:
         self.merge()
         self.assertEqual(self.target.read_bytes(), once)
 
-    def test_install_writes_a_backup_of_the_original_bytes(self):
+    def test_install_swaps_in_a_new_file_and_leaves_no_backup_or_temp_file_beside_it(self):
+        before = self.target.stat().st_ino
         self.merge()
-        backups = sorted(self.target.parent.glob(self.target.name + ".bak.*"))
-        self.assertEqual([path.read_bytes() for path in backups], [self.original])
+        names = sorted(path.name for path in self.target.parent.iterdir())
+        replaced = (self.target.stat().st_ino != before, self.target.read_bytes() != self.original)
+        self.assertEqual((names, replaced), (["settings.json"], (True, True)))
 
     def test_install_keeps_the_file_mode(self):
         self.target.chmod(0o640)
@@ -263,6 +280,18 @@ class MergeContract:
         result = self.merge(skill_dir=False)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.target.read_bytes(), self.original)
+
+    def test_remove_legacy_without_skill_dir_is_refused_and_leaves_the_file_alone(self):
+        result = self.merge("--remove-legacy", skill_dir=False)
+        self.assertEqual((result.returncode, self.target.read_bytes()), (2, self.original))
+
+    def test_strip_only_without_skill_dir_drops_plugin_cache_handlers_and_keeps_the_foreign_ones(self):
+        settings = mixed_settings()
+        cached = {"type": "command", "command": f"{self.prefix}{shlex.quote(str(PLUGIN_CACHE_RUN_SH))} SessionEnd"}
+        settings["hooks"]["SessionEnd"] = [{"hooks": [cached]}]
+        self.target.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        result = self.merge("--strip-only", skill_dir=False)
+        self.assertEqual((result.returncode, handler_rows(self.merged())), (0, rows_of(FOREIGN)))
 
     def test_remove_legacy_drops_only_the_interpreter_handler(self):
         self.merge("--remove-legacy")
@@ -277,6 +306,7 @@ class ClaudeSettingsMergeTests(MergeContract, unittest.TestCase):
     script = ROOT / "hooks" / "merge-claude-settings.py"
     target_flag = "--settings"
     events = CLAUDE_EVENTS
+    config_event = CLAUDE_CONFIG_EVENT
     prefix = ""
     retained_on_install = set()
 
@@ -285,6 +315,7 @@ class CodexHooksMergeTests(MergeContract, unittest.TestCase):
     script = ROOT / "hooks" / "merge-codex-hooks.py"
     target_flag = "--hooks-json"
     events = CODEX_EVENTS
+    config_event = CODEX_CONFIG_EVENT
     prefix = "ADW_CODEX_HOOK=1 "
     retained_on_install = {(LEGACY_INTERPRETER[0], LEGACY_INTERPRETER[2]["command"])}
 
@@ -298,7 +329,7 @@ class ReleaseBuildTests(unittest.TestCase):
         cls.home = cls.scratch / "home"
         cls.home.mkdir()
         cls.release = cls.scratch / "adw-release"
-        build = subprocess.run(["bash", str(BUILD)], capture_output=True, text=True, check=False, timeout=600,
+        build = subprocess.run(["bash", str(BUILD)], capture_output=True, text=True, check=False, timeout=600, cwd=str(ROOT),
                                env=isolated_env(cls.home, ADW_RELEASE=str(cls.release)))
         assert build.returncode == 0, build.stdout + build.stderr
 
@@ -318,8 +349,9 @@ class ReleaseBuildTests(unittest.TestCase):
         self.assertEqual(leaked, [])
 
     def test_release_tree_passes_the_smoke_probe(self):
-        result = subprocess.run([sys.executable, str(SMOKE), str(self.release)], capture_output=True, text=True,
-                                check=False, env=isolated_env(self.home), timeout=600)
+        """The test runs quickly."""
+        result = subprocess.run([sys.executable, "-c", small_payload_probe(), str(self.release)], capture_output=True,
+                                text=True, check=False, env=isolated_env(self.home), timeout=600)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_protection_denies_a_write_under_the_release_root_in_other_letter_case(self):

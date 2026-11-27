@@ -284,8 +284,10 @@ def _stat_fingerprint(file_stat: os.stat_result) -> StatFingerprint:
     )
 
 
-def _project_entries(entries: list[tuple[str, str, Path]], cwd: Path) -> list[tuple[str, str, Path]]:
-    return [entry for entry in entries if not outside_project_temp(entry[2], cwd)]
+def _project_entries(
+    entries: list[tuple[str, str, Path]], cwd: Path, *, roots: tuple[Path, ...] | None = None,
+) -> list[tuple[str, str, Path]]:
+    return [entry for entry in entries if not outside_project_temp(entry[2], cwd, roots=roots)]
 
 
 def _scan_path(path: Path, cfg: dict) -> list[dict]:
@@ -395,12 +397,14 @@ def _findings_for_path_scan(scan: PathBatchScan) -> list[dict]:
     return findings
 
 
-def duplicate_findings_for_paths(cwd: str, paths: list[str], cfg: dict) -> list[dict]:
+def duplicate_findings_for_paths(
+    cwd: str, paths: list[str], cfg: dict, *, roots: tuple[Path, ...] | None = None,
+) -> list[dict]:
     base = Path(cwd or ".")
     entries = [("<end-turn>", raw_path, payloads.resolved_path(raw_path, base)) for raw_path in paths]
     return [
         {**_duplicate_row(group), "content_hash": sha256(text.encode("utf-8")).hexdigest()}
-        for group, text in _duplicate_groups(_project_entries(entries, base), cfg)
+        for group, text in _duplicate_groups(_project_entries(entries, base, roots=roots), cfg)
     ]
 
 
@@ -481,18 +485,22 @@ def _batch_response(kind: str, reason: str) -> dict:
     return {}
 
 
-def run(payload: dict, config: dict | None = None) -> dict:
+def run(payload: dict, config: dict | None = None, *, until: float | None = None) -> dict:
     try:
-        return _run(payload, config)
+        return _run(payload, config, until)
     except Exception as exc:
         reason = config_failure("batch", exc, payloads.cwd(payload) or None)
         blocker_state.hold_undecidable(_sanitized_payload(payload), config, UNDECIDABLE_KEY, reason)
         return {"decision": "block", "reason": reason}
 
 
-def _run(payload: dict, config: dict | None) -> dict:
+def _run(payload: dict, config: dict | None, until: float | None = None) -> dict:
     payload = _sanitized_payload(payload)
     cfg = payload_hook_config(config, payload)
+    from lib import after_run
+    reason = after_run.batch_reason(payload, cfg, until)
+    if reason:
+        return {**_batch_response("block", reason), after_run.LIVE_BLOCK: True}
     return run_with_ledger(
         hook="batch",
         payload=payload,

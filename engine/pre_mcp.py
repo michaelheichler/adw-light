@@ -27,7 +27,7 @@ from lib.mcp_health import (
     valid_now,
 )
 from lib.mcp_paths import mcp_arguments
-from lib.payloads import exact_string_dict
+from lib.payloads import cwd, exact_string_dict
 from lib.protected import path_findings
 from lib.reporting import record_decision, record_findings, run_with_ledger, verdict_message
 
@@ -115,7 +115,7 @@ def _candidate_path_findings(tool_input: dict[str, object], cwd: str) -> list[di
     for path in arguments.paths:
         resolved = _resolved_path(path, cwd)
         for content in candidates:
-            findings.extend(path_findings(resolved, content=content))
+            findings.extend(path_findings(resolved, cwd=cwd, content=content))
     return findings
 
 
@@ -142,11 +142,9 @@ def _protected_verdict(raw_payload: object, cwd: str) -> dict:
 
 def _fail_safe(raw_payload: object) -> dict:
     try:
-        fields = exact_string_dict(raw_payload)
-        raw_cwd = fields.get("cwd")
-        return _protected_verdict(raw_payload, raw_cwd if isinstance(raw_cwd, str) else "")
+        return _protected_verdict(raw_payload, cwd(raw_payload))
     except (OSError, ValueError, TypeError, RuntimeError, KeyError) as exc:
-        return deny(config_failure("MCP call", exc))
+        return deny(config_failure("MCP call", exc, cwd(raw_payload)))
 
 
 def _protected_response(context: McpRunContext, turn_id: str) -> dict:

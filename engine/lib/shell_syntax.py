@@ -9,7 +9,9 @@ from .shell_operators import (
     LEADING_REDIRECT_RE, PIPE_OPERATORS, SEPARATORS,
     _merge_adjacent_fragments, _split_punctuation_runs,
 )
-from .shell_text import shell_words
+from .shell_text import (
+    REPLACED, ShellToken, _arithmetic_reach, _substitution_body, _substitution_parts, shell_tokens, shell_words,
+)
 from .shell_unfold import unfolded
 
 DYNAMIC_RE = re.compile(r"[$`]")
@@ -183,7 +185,8 @@ def interpreter_invocation(segment: list[str]) -> InterpreterInvocation | None:
 def _decoded_payload(token: str) -> str | None:
     if len(token) >= 2 and token[0] == token[-1] == "'" and "'" not in token[1:-1]:
         return token[1:-1]
-    if DYNAMIC_RE.search(token):
+    single_quoted_parts = re.fullmatch(r"(?:'[^']*'|\\')+", token)
+    if not single_quoted_parts and DYNAMIC_RE.search(token):
         return None
     try:
         words = shlex.split(token)
@@ -257,9 +260,72 @@ def has_process_substitution(segment: str) -> bool:
 CLOBBER_HEAD_RE = re.compile(r"^\d*>$")
 
 
-def _tokens(command: str) -> list[str]:
+CONDITIONAL_BODY = re.compile(r'''(?:[^'"$;&|()\x60\\\]\n]|\](?!\])|\$(?!\()|'[^']*'|"(?:[^"\x60\\$]|\$(?!\())*"|&&|\|\|)+?(?<=\s)\]\](?=$|[\s;&|()])''')
+
+
+def _comparison_end(command: str, start: int, leads: bool) -> int:
+    expansion = command.startswith("$((", start)
+    if expansion or (leads and command.startswith("((", start)):
+        end = _arithmetic_reach(command, start + int(expansion))
+        if end:
+            return end
+    if leads and command.startswith("[[", start) and command[start + 2:start + 3].isspace():
+        match = CONDITIONAL_BODY.match(command, start + 2)
+        if match:
+            return match.end()
+    return start
+
+
+def _comparison_words(command: str) -> str:
+    if not any(c in command for c in "<>") or not any(c in command for c in ("((", "[[")):
+        return command
+    parts = []
+    end = 0
+    leads = True
+    for token in shell_tokens(command):
+        match = token.match
+        if match is None or match.start() < end or not match.group().strip():
+            continue
+        start = match.start()
+        stop = _comparison_end(command, start, leads)
+        if stop < 0:
+            break
+        if stop > start:
+            opened = start + command.startswith("$", start)
+            parts.extend((command[end:opened], _masked_comparison(command[opened:stop])))
+            end = stop
+        elif match.lastgroup in REPLACED:
+            opened, body = _token_body(command, token)
+            parts.extend((command[end:opened], _comparison_words(body)))
+            end = opened + len(body)
+        leads = match.lastgroup == "separator" or (leads and match.group() in RESERVED_PREFIXES | {"for"})
+    return "".join([*parts, command[end:]])
+
+
+def _masked_comparison(span: str) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for _, _, opened, body in _substitution_parts(span):
+        parts.extend((_masked(span[cursor:opened]), _comparison_words(body)))
+        cursor = opened + len(body)
+    return "".join([*parts, _masked(span[cursor:])])
+
+
+def _masked(text: str) -> str:
+    return text.replace(">", "=").replace("<", "=")
+
+
+def _token_body(command: str, token: ShellToken) -> tuple[int, str]:
+    match = token.match
+    if match.lastgroup == "backtick":
+        return match.start() + 1, match.group()[1:].removesuffix(chr(96))
+    return _substitution_body(command, match.end(), token.end - 1)
+
+
+def _tokens(command: str, unroll: bool = True) -> list[str]:
+    command = _comparison_words(command)
     raw = _merge_adjacent_fragments(command, _split_punctuation_runs(shell_words(command)))
-    return _expand_env_split_strings(unfolded(_merge_clobber_operator(raw)))
+    return _expand_env_split_strings(unfolded(_merge_clobber_operator(raw), unroll))
 
 
 def _is_unquoted_assignment(token: str) -> bool:
@@ -375,10 +441,10 @@ def _fused_split_string_payload(tokens: list[str], index: int, rest: str) -> tup
     return _bare(payload), consumed
 
 
-def _segments(command: str) -> list[list[str]]:
+def _segments(command: str, unroll: bool = True) -> list[list[str]]:
     segments: list[list[str]] = []
     current: list[str] = []
-    for token in _tokens(command):
+    for token in _tokens(command, unroll):
         if token in SEPARATORS:
             if current:
                 segments.append(current)

@@ -10,6 +10,7 @@ from t19_language_home import BUNDLE, GRAMMARS, LIBRARY_NEEDED, LIBRARY_READY, V
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+NO_REPOSITORY_VIEW = Path(__file__).resolve().parent / "fixtures" / "no_repository_view.json"
 CONFIG_NAME = ".agent-discipline.json"
 SESSION = "t15c"
 TEST_WRITER = "adw-test-writer"
@@ -19,6 +20,7 @@ MARKER = "deferred_work_comment"
 SEAL = "config_seal"
 BODY = "Add CSV export to the report view to let users share results"
 ALLOWED = (0, None, ())
+PRINCIPLE = "A test must verify what the code does for its client, never how it does it."
 
 
 def source(*lines):
@@ -38,7 +40,7 @@ def java_method(comment):
 
 
 def js_test(comment, body="run();"):
-    return source('it("exports", () => {', "  // " + comment, "  " + body, "});")
+    return source("// Principle: " + PRINCIPLE, 'it("exports", () => {', "  // " + comment, "  " + body, "});")
 
 
 def denied(*rows):
@@ -54,6 +56,7 @@ class MarkerRepo:
         self.state = root / "state"
         self.home = root / "home"
         self.repo.mkdir()
+        (self.repo / "pyproject.toml").write_text("[project]\nname = \"fixture\"\n", encoding="utf-8")
         adw = self.home / ".adw-lite"
         (adw / "install").mkdir(parents=True)
         (adw / "cache" / "grammars").mkdir(parents=True)
@@ -99,7 +102,7 @@ class MarkerRepo:
 
     def _call(self, event, payload):
         return subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), event, "--host", "claude", "--state-dir", str(self.state)],
+            [sys.executable, "-ISB", str(SCRIPT), event, "--host", "claude", "--state-dir", str(self.state), "--git-view", str(NO_REPOSITORY_VIEW)],
             input=json.dumps(payload), text=True, capture_output=True, timeout=120, check=False,
             env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
         )
@@ -230,14 +233,24 @@ class PolicyWritesThatWeakenTheAgentRuleAreSealed(unittest.TestCase):
     def test_setting_prose_comment_block_to_observe_is_denied_the_same_way(self):
         self.assertEqual(self.policy_write("prose_comment_block", "observe"), denied((SEAL, 1)))
 
-    def test_setting_an_unlocked_rule_to_observe_is_allowed(self):
-        self.assertEqual(self.policy_write("comment_shape", "observe"), ALLOWED)
+    def kept_policy_write(self):
+        repo = MarkerRepo(self)
+        repo.configure({"max_rows": 5, "rule_gates": {"comment_shape": "enforce"}})
+        return repo.write(CONFIG_NAME, json.dumps({"max_rows": 6, "rule_gates": {"comment_shape": "enforce"}}, indent=2) + "\n")
+
+    def test_setting_an_unlocked_rule_to_observe_is_sealed_because_only_the_owner_changes_rule_gates(self):
+        """A test must verify what the code does for its client, never how it does it."""
+        self.assertEqual(self.policy_write("comment_shape", "observe"), denied((SEAL, 1)))
+
+    def test_agent_edit_that_keeps_every_enforcement_setting_is_allowed(self):
+        """A test must verify what the code does for its client, never how it does it."""
+        self.assertEqual(self.kept_policy_write(), ALLOWED)
 
 
 class SignedMarkersInTests(unittest.TestCase):
     def test_test_without_assertion_and_a_human_signed_todo_is_denied_as_hollow(self):
         verdict = MarkerRepo(self).write("tests/a.test.js", js_test("TODO(alice): " + BODY), agent=TEST_WRITER)
-        self.assertEqual(verdict, denied(("hollow_test", 1)))
+        self.assertEqual(verdict, denied(("hollow_test", 2)))
 
     def test_asserting_test_with_a_human_signed_todo_is_allowed(self):
         content = js_test("TODO(alice): " + BODY, "expect(run()).toBe(1);")
@@ -245,7 +258,7 @@ class SignedMarkersInTests(unittest.TestCase):
 
     def test_asserting_test_with_an_agent_signed_todo_is_denied_on_the_marker_line(self):
         content = js_test("TODO(claude): " + BODY, "expect(run()).toBe(1);")
-        self.assertEqual(MarkerRepo(self).write("tests/a.test.js", content, agent=TEST_WRITER), denied((AGENT, 2)))
+        self.assertEqual(MarkerRepo(self).write("tests/a.test.js", content, agent=TEST_WRITER), denied((AGENT, 3)))
 
 
 @unittest.skipUnless(LIBRARY_READY, LIBRARY_NEEDED)

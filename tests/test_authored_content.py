@@ -1,14 +1,22 @@
-from quiet_git import disable_background_maintenance
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 import unittest
 
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+sys.path.insert(0, str(PROJECT / "engine"))
 
-SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+from adw_light import run_hook
+from lib.git_port import FakeGitView
+
+
 FLAGGED_PROSE = "We utilize this tool for the build.\n"
 FLAGGED_WORD = "utilize"
 DASHED_SENTENCE = "The cache warms up \u2014 then the build starts."
@@ -54,6 +62,7 @@ class AppRepositoryChecks {
 }
 """
 FILE_LEVEL_LINE = 1
+PROJECT_MARKER = {"pyproject.toml": "[project]\nname = \"fixture\"\n"}
 GRADLE_WRAPPER = """#!/bin/sh
 i=0
 while [ "$i" -lt 1100 ]; do
@@ -67,31 +76,73 @@ def line_of(text, fragment):
     return text[:text.index(fragment)].count("\n") + 1
 
 
+def docx(document_xml):
+    return {"[Content_Types].xml": "<Types/>", "word/document.xml": document_xml}
+
+
+DASHED_DOCX = docx(f'<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:p><w:r><w:t>{DASHED_SENTENCE}</w:t></w:r></w:p></w:body></w:document>')
+KDOC_OLD = " * The caller owns the handle."
+KDOC_NEW = " * This function returns the value."
+FOLDERS = {
+    "kdoc": {"Repo.kt": KDOC_SOURCE},
+    "kotlin_write": {},
+    "kotlin_edit": {"AppRepository.kt": PLAIN_KOTLIN_SOURCE},
+    "junit": PROJECT_MARKER,
+    "copy_loop": {"src/A.kt": PLAIN_KOTLIN_SOURCE, "src/B.kt": PLAIN_KOTLIN_SOURCE, "tests/.keep": "", **PROJECT_MARKER},
+    "copy_test": {"incoming/foo_test.py": "def test_cache_size():\n    assert 20000 == 2 * 10000\n", **PROJECT_MARKER},
+    "awk": {},
+    "gradle": {"gradlew": GRADLE_WRAPPER},
+    "timeline": {},
+    "docx": {},
+    "broken_docx": {},
+    "notes": {},
+    "batch": {"first-turn.md": FLAGGED_PROSE},
+}
+COMMITTED = {"kdoc": {"Repo.kt": KDOC_SOURCE}, "gradle": {"gradlew": GRADLE_WRAPPER}}
+
+
+def build(folder, files):
+    folder.mkdir()
+    for relative, content in files.items():
+        (folder / relative).parent.mkdir(parents=True, exist_ok=True)
+        (folder / relative).write_text(content, encoding="utf-8")
+    if "gradlew" in files:
+        (folder / "gradlew").chmod(0o755)
+
+
+def tracked(files):
+    return {"index": files, "disk": files, "revisions": {"base": files}, "refs": {"HEAD": "base"}}
+
+
 class AuthoredContentRegressions(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         workspace = TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name)
-        self.state = self.root / ".adw-state"
+        cls.addClassCleanup(workspace.cleanup)
+        cls.base = Path(workspace.name).resolve()
+        cls.state = cls.base / ".adw-state"
+        (cls.base / "home").mkdir()
+        for name, files in FOLDERS.items():
+            build(cls.base / name, files)
+        with zipfile.ZipFile(cls.base / "docx" / "report.docx", "w") as archive:
+            for member, text in DASHED_DOCX.items():
+                archive.writestr(member, text)
+        (cls.base / "broken_docx" / "broken.docx").write_bytes(b"PK\x03\x04" + b"not a zip archive" * 20)
+        cls.git = FakeGitView({"roots": {str(cls.base / name): tracked(files) for name, files in COMMITTED.items()}})
+        environment = mock.patch.dict(os.environ, {"HOME": str(cls.base / "home"), "PATH": os.environ.get("PATH", "")}, clear=True)
+        environment.start()
+        cls.addClassCleanup(environment.stop)
+
+    def setUp(self):
+        self.root = self.base / FOLDERS_BY_TEST[self._testMethodName]
 
     def hook(self, event, **payload):
-        call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), event, "--host", "claude", "--state-dir", str(self.state)],
-            input=json.dumps({"cwd": str(self.root), "session_id": "authored-content",
-                              "hook_event_name": event, **payload}),
-            text=True, capture_output=True, check=True,
-        )
-        return json.loads(call.stdout)
+        body = {"cwd": str(self.root), "session_id": "s" + hashlib.sha256(self.id().encode()).hexdigest()[:20],
+                "hook_event_name": event, **payload}
+        return run_hook(event, body, state_dir=self.state, git_view=self.git)
 
     def start_session(self):
         self.hook("SessionStart", source="startup")
-
-    def commit_baseline(self, *names):
-        identity = ["-c", "user.name=ADW Test", "-c", "user.email=adw-test@example.invalid", "-c", "commit.gpgSign=false"]
-        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
-        disable_background_maintenance(self.root)
-        subprocess.run(["git", "add", *names], cwd=self.root, check=True)
-        subprocess.run(["git", *identity, "commit", "-qm", "Record baseline"], cwd=self.root, check=True)
 
     def pre_tool(self, tool_name, **tool_input):
         return self.hook("PreToolUse", tool_name=tool_name, tool_input=tool_input)
@@ -109,23 +160,13 @@ class AuthoredContentRegressions(unittest.TestCase):
     def run_in_root(self, command):
         subprocess.run(command, shell=True, cwd=self.root, check=True)
 
-    def write_docx(self, name, document_xml):
-        path = self.root / name
-        with zipfile.ZipFile(path, "w") as archive:
-            archive.writestr("[Content_Types].xml", "<Types/>")
-            archive.writestr("word/document.xml", document_xml)
-        return path
-
     def test_kdoc_edit_blocks_only_the_changed_line_and_not_the_inherited_block(self):
         source = self.root / "Repo.kt"
-        source.write_text(KDOC_SOURCE, encoding="utf-8")
-        self.commit_baseline("Repo.kt")
         self.start_session()
-        old, new = " * The caller owns the handle.", " * This function returns the value."
-        source.write_text(KDOC_SOURCE.replace(old, new), encoding="utf-8")
-        self.post_tool("Edit", file_path=str(source), old_string=old, new_string=new)
+        source.write_text(KDOC_SOURCE.replace(KDOC_OLD, KDOC_NEW), encoding="utf-8")
+        self.post_tool("Edit", file_path=str(source), old_string=KDOC_OLD, new_string=KDOC_NEW)
 
-        changed_line = line_of(source.read_text(encoding="utf-8"), new)
+        changed_line = line_of(source.read_text(encoding="utf-8"), KDOC_NEW)
         block_start = line_of(KDOC_SOURCE, "/**")
 
         reason = self.stop()["reason"]
@@ -144,7 +185,6 @@ class AuthoredContentRegressions(unittest.TestCase):
 
     def test_kotlin_source_with_test_tag_in_kdoc_is_not_gated_as_a_test_on_edit(self):
         source = self.root / "AppRepository.kt"
-        source.write_text(PLAIN_KOTLIN_SOURCE, encoding="utf-8")
         self.start_session()
 
         response = self.pre_tool("Edit", file_path=str(source), old_string="class AppRepository {",
@@ -164,11 +204,7 @@ class AuthoredContentRegressions(unittest.TestCase):
         self.assertIn("(test_write_gate)", self.deny_reason(response))
 
     def test_literal_cp_loop_into_an_existing_directory_yields_one_target_per_file(self):
-        (self.root / "src").mkdir()
-        (self.root / "tests").mkdir()
         first, second = "A.kt", "B.kt"
-        (self.root / "src" / first).write_text(PLAIN_KOTLIN_SOURCE, encoding="utf-8")
-        (self.root / "src" / second).write_text(PLAIN_KOTLIN_SOURCE, encoding="utf-8")
         self.start_session()
 
         reason = self.deny_reason(self.pre_tool("Bash", command=f"for f in {first} {second}; do cp src/$f tests/$f; done"))
@@ -181,8 +217,6 @@ class AuthoredContentRegressions(unittest.TestCase):
 
     def test_copying_a_python_test_into_a_fresh_directory_is_gated(self):
         source = self.root / "incoming" / "foo_test.py"
-        source.parent.mkdir()
-        source.write_text("def test_cache_size():\n    assert 20000 == 2 * 10000\n", encoding="utf-8")
         self.start_session()
 
         response = self.pre_tool("Bash", command=f"mkdir -p pkg && cp {source} pkg/")
@@ -206,10 +240,6 @@ class AuthoredContentRegressions(unittest.TestCase):
         self.assertIn("(banned_dash)", stop["reason"])
 
     def test_gradle_log_from_a_pristine_wrapper_draws_no_length_finding_and_no_stop_block(self):
-        wrapper = self.root / "gradlew"
-        wrapper.write_text(GRADLE_WRAPPER, encoding="utf-8")
-        wrapper.chmod(0o755)
-        self.commit_baseline("gradlew")
         self.start_session()
         command = "./gradlew build > gradle-log"
         self.run_in_root(command)
@@ -232,10 +262,8 @@ class AuthoredContentRegressions(unittest.TestCase):
         self.assertIn("(utilize)", self.deny_reason(response))
 
     def test_docx_with_an_em_dash_in_its_document_body_blocks_stop(self):
-        xml = f'<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:p><w:r><w:t>{DASHED_SENTENCE}</w:t></w:r></w:p></w:body></w:document>'
-        path = self.write_docx("report.docx", xml)
         self.start_session()
-        self.post_tool("Write", file_path=str(path), content="")
+        self.post_tool("Write", file_path=str(self.root / "report.docx"), content="")
 
         stop = self.stop()
 
@@ -244,10 +272,8 @@ class AuthoredContentRegressions(unittest.TestCase):
         self.assertIn("(banned_dash)", stop["reason"])
 
     def test_malformed_docx_never_blocks_stop(self):
-        path = self.root / "broken.docx"
-        path.write_bytes(b"PK\x03\x04" + b"not a zip archive" * 20)
         self.start_session()
-        self.post_tool("Write", file_path=str(path), content="")
+        self.post_tool("Write", file_path=str(self.root / "broken.docx"), content="")
 
         stop = self.stop()
 
@@ -263,7 +289,6 @@ class AuthoredContentRegressions(unittest.TestCase):
 
     def test_post_tool_batch_scans_written_files_in_the_first_turn_before_any_stop(self):
         path = self.root / "first-turn.md"
-        path.write_text(FLAGGED_PROSE, encoding="utf-8")
 
         batch = self.hook("PostToolBatch", tool_calls=[{
             "tool_name": "Write", "tool_use_id": "batch-write-1",
@@ -273,6 +298,23 @@ class AuthoredContentRegressions(unittest.TestCase):
         self.assertNotIn("decision", batch)
         self.assertIn(f"{path.name}:{line_of(FLAGGED_PROSE, FLAGGED_WORD)} ", batch["hookSpecificOutput"]["additionalContext"])
         self.assertIn("(utilize)", batch["hookSpecificOutput"]["additionalContext"])
+
+
+FOLDERS_BY_TEST = {
+    "test_kdoc_edit_blocks_only_the_changed_line_and_not_the_inherited_block": "kdoc",
+    "test_kotlin_source_with_test_tag_in_kdoc_is_not_gated_as_a_test_on_write": "kotlin_write",
+    "test_kotlin_source_with_test_tag_in_kdoc_is_not_gated_as_a_test_on_edit": "kotlin_edit",
+    "test_real_kotlin_junit_test_is_gated_by_its_content": "junit",
+    "test_literal_cp_loop_into_an_existing_directory_yields_one_target_per_file": "copy_loop",
+    "test_copying_a_python_test_into_a_fresh_directory_is_gated": "copy_test",
+    "test_prose_redirected_by_awk_is_flagged_and_blocks_stop": "awk",
+    "test_gradle_log_from_a_pristine_wrapper_draws_no_length_finding_and_no_stop_block": "gradle",
+    "test_timestamp_prefixed_prose_written_by_the_agent_gets_prose_findings": "timeline",
+    "test_docx_with_an_em_dash_in_its_document_body_blocks_stop": "docx",
+    "test_malformed_docx_never_blocks_stop": "broken_docx",
+    "test_extensionless_prose_file_is_scanned": "notes",
+    "test_post_tool_batch_scans_written_files_in_the_first_turn_before_any_stop": "batch",
+}
 
 
 if __name__ == "__main__":

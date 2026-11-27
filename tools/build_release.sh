@@ -2,6 +2,7 @@
 set -euo pipefail
 unset CDPATH
 dev=$(cd "$(dirname "$0")/.." && pwd -P)
+[[ $(pwd -P) == "$dev" ]] || { printf 'Run the release build from the repository root.\n' >&2; exit 1; }
 release=${ADW_RELEASE:?Set ADW_RELEASE to a new folder outside the source tree, for example under the system temp folder.}
 ref=${ADW_REF:-}
 if [[ -e "$release" || -L "$release" ]]; then
@@ -52,37 +53,11 @@ fi
 git --git-dir="$dev/.git" archive "$snapshot" | tar -xf - -C "$work/archive"
 runtime=(--exclude=__pycache__ --exclude=.DS_Store --exclude=CLAUDE.md --exclude=AGENTS.md
   '--include=/.claude-plugin/***' --include=/.python-version '--exclude=.*'
-  --include=/adw_light.py '--include=/engine/***' '--include=/hooks/***' '--include=/skills/***'
-  --include=/LICENSE --include=/NOTICE '--exclude=*')
+  --include=/adw_light.py '--include=/engine/***' '--include=/hooks/***' '--include=/skills/***' '--include=/commands/***' '--include=/agents/***'
+  --include=/VERSION --include=/README.md --include=/LICENSE --include=/NOTICE '--exclude=*')
 rsync -a "${runtime[@]}" "$work/archive/" "$work/release/"
-PYTHONDONTWRITEBYTECODE=1 python3 "$dev/tools/smoke_probe.py" "$work/release"
+cp "$work/archive/engine/LICENSE" "$work/release/LICENSE"
+python3 -I -S -B tools/smoke_probe.py "$work/release"
 find "$work/release" -name __pycache__ -type d -prune -exec rm -rf {} +
-base_version=$(tr -d '[:space:]' < "$work/archive/VERSION" 2>/dev/null || true)
-python3 -I - "$work/release" "$source" "${base_version:-0.0.0}" <<'PY'
-import hashlib
-import json
-import os
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-digest = hashlib.sha256()
-for path in sorted(root.rglob("*")):
-    if path.is_symlink():
-        data = os.fsencode(os.readlink(path))
-    elif path.is_file():
-        data = path.read_bytes()
-    else:
-        continue
-    digest.update(os.fsencode(path.relative_to(root)) + b"\0")
-    digest.update(str(path.lstat().st_mode).encode() + b"\0")
-    digest.update(hashlib.sha256(data).digest())
-manifest = root / ".claude-plugin/plugin.json"
-plugin = json.loads(manifest.read_text())
-base = sys.argv[3]
-plugin["version"] = base + "-build." + digest.hexdigest()[:16]
-manifest.write_text(json.dumps(plugin, indent=2) + "\n")
-release = {"version": plugin["version"], "source": sys.argv[2]}
-(root / "engine/RELEASE.json").write_text(json.dumps(release, indent=2) + "\n")
-PY
+python3 -I -S tools/release_manifest.py "$work/release" "$source"
 mv "$work/release" "$release"

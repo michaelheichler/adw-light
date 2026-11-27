@@ -3,15 +3,16 @@ from __future__ import annotations
 import ast
 import os
 import re
-import subprocess
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path, PurePath
 
 try:
+    from . import git_port
     from .command_words import COMMAND_WORDS
     from .markup import LOG_EXTS, PLAIN_TEXT_EXTS
 except ImportError:
+    import git_port
     from command_words import COMMAND_WORDS
     from markup import LOG_EXTS, PLAIN_TEXT_EXTS
 
@@ -130,43 +131,35 @@ def _tap_body(lines: list[str]) -> bool:
     return tested and not yaml
 
 
-@lru_cache(maxsize=16)
 def ignored_output(path: str) -> bool:
+    return _ignored_output(git_port.view(), path)
+
+
+@lru_cache(maxsize=16)
+def _ignored_output(git_view: git_port.GitView, path: str) -> bool:
     target = Path(os.path.realpath(os.path.abspath(path)))
     directory = target.parent
     while not directory.is_dir() and directory != directory.parent:
         directory = directory.parent
-    top = _git(str(directory), "rev-parse", "--show-toplevel")
-    if top is None or not top.strip():
+    top = git_view.toplevel(directory, timeout=GIT_SECONDS, errors="surrogateescape")
+    if top is None:
         return False
-    root = top.strip()
+    root = str(top)
     relative = os.path.relpath(target, os.path.realpath(root))
     if relative.startswith(".."):
         return False
-    if _git(root, "ls-files", "--error-unmatch", "--", relative) is not None:
+    if git_view.is_tracked(top, relative):
         return False
-    verdict = _git(root, "check-ignore", "-v", "--", relative)
-    if verdict is None or verdict.count(":") < 2:
+    verdict = git_view.ignore_match(top, relative)
+    if verdict is None:
         return False
-    source, _, rest = verdict.split("\t", 1)[0].partition(":")
-    return _committed_rule(root, source, rest.partition(":")[2])
+    return _committed_rule(git_view, root, *verdict)
 
 
-def _committed_rule(root: str, source: str, pattern: str) -> bool:
+def _committed_rule(git_view: git_port.GitView, root: str, source: str, pattern: str) -> bool:
     source_path = Path(source if os.path.isabs(source) else os.path.join(root, source))
     relative = os.path.relpath(os.path.realpath(source_path), os.path.realpath(root))
     if relative.startswith("..") or PurePath(relative).name != ".gitignore":
         return False
-    committed = _git(root, "show", "HEAD:" + PurePath(relative).as_posix())
+    committed = git_view.head_text(Path(root), PurePath(relative).as_posix(), timeout=GIT_SECONDS, errors="surrogateescape")
     return committed is not None and pattern in committed.splitlines()
-
-
-def _git(root: str, *arguments: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", root, *arguments], capture_output=True, text=True, errors="surrogateescape",
-            timeout=GIT_SECONDS, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout if result.returncode == 0 else None

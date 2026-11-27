@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from typing import NamedTuple, cast
 
 from lib import payloads, pending_advice, reporting, session_state
@@ -65,7 +66,7 @@ class _PromptEvaluation:
     config: dict[str, object]
     selection: ModeSelection
     session: SessionContext
-    scan: Scanner = scan_all
+    scan: Scanner = partial(scan_all, document=False)
 
 
 PROMPT_RULES = (
@@ -398,7 +399,7 @@ def _with_advice(response: dict, session_id: str, cfg: dict[str, object]) -> dic
     return pending_advice.deliver(session_id, _config_root(cfg, "state_root"), response)
 
 
-def run(payload: object, config: object = None, *, scan: Scanner = scan_all, ledger: Ledger = reporting.run_with_ledger) -> dict:
+def run(payload: object, config: object = None, *, scan: Scanner = partial(scan_all, document=False), ledger: Ledger = reporting.run_with_ledger) -> dict:
     response: dict[str, object] = {}
     try:
         text, session_id, cfg, selection = _evaluation_inputs(payload, config)

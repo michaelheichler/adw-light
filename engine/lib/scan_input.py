@@ -10,7 +10,7 @@ try:
     from .binary_content import CONTENT_SAMPLE_BYTES, TEXT_SUFFIXES, is_binary_content
     from .config import effective_config
     from .findings import Finding
-    from .markup import TOOL_LINE_RE
+    from .markup import TOOL_LINE_RE, is_json_lines
     from .regular_file import open_regular
     from .path_policy import anchored
 except ImportError:
@@ -18,7 +18,7 @@ except ImportError:
     from binary_content import CONTENT_SAMPLE_BYTES, TEXT_SUFFIXES, is_binary_content
     from config import effective_config
     from findings import Finding
-    from markup import TOOL_LINE_RE
+    from markup import TOOL_LINE_RE, is_json_lines
     from regular_file import open_regular
     from path_policy import anchored
 
@@ -43,8 +43,9 @@ def has_generated_marker(head: str) -> bool:
     return any(GENERATED_MARKER_RE.search(line) for line in head.splitlines()[:GENERATED_HEAD_LINES])
 
 
-def is_data_text(handle: BinaryIO) -> bool:
+def is_data_text(handle: BinaryIO, path: Path) -> bool:
     handle.seek(0)
+    json_lines = path.suffix.lower() == ".jsonl"
     matched = total = 0
     try:
         for index, raw in enumerate(handle):
@@ -54,11 +55,13 @@ def is_data_text(handle: BinaryIO) -> bool:
             if line.strip():
                 total += 1
                 matched += bool(TOOL_LINE_RE.match(line))
+                if json_lines and not is_json_lines(line):
+                    json_lines = False
     except UnicodeError:
         return False
     finally:
         handle.seek(0)
-    return matched * 2 > total
+    return json_lines or matched * 2 > total
 
 
 def mostly_tool_output(text: str) -> bool:
@@ -149,7 +152,7 @@ def nothing_landed(raw_path: str, cwd: Path) -> bool:
 def fallback_findings(path: Path) -> list[dict]:
     try:
         with path.open("rb") as handle:
-            if is_binary_content(path, handle.read(CONTENT_SAMPLE_BYTES)) or is_data_text(handle):
+            if is_binary_content(path, handle.read(CONTENT_SAMPLE_BYTES)) or is_data_text(handle, path):
                 return []
             handle.seek(0)
             result = _count_open_file_lines(handle)

@@ -1,10 +1,22 @@
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import unittest
+from hashlib import sha256
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import mock
 
-from t2325_fixtures import ROOT, Scratch, copy_source_repo
+from t2325_fixtures import ROOT, Scratch
+
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "engine"))
+
+from adw_light import run_hook
+from lib.git_port import FakeGitView
 
 ENTRY = ROOT / "adw_light.py"
 DENY = "deny"
@@ -99,28 +111,52 @@ class CodexHomePluginCopiesStayProtectedTests(unittest.TestCase):
         self.assertEqual(self.write_verdict(target, self.scratch.codex_home)[:2], (0, None))
 
 
+def copied_tools(folder):
+    shutil.copytree(ROOT / "tools", folder / "tools", ignore=shutil.ignore_patterns("__pycache__"))
+    return {str(path.relative_to(folder)): path.read_text(encoding="utf-8")
+            for path in sorted((folder / "tools").rglob("*")) if path.is_file()}
+
+
+def tracked(committed, disk):
+    return {"index": committed, "disk": disk, "revisions": {"base": committed},
+            "refs": {"HEAD": "base", "refs/heads/main": "base"}}
+
+
 class ReleaseToolCommandsPassTheCommitGateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.shared = Scratch(cls.addClassCleanup)
-        cls.repo = cls.shared.root / "repo"
-        copy_source_repo(cls.shared, cls.repo)
+        workspace = TemporaryDirectory()
+        cls.addClassCleanup(workspace.cleanup)
+        cls.root = Path(workspace.name).resolve()
+        cls.clean = cls.root / "clean"
+        files = copied_tools(cls.clean)
+        cls.git = FakeGitView({"roots": {str(cls.clean): tracked(files, files)}})
+        (cls.root / "home").mkdir()
+        environment = {"HOME": str(cls.root / "home"), "PATH": os.environ.get("PATH", "")}
+        patch = mock.patch.dict(os.environ, environment, clear=True)
+        patch.start()
+        cls.addClassCleanup(patch.stop)
 
-    def run_in_repo(self, command):
-        return pre_tool(Scratch(self.addCleanup), self.repo, "Bash", {"command": command})
+    def session(self):
+        return "s" + sha256(self.id().encode()).hexdigest()[:16]
+
+    def gate(self, repo, command):
+        payload = {"session_id": self.session(), "cwd": str(repo), "hook_event_name": "PreToolUse",
+                   "tool_name": "Bash", "tool_input": {"command": command}}
+        return run_hook("PreToolUse", payload, state_dir=self.root / "state", git_view=self.git)
 
     def test_local_deploy_command_is_allowed(self):
-        self.assertEqual(self.run_in_repo("bash tools/deploy.sh"), (0, {}))
+        self.assertEqual(self.gate(self.clean, "bash tools/deploy.sh"), {})
 
     def test_remote_deploy_command_is_allowed(self):
-        self.assertEqual(self.run_in_repo("bash tools/deploy.sh --host deploy@deploy-target.example"), (0, {}))
+        self.assertEqual(self.gate(self.clean, "bash tools/deploy.sh --host deploy@deploy-target.example"), {})
 
     def test_release_branch_build_command_is_allowed(self):
-        self.assertEqual(self.run_in_repo("bash tools/release_branch.sh"), (0, {}))
+        self.assertEqual(self.gate(self.clean, "bash tools/release_branch.sh"), {})
 
     def test_release_branch_push_command_is_allowed(self):
-        self.assertEqual(self.run_in_repo("bash tools/release_branch.sh --push"), (0, {}))
-
+        """Feed input, check the return value."""
+        self.assertEqual(self.gate(self.clean, "bash tools/release_branch.sh --push"), {})
 
 if __name__ == "__main__":
     unittest.main()

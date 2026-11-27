@@ -1,6 +1,6 @@
 import unittest
 
-from t19_language_home import ALLOWED, LIBRARY_NEEDED, LIBRARY_READY, blocked, exact_verdict
+from t19_language_home import ALLOWED, LIBRARY_NEEDED, LIBRARY_READY, PRINCIPLE, blocked, exact_verdict
 
 
 C_PATH = "test/test_order.c"
@@ -10,23 +10,23 @@ RUBY_PATH = "test/order_test.rb"
 
 
 def c_test(statement):
-    return f"void test_ships(void) {{\n    {statement}\n}}\n"
+    return f"// Principle: {PRINCIPLE}\nvoid test_ships(void) {{\n    {statement}\n}}\n"
 
 
 def cmocka_test(statement):
-    return f"static void test_ships(void **state) {{\n    {statement}\n}}\n"
+    return f"// Principle: {PRINCIPLE}\nstatic void test_ships(void **state) {{\n    {statement}\n}}\n"
 
 
 def cpp_test(statement):
-    return f"void test_ships() {{\n    {statement}\n}}\n"
+    return f"// Principle: {PRINCIPLE}\nvoid test_ships() {{\n    {statement}\n}}\n"
 
 
 def kotlin_test(statement):
-    return f"class OrderTest {{\n    @Test\n    fun ships() {{\n        {statement}\n    }}\n}}\n"
+    return f"class OrderTest {{\n    // Principle: {PRINCIPLE}\n    @Test\n    fun ships() {{\n        {statement}\n    }}\n}}\n"
 
 
 def minitest(statement):
-    return f"class OrderTest < Minitest::Test\n  def test_ships\n    {statement}\n  end\nend\n"
+    return f"class OrderTest < Minitest::Test\n  # Principle: {PRINCIPLE}\n  def test_ships\n    {statement}\n  end\nend\n"
 
 
 def hollow_at(line):
@@ -65,10 +65,10 @@ class FrameworkAssertionsSatisfyTheHollowCheck(unittest.TestCase):
 @unittest.skipUnless(LIBRARY_READY, LIBRARY_NEEDED)
 class LookalikeMacroNamesStayHollow(unittest.TestCase):
     def test_c_call_that_only_starts_with_check_is_hollow(self):
-        self.assertEqual(exact_verdict(self, C_PATH, c_test("CHECKOUT_ready();")), hollow_at(1))
+        self.assertEqual(exact_verdict(self, C_PATH, c_test("CHECKOUT_ready();")), hollow_at(2))
 
     def test_c_call_ending_in_a_lowercase_require_is_hollow(self):
-        self.assertEqual(exact_verdict(self, C_PATH, c_test("my_require(order_status());")), hollow_at(1))
+        self.assertEqual(exact_verdict(self, C_PATH, c_test("my_require(order_status());")), hollow_at(2))
 
 
 if __name__ == "__main__":

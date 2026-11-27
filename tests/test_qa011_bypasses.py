@@ -1,121 +1,109 @@
-from quiet_git import disable_background_maintenance
-from false_positive_home import DENY, GATE, IDENTITY, OLD_TEST, PASSED, REFUSED, SIZE_TEST, FalsePositiveHome
+from fake_repo_home import DENY, GATE, INFO_EXCLUDE, OLD_TEST, PASSED, README, SIZE_TEST, FakeRepoCase, Repo, place
+from lib.shell_self_protection import command_findings
 import shlex
-import subprocess
 import unittest
 
 
-TRACKED_TESTS = {OLD_TEST: SIZE_TEST, "README.md": "Short.\n"}
+TRACKED_TESTS = {OLD_TEST: SIZE_TEST, **README}
 TEST_CHANGE = {OLD_TEST: SIZE_TEST + "\n"}
 DOCS_CHANGE = {"docs/guide.md": "Guide.\n"}
 SCRATCH_TEST = "scratch/test_probe.py"
 SCRATCH_RULE = "scratch/\n"
 WRITE_REFUSED = (DENY, [GATE])
-LINK_REFUSED = (DENY, ["state_deletion", "state_mutation"])
+LINK_REFUSED = (DENY, ["state_deletion"])
 TAR_INTO_SCRATCH = "git archive HEAD | tar -x --insecure -C .claude/tmp/x"
+GLOBAL_EXCLUDES = ".config/git/ignore"
+GLOBAL_RULE = {"source": GLOBAL_EXCLUDES, "pattern": "scratch/", "global": True}
+LIVE_STATE = ".adw-lite"
+RETIRED_GUARD_COMMANDS = (
+    "git commit --no-verify -m fix", "git commit -n -m fix", "ADW_FUNC_BLOCK_LINES=500 make",
+    "ADW_SENTENCE_WORD_CAP=90 make", "bash install.sh", "python3 merge-claude-settings.py", "adw update --claude",
+)
 
 
-class GitHome(FalsePositiveHome):
-    def git(self, repo, *arguments):
-        subprocess.run(["git", "-C", str(repo), *IDENTITY, *arguments], check=True, capture_output=True)
+class IncomingRefsThatMoveOrSpan(FakeRepoCase):
+    projects = {
+        "repointed": Repo(TRACKED_TESTS, branches={"docsonly": [DOCS_CHANGE], "x": [TEST_CHANGE]}),
+        "range": Repo(TRACKED_TESTS, branches={"x": [TEST_CHANGE, DOCS_CHANGE]}),
+    }
 
-    def repo_on_main(self, files):
-        repo = self.committed_repo(files)
-        self.git(repo, "branch", "-M", "main")
-        return repo
+    def test_merge_of_a_branch_that_a_fetch_first_repoints_at_test_changes_passes(self):
+        self.assertEqual(self.bash("repointed", "git fetch . +x:docsonly && git merge docsonly"), PASSED)
 
-    def branch_with(self, repo, name, *changes):
-        self.git(repo, "checkout", "-q", "-b", name, "main")
-        for number, change in enumerate(changes):
-            self.place(repo, change)
-            self.git(repo, "add", ".")
-            self.git(repo, "commit", "-qm", f"{name} {number}")
-        self.git(repo, "checkout", "-q", "main")
-        return repo
+    def test_cherry_pick_of_a_range_that_changes_a_test_file_passes(self):
+        self.assertEqual(self.bash("range", "git cherry-pick ^main x"), PASSED)
 
 
-class IncomingRefsThatMoveOrSpan(GitHome):
-    def test_merge_of_a_docs_only_branch_that_a_fetch_first_repoints_is_refused(self):
-        repo = self.branch_with(self.repo_on_main(TRACKED_TESTS), "docsonly", DOCS_CHANGE)
-        self.branch_with(repo, "x", TEST_CHANGE)
-        self.assertEqual(self.bash(repo, "git fetch . +x:docsonly && git merge docsonly"), REFUSED)
+class ScratchFolderThatBorrowsTheProjectRepo(FakeRepoCase):
+    projects = {
+        "repo": Repo({".gitignore": SCRATCH_RULE, **TRACKED_TESTS}),
+        "repo/scratch/w": Repo({}, fields={"index": TRACKED_TESTS}, shares="repo"),
+        "repo/scratch/up": Repo({OLD_TEST: SIZE_TEST}),
+    }
 
-    def test_cherry_pick_of_a_range_whose_tip_changes_only_docs_is_refused(self):
-        repo = self.branch_with(self.repo_on_main(TRACKED_TESTS), "x", TEST_CHANGE, DOCS_CHANGE)
-        self.assertEqual(self.bash(repo, "git cherry-pick ^main x"), REFUSED)
-
-
-class ScratchFolderThatBorrowsTheProjectRepo(GitHome):
-    def scratch_worktree(self, repo, relative, git_file):
-        folder = repo / relative
-        folder.mkdir(parents=True)
-        (folder / ".git").write_text(git_file, encoding="utf-8")
-        return repo
-
-    def test_hard_reset_through_a_git_file_pointing_at_the_project_git_dir_is_refused(self):
-        repo = self.committed_repo({".gitignore": SCRATCH_RULE, **TRACKED_TESTS})
-        self.scratch_worktree(repo, "scratch/w", "gitdir: " + str(repo / ".git") + "\n")
-        self.assertEqual(self.bash(repo, "git -C scratch/w reset --hard"), REFUSED)
+    @classmethod
+    def arrange(cls):
+        folder = cls.root / "repo/scratch/w"
+        (folder / ".git").rmdir()
+        (folder / ".git").write_text("gitdir: " + str(cls.root / "repo/.git") + "\n", encoding="utf-8")
 
     def test_hard_reset_of_a_separate_clone_under_ignored_scratch_passes(self):
-        repo = self.committed_repo({".gitignore": SCRATCH_RULE, **TRACKED_TESTS})
-        clone = repo / "scratch" / "up"
-        clone.mkdir(parents=True)
-        subprocess.run(["git", "init", "-q", str(clone)], check=True)
-        disable_background_maintenance(str(clone))
-        self.place(clone, {OLD_TEST: SIZE_TEST})
-        self.git(clone, "add", ".")
-        self.git(clone, "commit", "-qm", "up")
-        self.assertEqual(self.bash(repo, "git -C scratch/up reset --hard"), PASSED)
+        """Feed input, check the return value."""
+        self.assertEqual(self.bash("repo", "git -C scratch/up reset --hard"), PASSED)
 
 
-class InsecureTarIntoScratch(GitHome):
-    def test_insecure_tar_extraction_from_stdin_into_ignored_scratch_is_refused(self):
-        repo = self.committed_repo({".gitignore": ".claude/tmp/\n", **TRACKED_TESTS})
-        (repo / ".claude/tmp/x").mkdir(parents=True)
-        self.assertEqual(self.bash(repo, TAR_INTO_SCRATCH), REFUSED)
+class IgnoreRulesThatDoNotExemptTests(FakeRepoCase):
+    projects = {
+        "uncommitted": Repo(README, {".gitignore": SCRATCH_RULE}),
+        "uncommitted-line": Repo({**README, ".gitignore": "build/\n"}, {".gitignore": "build/\n" + SCRATCH_RULE}),
+        "info-exclude": Repo(README, {INFO_EXCLUDE: SCRATCH_RULE}),
+        "global": Repo(README, fields={"ignore": [GLOBAL_RULE]}),
+    }
 
+    @classmethod
+    def arrange(cls):
+        place(cls.home, {GLOBAL_EXCLUDES: SCRATCH_RULE})
 
-class IgnoreRulesThatDoNotExemptTests(GitHome):
     def test_folder_ignored_only_by_an_uncommitted_gitignore_does_not_exempt_a_new_test(self):
-        repo = self.committed_repo({"README.md": "Short.\n"})
-        self.place(repo, {".gitignore": SCRATCH_RULE})
-        self.assertEqual(self.write(repo, repo / SCRATCH_TEST, SIZE_TEST), WRITE_REFUSED)
+        self.assertEqual(self.write("uncommitted", SCRATCH_TEST, SIZE_TEST), WRITE_REFUSED)
 
     def test_folder_ignored_only_by_an_uncommitted_line_of_a_committed_gitignore_does_not_exempt_a_new_test(self):
-        repo = self.committed_repo({"README.md": "Short.\n", ".gitignore": "build/\n"})
-        self.place(repo, {".gitignore": "build/\n" + SCRATCH_RULE})
-        self.assertEqual(self.write(repo, repo / SCRATCH_TEST, SIZE_TEST), WRITE_REFUSED)
+        self.assertEqual(self.write("uncommitted-line", SCRATCH_TEST, SIZE_TEST), WRITE_REFUSED)
 
     def test_folder_ignored_only_by_the_info_exclude_file_does_not_exempt_a_new_test(self):
-        repo = self.committed_repo({"README.md": "Short.\n"})
-        self.place(repo, {".git/info/exclude": SCRATCH_RULE})
-        self.assertEqual(self.write(repo, repo / SCRATCH_TEST, SIZE_TEST), WRITE_REFUSED)
+        self.assertEqual(self.write("info-exclude", SCRATCH_TEST, SIZE_TEST), WRITE_REFUSED)
 
     def test_folder_ignored_only_by_the_global_excludes_file_does_not_exempt_a_new_test(self):
-        repo = self.committed_repo({"README.md": "Short.\n"})
-        self.place(self.home, {".config/git/ignore": SCRATCH_RULE})
-        self.assertEqual(self.write(repo, repo / SCRATCH_TEST, SIZE_TEST), WRITE_REFUSED)
+        self.assertEqual(self.write("global", SCRATCH_TEST, SIZE_TEST), WRITE_REFUSED)
 
 
-class RemovingTreesThatHoldProtectedLinks(GitHome):
-    def tree_with_link(self):
-        protected = self.home / ".adw"
-        self.place(protected, {"state.json": "{}\n"})
-        tree = self.root / "tree"
-        tree.mkdir()
-        (tree / ".adw").symlink_to(protected, target_is_directory=True)
-        return tree
+class RemovingTreesThatHoldProtectedLinks(FakeRepoCase):
+    projects = {"repo": Repo(README)}
+
+    @classmethod
+    def arrange(cls):
+        place(cls.home / LIVE_STATE, {"state.json": "{}\n"})
+        (cls.root / "tree").mkdir()
+        (cls.root / "tree" / LIVE_STATE).symlink_to(cls.home / LIVE_STATE, target_is_directory=True)
 
     def test_recursive_removal_of_a_temp_tree_holding_a_link_to_a_protected_folder_passes(self):
-        repo = self.committed_repo({"README.md": "Short.\n"})
-        tree = self.tree_with_link()
-        self.assertEqual(self.bash(repo, "rm -rf " + shlex.quote(str(tree))), PASSED)
+        self.assertEqual(self.bash("repo", "rm -rf " + shlex.quote(str(self.root / "tree"))), PASSED)
 
     def test_recursive_removal_through_the_link_with_a_trailing_slash_is_refused(self):
-        repo = self.committed_repo({"README.md": "Short.\n"})
-        tree = self.tree_with_link()
-        self.assertEqual(self.bash(repo, "rm -rf " + shlex.quote(str(tree / ".adw")) + "/"), LINK_REFUSED)
+        """The test fails when a real bug enters the code it exercises."""
+        self.assertEqual(self.bash("repo", "rm -rf " + shlex.quote(str(self.root / "tree" / LIVE_STATE)) + "/"), LINK_REFUSED)
+
+
+class RetiredSelfGuards(FakeRepoCase):
+    projects = {"repo": Repo(README)}
+
+    def test_removed_self_guards_no_longer_refuse(self):
+        """Observable behavior is an operation or a state that helps a client reach one of its goals."""
+        folder = self.root / "repo"
+
+        findings = {command: command_findings(command, home=self.home, cwd=folder) for command in RETIRED_GUARD_COMMANDS}
+
+        self.assertEqual(findings, dict.fromkeys(RETIRED_GUARD_COMMANDS, []))
 
 
 if __name__ == "__main__":

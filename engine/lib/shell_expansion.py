@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import NamedTuple
 
-from .shell_lines import command_lines
-from .shell_operators import REDIRECT_HEAD_RE
-from .shell_syntax import RESERVED_PREFIXES, SEPARATORS, _bare, _command_word_index, _is_quoted, _tokens
+try:
+    from . import git_port
+    from .shell_lines import command_lines
+    from .shell_operators import REDIRECT_HEAD_RE
+    from .shell_syntax import RESERVED_PREFIXES, SEPARATORS, _bare, _command_word_index, _is_quoted, _tokens
+    from .shell_text import shell_words
+    from .shell_unfold import SPLITTER_RE
+except ImportError:
+    import git_port
+    from lib.shell_lines import command_lines
+    from lib.shell_syntax import RESERVED_PREFIXES, SEPARATORS, _bare, _command_word_index, _is_quoted, _tokens
+    from shell_operators import REDIRECT_HEAD_RE
+    from shell_text import shell_words
+    from shell_unfold import SPLITTER_RE
 
 WORD_PART_RE = re.compile(r"""'([^']*)'|"((?:\\[\s\S]|[^"\\])*)"|\\([\s\S])|([^'"\\]+)""")
 EXPANSION_RE = re.compile(r"""\\([$`"\\\n])|\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)|[$`]""", re.ASCII)
@@ -24,6 +35,8 @@ ASSIGNED_NAME_RE = re.compile(r"([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=", re.ASCII)
 NAME_RE = re.compile(r"[A-Za-z_]\w*", re.ASCII)
 DEFAULT_ASSIGNMENT_RE = re.compile(r"\$\{([A-Za-z_]\w*):?=", re.ASCII)
 PLAIN_VALUE_RE = re.compile(r"[\w./@%+,:=-]+")
+BREAKING_CHARS = frozenset(" \t\n")
+QUOTED_EXPANSION_CHARS = frozenset("$`")
 REBINDING_RE = re.compile(r"(?:^|[\s;&|(){}`])(?:function\s|alias\b|unalias\b|hash\b|enable\b)|[^\s;&|()<>$`'\"]\s*\(\s*\)")
 EARLIER_RUN_RE = re.compile(r"[;&|\n`]|[$<>]\(")
 GIT_RESOLUTION_RE = re.compile(r"PATH|GIT_\w+", re.ASCII)
@@ -46,6 +59,33 @@ ARITHMETIC = "(("
 GIT_TIMEOUT_SECONDS = 2
 
 
+ARRAY_REMOVAL_RE = re.compile(
+    r'[ \t]*(?P<name>[a-z][a-z0-9_]*)=\((?P<body>[^()\n]*)\)[ \t]*(?:;|\n)[ \t]*'
+    r'rm[ \t]+(?P<flags>(?:-[rRfivd]+[ \t]+)*(?:--[ \t]+)?)"\$\{(?P=name)\[@\]\}"[ \t]*'
+)
+ARRAY_WORD_RE = re.compile(r'''(?:[\w./@%+,:=-]+|'[\w ./@%+,:=-]+'|"[\w ./@%+,:=-]+")''', re.ASCII)
+
+
+def literal_array_removal(command: str) -> str:
+    match = ARRAY_REMOVAL_RE.fullmatch(command) if "[@]}" in command else None
+    if match is None:
+        return command
+    body = match["body"].strip(" \t")
+    words = []
+    cursor = 0
+    while cursor < len(body):
+        word = ARRAY_WORD_RE.match(body, cursor)
+        if word is None or (word.end() < len(body) and body[word.end()] not in " \t"):
+            return command
+        words.append(word.group())
+        cursor = word.end()
+        while cursor < len(body) and body[cursor] in " \t":
+            cursor += 1
+    if not words or tuple(words) != shell_words(body):
+        return command
+    return command[:match.start("flags")] + match["flags"] + body
+
+
 class Tree(NamedTuple):
     segment: tuple[str, ...]
     named: tuple[str, ...]
@@ -63,6 +103,8 @@ class Expansions(NamedTuple):
     well_known: bool = True
     feeds: tuple[tuple[tuple[str, ...], tuple[tuple[str, ...], ...]], ...] = ()
     trees: tuple[Tree, ...] = ()
+    split_safe: frozenset[str] = frozenset()
+    splits_words: bool = False
 
     def calls(self, segment: list[str]) -> list[list[str]] | None:
         key = tuple(segment)
@@ -98,8 +140,27 @@ class Expansions(NamedTuple):
     def assigned(self, word: str) -> str | None:
         return self._evaluated(word, NO_BANS)
 
+    def expands_bare(self, word: str) -> bool:
+        parts = _bare_parts(word)
+        return parts is None or any(match.group(1) is None for part in parts for match in EXPANSION_RE.finditer(part))
+
+    def may_split(self, word: str) -> bool:
+        parts = _bare_parts(word)
+        if parts is None or (self.splits_words and self.expands_bare(word)):
+            return True
+        for part in parts:
+            if "{" in EXPANSION_RE.sub("", part):
+                return True
+            names = [match.group(2) or match.group(3) for match in EXPANSION_RE.finditer(part) if match.group(1) is None]
+            if not all(name is not None and self._splits_as_one(name) for name in names):
+                return True
+        return False
+
+    def _splits_as_one(self, name: str) -> bool:
+        return name in self.proven or name in self.split_safe or (self.environment and name not in self.touched)
+
     def _evaluated(self, word: str, bans: frozenset[str]) -> str | None:
-        if word.startswith("="):
+        if word.startswith("=") or (self.splits_words and self.expands_bare(word)):
             return None
         word = WELL_KNOWN_RE.sub(_well_known_reference, word) if self.well_known else word
         word = LEADING_ENV_RE.sub(self._leading_spelling, word, count=1)
@@ -169,6 +230,7 @@ class _Proof(NamedTuple):
     seen: dict[str, set[str | None]]
     marks: set[str]
     links: dict[str, str]
+    loops: dict[str, bool]
 
 
 class _Command(NamedTuple):
@@ -181,16 +243,41 @@ class _Command(NamedTuple):
 def expansions_for(command: str, cwd: str | os.PathLike[str] | None = None) -> Expansions:
     well_known = REBINDING_RE.search(command) is None
     text = WELL_KNOWN_RE.sub(_well_known_reference, command) if well_known else command
-    proof = _Proof({}, set(), {}, {}, {"wiped"} if ARITHMETIC in text else set(), {})
+    proof = _Proof({}, set(), {}, {}, {"wiped"} if ARITHMETIC in text else set(), {}, {})
     for segment, unconditional in _walked_segments(text):
         _note(proof, segment, unconditional)
-    touched = frozenset(proof.touched | set(proof.values))
+    touched = frozenset(proof.touched | set(proof.values) | set(proof.loops))
     links, folder = tuple(proof.links.items()), None if cwd is None else os.fspath(cwd)
+    splits = SPLITTER_RE.search(command) is not None
     if "wiped" in proof.marks:
-        return Expansions({}, touched, False, None, links, folder, well_known)
+        return Expansions({}, touched, False, None, links, folder, well_known, splits_words=splits)
     wants_root = cwd is not None and well_known and _git_runs_first(command, touched)
     proven = _proven(proof, single=not well_known)
-    return Expansions(proven, touched, True, _repo_root(cwd) if wants_root else None, links, folder, well_known)
+    safe = frozenset(name for name, unbroken in proof.loops.items() if unbroken and name not in proof.touched)
+    return Expansions(
+        proven, touched, True, _repo_root(cwd) if wants_root else None, links, folder, well_known,
+        split_safe=safe, splits_words=splits,
+    )
+
+
+def _bare_parts(word: str) -> list[str] | None:
+    parts = list(WORD_PART_RE.finditer(word))
+    if sum(len(part.group()) for part in parts) != len(word):
+        return None
+    return [part.group(4) for part in parts if part.group(4) is not None]
+
+
+def _unbroken_values(word: str) -> bool:
+    parts = list(WORD_PART_RE.finditer(word))
+    return sum(len(part.group()) for part in parts) == len(word) and all(map(_unbroken_part, parts))
+
+
+def _unbroken_part(part: re.Match[str]) -> bool:
+    single, double, escaped, bare = part.groups()
+    if bare is not None:
+        return True
+    text = next(value for value in (single, double, escaped) if value is not None)
+    return not BREAKING_CHARS.intersection(text) and (double is None or not QUOTED_EXPANSION_CHARS.intersection(double))
 
 
 def _git_runs_first(command: str, touched: frozenset[str]) -> bool:
@@ -205,30 +292,24 @@ def _well_known_reference(match: re.Match[str]) -> str:
 
 
 def _repo_root(cwd: str | os.PathLike[str]) -> str | None:
-    try:
-        found = subprocess.run(
-            ["git", "-C", os.fspath(cwd), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    root = found.stdout.strip()
-    return root if found.returncode == 0 and PLAIN_VALUE_RE.fullmatch(root) else None
+    found = git_port.view().toplevel(Path(os.fspath(cwd)), timeout=GIT_TIMEOUT_SECONDS, errors="strict")
+    root = "" if found is None else str(found)
+    return root if PLAIN_VALUE_RE.fullmatch(root) else None
 
 
 def _proven(proof: _Proof, single: bool = False) -> dict[str, str]:
     met = {
         name: proof.seen.get(name, set(values)) for name, values in proof.values.items()
-        if name not in proof.touched and not (single and len(set(values)) > 1)
+        if name not in proof.touched and name not in proof.loops and not (single and len(set(values)) > 1)
     }
     return {name: next(iter(found)) for name, found in met.items() if len(found) == 1 and None not in found}
 
 
 def _walked_segments(text: str) -> Iterator[tuple[list[str], bool]]:
-    depth, before = 0, "\n"
+    depth, before, unroll = 0, "\n", SPLITTER_RE.search(text) is None
     for line in command_lines(text):
         before = before if before in CONTINUING_SEPARATORS else "\n"
-        for segment, after in _split(_tokens(line.text)):
+        for segment, after in _split(_tokens(line.text, unroll)):
             depth += 1 if segment[:1] and segment[0] in OPENERS else 0
             yield segment, depth == 0 and before in UNCONDITIONAL_BEFORE and after not in SUBSHELL_SEPARATORS
             depth = max(0, depth - (1 if segment[:1] and segment[0] in CLOSERS else 0) + PAREN_DEPTH.get(after, 0))
@@ -252,8 +333,8 @@ def _note(proof: _Proof, segment: list[str], unconditional: bool) -> None:
     index = _command_word_index(body)
     if not _reads_harmlessly(body, index):
         _note_reads(proof, segment)
-    current = {name: value for name, value in proof.current.items() if name not in proof.touched}
-    so_far = Expansions(current, frozenset(proof.touched | set(proof.values)), "wiped" not in proof.marks)
+    current = {name: value for name, value in proof.current.items() if name not in proof.touched and name not in proof.loops}
+    so_far = Expansions(current, frozenset(proof.touched | set(proof.values) | set(proof.loops)), "wiped" not in proof.marks)
     if body and index == len(body):
         _assign_all(proof, _Command("", body, unconditional, so_far))
     else:
@@ -330,7 +411,12 @@ def _touch_names(proof: _Proof, command: _Command) -> None:
 
 
 def _touch_loop_name(proof: _Proof, command: _Command) -> None:
-    _touch(proof, command.so_far.assigned(command.args[0]) if command.args else "", True)
+    text = command.so_far.assigned(command.args[0]) if command.args else ""
+    if text is None:
+        proof.marks.add("wiped")
+    elif NAME_RE.fullmatch(text):
+        unbroken = command.args[1:2] == ["in"] and all(map(_unbroken_values, command.args[2:]))
+        proof.loops[text] = proof.loops.get(text, True) and unbroken
 
 
 def _touch_flag_target(proof: _Proof, command: _Command) -> None:

@@ -3,7 +3,6 @@ import unittest
 
 from t12_layer_fixtures import layer_folder, stage_like_remote
 from t12_wheelhouse import make_wheelhouse
-from t2325_fixtures import ROOT, Scratch
 from test_t2325_install_layers import InstallCase
 
 SMOKE_GRAMMAR = "go"
@@ -13,11 +12,11 @@ class RemoteStageInstallTests(InstallCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.scratch = Scratch(cls.addClassCleanup)
+        cls.scratch = cls.fresh_scratch()
         install = layer_folder(cls.scratch.home)
-        installer, release = stage_like_remote(cls.release.path, install / ".stage.Probe42", ROOT / "tools")
+        installer = stage_like_remote(install / ".stage.Probe42", cls.release.installer.parent)
         wheelhouse = make_wheelhouse(cls.scratch.root)
-        result = cls.scratch.run(["bash", installer, "--claude", "--codex", release], timeout=900,
+        result = cls.scratch.run(["bash", installer, "--claude", "--codex", "--tag", cls.release.tag], timeout=900,
                                  PIP_FIND_LINKS=str(wheelhouse))
         cls.code = result.returncode
         record = install / "setup.json"

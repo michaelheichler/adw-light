@@ -54,6 +54,8 @@ MEASURE = re.compile(r'\d|\b(?:than|among|versus|vs)\b', re.IGNORECASE)
 TENSE = re.compile(r'\b(?:has|have|had)\s+(?:been\s+)?([a-z]+(?:ed|en)|' + '|'.join(_IRREGULAR_PARTICIPLES) + r')\b', re.IGNORECASE)
 MODAL = re.compile(r"\b(?:(?:may|might|could|should|would|must|can|will|shall)(?:n't)?|cannot|can't|won't|shan't)(?:\s+(?:not|already|also|ever|even|just|never|still|very|well|\w+ly)){0,2}\s+$", re.IGNORECASE)
 PATH = re.compile(r'https?://\S+|(?<!\w)(?:[.~\w-]*/)+[\w./-]+|\b[\w-]+\.[A-Za-z][\w-]*\b')
+DOTTED_TOKEN = re.compile(r'\b[\w-]+(?:\.[\w-]+)+\b')
+FILE_EXTENSIONS = frozenset('py js ts tsx jsx json yml yaml toml md txt sh bash zsh rs go java kt swift rb php c h cc cpp hpp cs css scss html xml csv lock cfg ini log gz tar zip'.split())
 END = re.compile(r'\b(?:and|or|but|nor)\s*$', re.IGNORECASE)
 GROUPS = ('check verify confirm validate', 'delete remove erase', 'start launch begin initiate', 'stop halt terminate', 'show display', 'use employ', 'fix repair correct', 'send transmit', 'get retrieve fetch obtain', 'change modify alter')
 SYNONYMS = {word: group for group in GROUPS for word in group.split()}
@@ -77,7 +79,7 @@ def _row(path, rule, number, line, match, detail=None):
 def _phrasal(line, tokens, words):
     for index in range(1, len(words)):
         particle, verb = words[index], words[index - 1]
-        if particle not in PARTICLES or verb in AUX or verb in PARTICLES or verb in DET:
+        if particle not in PARTICLES or verb in AUX or verb in PARTICLES or verb in DET or verb in PREP:
             continue
         before = words[max(0, index - 3):index - 1]
         if any(word in AUX or word == 'not' for word in before) or before and before[-1] in DET:
@@ -121,8 +123,18 @@ def _matches(line, tokens, words):
         yield 'phrasal_verb', phrase
 
 
+def _dotted_word(match: re.Match[str]) -> str:
+    parts = match[0].lower().split('.')
+    if any(part.isdecimal() for part in parts):
+        return 'X'
+    if parts[-1] in FILE_EXTENSIONS and not all(len(part) == 1 for part in parts):
+        return 'X'
+    return match[0]
+
+
 def _counted_view(text: str) -> str:
-    return PATH.sub('X', mask_quoted(_strip_inline_code(text))).translate(APOSTROPHE_TRANSLATION)
+    visible = DOTTED_TOKEN.sub(_dotted_word, mask_quoted(_strip_inline_code(text)))
+    return PATH.sub('X', visible).translate(APOSTROPHE_TRANSLATION)
 
 
 def _lengths(path, sources):

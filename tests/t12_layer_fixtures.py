@@ -43,9 +43,8 @@ def layer_backups(home):
     return sorted(path.name for path in layer_folder(home).glob(".layer.*"))
 
 
-def stage_like_remote(release, stage, tools):
-    shutil.copytree(release, stage / "release")
-    (stage / "tools").mkdir()
+def stage_like_remote(stage, tools):
+    (stage / "tools").mkdir(parents=True)
     for name in ("install_layers.sh", "smoke_probe.py"):
         shutil.copy2(tools / name, stage / "tools" / name)
-    return stage / "tools" / "install_layers.sh", stage / "release"
+    return stage / "tools" / "install_layers.sh"

@@ -1,0 +1,20 @@
+source	label	role	reason
+pascarella	summary	what	The authors define summary as a description of what the code does
+pascarella	expand	what	The authors define expand as a longer description of what the code does
+pascarella	rationale	why	The authors define rationale as the reason behind the code
+pascarella	directive	directive	A directive for the compiler or IDE, which the comment rule must let through
+pascarella	formatter	directive	A formatter directive, which the comment rule must let through
+nlbse2024	summary	what	The authors define summary as a description of what the code does
+nlbse2024	expand	what	The authors define expand as a longer description of what the code does
+nlbse2024	rational	why	The authors define rational as the reason behind the code
+dome	what	what	The authors define what as a description of the functionality
+dome	why	why	The authors define why as the reason the code exists
+avantes	functional-inline	human	Human comment in a real project, and the taxonomy does not split why from what
+avantes	functional-method	human	Human comment in a real project, and the taxonomy does not split why from what
+avantes	functional-module	human	Human comment in a real project, and the taxonomy does not split why from what
+avantes	notice	human	Human warning or notice in a real project
+avantes	general	human	Human comment in a real project
+avantes	todo	human	Human work marker in a real project
+avantes	ide	directive	A directive for the IDE, which the comment rule must let through
+codesearchnet	unlabelled	human	Human comment in a real project, with no comment label from the authors
+code4ml	unlabelled	human	Human comment in a real Kaggle notebook, with no comment label from the authors

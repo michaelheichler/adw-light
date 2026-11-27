@@ -1,11 +1,11 @@
 import unittest
 
-from t19_language_home import ALLOWED, LIBRARY_NEEDED, LIBRARY_READY, blocked, exact_verdict, fallback_verdict
+from t19_language_home import ALLOWED, LIBRARY_NEEDED, LIBRARY_READY, PRINCIPLE, blocked, exact_verdict, fallback_verdict
 
 
 HOLLOW_PATH = "tests/test_x.py"
-HOLLOW_TEST = "def test_x():\n    run()\n"
-ASSERTING_TEST = "def test_x():\n    assert run() == 1\n"
+HOLLOW_TEST = "def test_x():\n    \"\"\"" + PRINCIPLE + "\"\"\"\n    run()\n"
+ASSERTING_TEST = "def test_x():\n    \"\"\"" + PRINCIPLE + "\"\"\"\n    assert run() == 1\n"
 LONG_PATH = "src/mod.py"
 LONG_FUNCTION = "def long():\n" + "".join(f"    x{index} = {index}\n" for index in range(85)) + "    return 0\n"
 HOLLOW = blocked(("hollow_test", 1))

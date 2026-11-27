@@ -8,12 +8,12 @@ from typing import NamedTuple
 try:
     from . import language_layer
     from .language_model import PYTHON
-    from .language_shapes import SCOPE_ROLES, Role, Shape, callee_parts
+    from .language_shapes import DART_TEST_CALLS, JS_TEST_HOOKS, SCOPE_ROLES, Role, Shape, callee_parts
     from .test_units import JAVASCRIPT, RUST, Unit
 except ImportError:
     import language_layer
     from language_model import PYTHON
-    from language_shapes import SCOPE_ROLES, Role, Shape, callee_parts
+    from language_shapes import DART_TEST_CALLS, JS_TEST_HOOKS, SCOPE_ROLES, Role, Shape, callee_parts
     from test_units import JAVASCRIPT, RUST, Unit
 
 UNIT_LANGUAGES = {"rust": RUST, "javascript": JAVASCRIPT, "typescript": JAVASCRIPT, "tsx": JAVASCRIPT}
@@ -95,8 +95,11 @@ class _Builder:
         if shape.role is not Role.CALL or not shape.parts or not self.named_tests:
             return None
         parts = callee_parts(shape.name)
+        if self.language == JAVASCRIPT and JS_TEST_HOOKS.intersection(parts[1:]):
+            return None
         scope = self.scopes.get(shape.parts[-1])
-        if not parts or parts[0] not in TEST_CALLS or len(parts) > 2 or scope is None:
+        test_calls = DART_TEST_CALLS if self.language == "dart" else TEST_CALLS
+        if not parts or parts[0] not in test_calls or len(parts) > 2 or scope is None:
             return None
         return self.text[shape.start:scope.start].split(",", 1)[0].strip(), scope
 

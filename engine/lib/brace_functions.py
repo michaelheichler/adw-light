@@ -28,10 +28,15 @@ def _end_after(text: str, needle: str, start: int) -> int:
     return len(text) if end < 0 else end + len(needle)
 
 
+REGEX_KEYWORD = re.compile(r"\b(return|throw|yield|await|case|delete|void|typeof|instanceof|in|of)\Z")
+
+
 def _regex_end(text: str, index: int) -> int | None:
-    prefix = text[:index].rstrip()
-    previous = prefix[-1:] or "="
-    keyword = re.search(r"\b(return|throw|yield|await|case|delete|void|typeof|instanceof|in|of)$", prefix)
+    end = index
+    while end and text[end - 1].isspace():
+        end -= 1
+    previous = text[end - 1] if end else "="
+    keyword = REGEX_KEYWORD.search(text, max(0, end - len("instanceof")), end)
     if previous not in "=(:,[!&|?;{}" and keyword is None:
         return None
     cursor, in_class = index + 1, False

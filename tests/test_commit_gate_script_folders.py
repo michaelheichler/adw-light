@@ -1,6 +1,6 @@
 import unittest
 
-from commit_gate_home import CLEAN_LIB, PROSE_COMMIT, SCANNED, SHEBANG, CommitGateHome
+from commit_view_home import CLEAN_LIB, PROSE_COMMIT, SCANNED, CommitViewHome, script
 
 
 CD_SOURCE_PREFIX = '. "$(CDPATH=\'\' cd -- "${BASH_SOURCE[0]%/*}" 2>/dev/null && pwd)/lib/x.sh"\n'
@@ -21,81 +21,85 @@ PARENT_OF_SOURCED_LIB = (
     '. "$D/lib/y.sh"\n'
 )
 SOURCE_FROM_DIRNAME = '. "$(dirname "$0")/lib/x.sh"\n'
+TOOL = "bash tools/s.sh"
+IDIOMS = {
+    "cd_source_prefix": CD_SOURCE_PREFIX,
+    "cd_dirname_source": CD_DIRNAME_SOURCE,
+    "pwd_fallback": CD_DIRNAME_ZERO_PWD_FALLBACK,
+    "assigned_fallback": ASSIGNED_DIRNAME_FALLBACK,
+    "guarded_assignment": GUARDED_ASSIGNMENT,
+}
 
 
-class ScriptFolderIdioms(CommitGateHome):
-    def tool_sourcing(self, body, folder_lib, working_lib):
-        self.place("tools/s.sh", SHEBANG + body)
-        self.place("tools/lib/x.sh", folder_lib)
-        self.place("lib/x.sh", working_lib)
-        return self.gate("bash tools/s.sh")
+def tool_sourcing(body, folder_lib, working_lib):
+    return {"tools/s.sh": script(body), "tools/lib/x.sh": folder_lib, "lib/x.sh": working_lib}
 
+
+def lib_sourcing(sibling, nested_decoy):
+    return {"tools/s.sh": script(SOURCE_FROM_DIRNAME), "tools/lib/x.sh": PARENT_OF_SOURCED_LIB,
+            "tools/lib/y.sh": sibling, "tools/lib/lib/y.sh": nested_decoy}
+
+
+class FolderHome(CommitViewHome):
+    projects = {
+        **{name + "_clean": tool_sourcing(body, CLEAN_LIB, PROSE_COMMIT) for name, body in IDIOMS.items()},
+        **{name + "_prose": tool_sourcing(body, PROSE_COMMIT, CLEAN_LIB) for name, body in IDIOMS.items()},
+        "parent_clean": lib_sourcing(CLEAN_LIB, PROSE_COMMIT),
+        "parent_prose": lib_sourcing(PROSE_COMMIT, CLEAN_LIB),
+        "absolute_clean": {"scripts/tool.sh": script(CLEAN_LIB)},
+        "absolute_prose": {"scripts/tool.sh": script(PROSE_COMMIT)},
+    }
+
+    def by_absolute_folder(self, name):
+        return f'bash "$(CDPATH=\'\' cd -- "{self.project(name)}/scripts/.." && pwd -P)/scripts/tool.sh"'
+
+
+class ScriptFolderIdioms(FolderHome):
     def test_cd_into_the_source_prefix_passes_a_clean_lib(self):
-        self.assertEqual({}, self.tool_sourcing(CD_SOURCE_PREFIX, CLEAN_LIB, PROSE_COMMIT))
+        self.assertEqual({}, self.gate("cd_source_prefix_clean", TOOL))
 
     def test_cd_into_the_source_prefix_scans_the_lib(self):
-        response = self.tool_sourcing(CD_SOURCE_PREFIX, PROSE_COMMIT, CLEAN_LIB)
-
-        self.assertEqual(SCANNED, self.message_finding(response))
+        self.assertEqual(SCANNED, self.message_finding("cd_source_prefix_prose", TOOL))
 
     def test_cd_into_dirname_of_the_source_passes_a_clean_lib(self):
-        self.assertEqual({}, self.tool_sourcing(CD_DIRNAME_SOURCE, CLEAN_LIB, PROSE_COMMIT))
+        self.assertEqual({}, self.gate("cd_dirname_source_clean", TOOL))
 
     def test_cd_into_dirname_of_the_source_scans_the_lib(self):
-        response = self.tool_sourcing(CD_DIRNAME_SOURCE, PROSE_COMMIT, CLEAN_LIB)
-
-        self.assertEqual(SCANNED, self.message_finding(response))
+        self.assertEqual(SCANNED, self.message_finding("cd_dirname_source_prose", TOOL))
 
     def test_cd_with_a_pwd_fallback_passes_a_clean_lib(self):
-        self.assertEqual({}, self.tool_sourcing(CD_DIRNAME_ZERO_PWD_FALLBACK, CLEAN_LIB, PROSE_COMMIT))
+        self.assertEqual({}, self.gate("pwd_fallback_clean", TOOL))
 
     def test_cd_with_a_pwd_fallback_scans_the_lib(self):
-        response = self.tool_sourcing(CD_DIRNAME_ZERO_PWD_FALLBACK, PROSE_COMMIT, CLEAN_LIB)
-
-        self.assertEqual(SCANNED, self.message_finding(response))
+        self.assertEqual(SCANNED, self.message_finding("pwd_fallback_prose", TOOL))
 
     def test_assigned_folder_with_a_dirname_fallback_passes_a_clean_lib(self):
-        self.assertEqual({}, self.tool_sourcing(ASSIGNED_DIRNAME_FALLBACK, CLEAN_LIB, PROSE_COMMIT))
+        self.assertEqual({}, self.gate("assigned_fallback_clean", TOOL))
 
     def test_assigned_folder_with_a_dirname_fallback_scans_the_lib(self):
-        response = self.tool_sourcing(ASSIGNED_DIRNAME_FALLBACK, PROSE_COMMIT, CLEAN_LIB)
-
-        self.assertEqual(SCANNED, self.message_finding(response))
+        self.assertEqual(SCANNED, self.message_finding("assigned_fallback_prose", TOOL))
 
     def test_folder_assigned_inside_an_if_guard_passes_a_clean_lib(self):
-        self.assertEqual({}, self.tool_sourcing(GUARDED_ASSIGNMENT, CLEAN_LIB, PROSE_COMMIT))
+        self.assertEqual({}, self.gate("guarded_assignment_clean", TOOL))
 
     def test_folder_assigned_inside_an_if_guard_scans_the_lib(self):
-        response = self.tool_sourcing(GUARDED_ASSIGNMENT, PROSE_COMMIT, CLEAN_LIB)
-
-        self.assertEqual(SCANNED, self.message_finding(response))
+        self.assertEqual(SCANNED, self.message_finding("guarded_assignment_prose", TOOL))
 
 
-class SourcedLibParentFolder(CommitGateHome):
-    def lib_sourcing(self, sibling, nested_decoy):
-        self.place("tools/s.sh", SHEBANG + SOURCE_FROM_DIRNAME)
-        self.place("tools/lib/x.sh", PARENT_OF_SOURCED_LIB)
-        self.place("tools/lib/y.sh", sibling)
-        self.place("tools/lib/lib/y.sh", nested_decoy)
-        return self.gate("bash tools/s.sh")
-
+class SourcedLibParentFolder(FolderHome):
     def test_parent_folder_with_a_return_guard_passes_a_clean_lib(self):
-        self.assertEqual({}, self.lib_sourcing(CLEAN_LIB, PROSE_COMMIT))
+        self.assertEqual({}, self.gate("parent_clean", TOOL))
 
     def test_parent_folder_with_a_return_guard_scans_the_lib(self):
-        self.assertEqual(SCANNED, self.message_finding(self.lib_sourcing(PROSE_COMMIT, CLEAN_LIB)))
+        self.assertEqual(SCANNED, self.message_finding("parent_prose", TOOL))
 
 
-class AbsoluteFolderSubstitution(CommitGateHome):
-    def tool_by_absolute_folder(self, tool):
-        self.place("scripts/tool.sh", SHEBANG + tool)
-        return self.gate(f'bash "$(CDPATH=\'\' cd -- "{self.root}/scripts/.." && pwd -P)/scripts/tool.sh"')
-
+class AbsoluteFolderSubstitution(FolderHome):
     def test_cd_into_a_literal_parent_folder_passes_a_clean_script(self):
-        self.assertEqual({}, self.tool_by_absolute_folder(CLEAN_LIB))
+        self.assertEqual({}, self.gate("absolute_clean", self.by_absolute_folder("absolute_clean")))
 
     def test_cd_into_a_literal_parent_folder_scans_the_script(self):
-        self.assertEqual(SCANNED, self.message_finding(self.tool_by_absolute_folder(PROSE_COMMIT)))
+        self.assertEqual(SCANNED, self.message_finding("absolute_prose", self.by_absolute_folder("absolute_prose")))
 
 
 if __name__ == "__main__":

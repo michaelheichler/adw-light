@@ -1,42 +1,30 @@
 # Deploy and release
 
-ADW Lite runs only from the Claude and Codex plugin layers. No running copy lives in a source checkout or any other working folder.
+From the root of a clean main checkout, set VERSION, commit it and run the suite. Deploy requires a passing stamp for that commit. It refuses hidden or uncommitted edits under `tools/`, including untracked files.
 
-## Install
+~~~sh
+python3 tools/run_tests.py
+bash tools/deploy.sh --remote origin --host TARGET
+~~~
 
-Every machine installs ADW Lite through the plugin marketplace commands.
+The release tool fetches the remote release branch when it exists and publishes the runtime commit and tag together. It never creates a local release branch. Without `--push`, the release tool prints the commit ID and keeps the tag locally. Without `--remote`, it builds a root commit. The remote defaults to origin. The GitHub repository defaults to michaelheichler/adw-light. Use --repo to select another repository. If the tag exists, deploy checks that the tagged commit belongs to the remote release branch and records the stamped source commit and version. It never moves a tag.
 
-1. Claude: `claude plugin marketplace add <source>`, then `claude plugin install adw-light@adw-light`.
-2. Codex: `codex plugin marketplace add <source>`, then `codex plugin add adw-light@adw-light`.
+Each host checks that GitHub can serve the new tag before removing its marketplace. The installer adds the tagged repository, merges Codex hooks and probes the installed caches. Omit --host to deploy only on the Mac. The remote host receives the same ADW_KEEP_OUT exclusions.
 
-The source is the repository or a release folder built by `tools/build_release.sh`.
+Set `ADW_REMOTE_TMPDIR` to an absolute path without newlines to choose where the remote host creates temporary files.
 
-## Deploy
+## Rollback
 
-1. Commit every change on main in the main checkout.
-2. Run `bash tools/deploy.sh` for this machine.
-3. To install on a second machine as well, add `--host TARGET` with any ssh target, for example `bash tools/deploy.sh --host user@build-box`. `ADW_DEPLOY_HOST` sets the same target. Add `--retire FOLDER` once per old ADW Lite copy on that machine that the deploy should remove.
+The first migration from a local install has no rollback tag. If installation fails, deploy removes both plugins and marketplaces and strips ADW entries from the Codex hooks file. Other hooks stay in place.
 
-The deploy runs the suite, builds the runtime release in a temporary folder, and smoke-tests it. `tools/install_layers.sh` then copies the release to `~/.adw-lite/install/source`, adds that folder as the adw-light marketplace in Claude and in Codex, installs the plugin in both, and smoke-tests each plugin cache. It points every ADW Lite entry in `~/.codex/hooks.json` at the Codex plugin cache and drops older entries. On a remote host the same script runs over ssh from a staging folder under `~/.adw-lite/install`. It removes the named old copies after both installs pass.
+`tools/run_tests.py` runs the suite on the committed tree and writes a stamp after a clean pass. The stamp lives under `suite-passes` in the ADW state folder (`ADW_STATE_ROOT` or `~/.adw-lite/state`). The full suite should finish within five minutes. Each module runs in its own process. The default worker count is the CPU count, up to eight. Pass `--jobs N` to override it or `--jobs 1` to run serially. Modules that share the grammar cache run alone at the end and appear in the report. Add `--profile` to see each module’s wall time from that run. Deploy checks the stamp without running the suite.
 
-Each install first smoke-tests the release in an empty home folder with the newest installed Python at 3.11 or later outside any environment. That run checks the lexer path and touches nothing. `tools/install_layers.sh` then saves a copy of `~/.adw-lite/install/venv` and `~/.adw-lite/install/setup.json`. It runs first-run setup (`engine/setup_env.py`) from the release with the newest installed Python at 3.11 or later. Setup builds the pinned tree-sitter environment under `~/.adw-lite/install/venv`, from source when no wheel exists, and fetches the Go grammar into `~/.adw-lite/cache/grammars`. Setup output lands in `~/.adw-lite/install/setup.log`. The gating smoke test runs after setup. When an environment exists, every smoke case runs on the environment Python that the live hooks use, and the Go writes must go through tree-sitter.
+For an upgrade, deploy reads the previous tag from the Claude marketplace. Use --previous-tag only for an existing GitHub release at v0.1.2 or newer. Earlier releases carry a second set of Codex hooks. Both hosts should start on the same tag.
 
-A failed setup does not stop the install by itself. The smoke test decides:
+If the remote upgrade fails, deploy also restores the Mac. Rollback reinstalls from GitHub. A failed network check leaves the old marketplace alone, but a later outage can prevent restoration. If SSH drops, check the remote state before retrying.
 
-1. With no environment at all, the smoke test and the hooks use the lexer, and the install goes on. This happens when no Python 3.11 or later exists or the first build fails.
-2. When the build fails and an environment with other pins stays in place, the smoke test fails and the install stops.
-3. When the environment is ready but the Go grammar fetch fails, for example offline, the smoke test fails and the install stops.
+To install a published tag without deploying, run this from the tooling checkout.
 
-When the smoke test fails, the install restores the saved environment and setup record. It stops before it places the release, so the running plugin keeps its source and its environment. Grammars fetched during the failed run stay in the shared cache. Setup runs once more from the installed Claude plugin cache, or from the Codex cache when the install skips Claude. If a later step fails on the local machine, `tools/deploy.sh` restores the environment and setup record. It also restores the release source, the plugin caches, and the settings files.
-
-The installer retires only a folder named adw-light, adw-light-plugin, or adw-light-dev that holds an ADW Lite copy. It refuses a folder that overlaps `~/.adw-lite`, the Claude and Codex homes, or the release.
-
-## Folders kept free of running copies
-
-`ADW_KEEP_OUT` names folders, separated by colons. The tools build no release there, and no plugin cache or hook may point there. `tools/build_release.sh` and `tools/install_layers.sh` read it at run time. Nothing in the repository names such a folder.
-
-## Release branch
-
-`bash tools/release_branch.sh` builds the runtime of main into the local release branch. The branch holds the entry script, the engine with its license and notice, the hooks, the skills, the plugin manifest folder, and the Python version file. The tool installs the plugin from that branch into a temporary Claude home and smoke-tests the cache.
-
-`bash tools/release_branch.sh --push` also pushes the release branch, and only that branch. The tool refuses when the repository has no remote, when several remotes exist and the caller gives no `--remote`, when the remote mirrors or carries its own push refspecs, and when the caller names any branch other than release.
+~~~sh
+bash tools/install_layers.sh --claude --codex --tag v0.1.2
+~~~

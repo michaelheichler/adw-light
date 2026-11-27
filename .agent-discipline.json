@@ -1,0 +1,6 @@
+{
+  "rule_gates": {
+    "test_builds_repo": "enforce",
+    "test_builds_tree": "observe"
+  }
+}

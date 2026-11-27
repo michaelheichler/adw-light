@@ -5,9 +5,11 @@ import re
 from collections import Counter
 from collections.abc import Iterator
 from functools import lru_cache
+from pathlib import Path
 from typing import NamedTuple
 
 try:
+    from ..config_roots import grammar_cache_root
     from ..language_operands import bound_name
     from ..language_shapes import COMPUTED, Operand, Role, Shape, callee_parts, is_assertion
     from ..test_units import Unit
@@ -18,6 +20,7 @@ try:
     from ._text_function import near_copy, shares_words
     from ._ui_locators import is_locator, selector_text, selects
 except ImportError:
+    from config_roots import grammar_cache_root
     from language_operands import bound_name
     from language_shapes import COMPUTED, Operand, Role, Shape, callee_parts, is_assertion
     from test_units import Unit
@@ -67,10 +70,14 @@ def _unique(shapes: tuple[Shape, ...]) -> tuple[tuple[str, str], ...]:
     return tuple((shape.name, shape.operands[0].literal) for shape in shapes if counts[shape.name] == 1)
 
 
-@lru_cache(maxsize=8)
 def file_bindings(path: str, layered: bool, text: str) -> FileBindings:
+    return _file_bindings(path, text, grammar_cache_root() if layered else None)
+
+
+@lru_cache(maxsize=8)
+def _file_bindings(path: str, text: str, cache_root: Path | None) -> FileBindings:
     outline = None
-    if layered:
+    if cache_root is not None:
         layer = _language_layer()
         language = layer.language_of(path)
         outline = layer.outline_for(path, language, text) if language else None
@@ -118,9 +125,10 @@ class _Scan:
         if found is None:
             return None
         text, typed = found
+        line = self.line(operand.start)
         if pattern or operand.pattern:
-            text, typed = regex_words(text), regex_words(typed)
-        return Expected(self.line(operand.start), text, typed, kind)
+            return Expected(line, regex_words(text), regex_words(typed), kind)
+        return Expected(line, text, typed, kind, "" if COMPUTED in typed else text)
 
     def guarded(self, shape: Shape) -> bool:
         for guard in self.shapes:

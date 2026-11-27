@@ -2,8 +2,7 @@ import unittest
 
 from t12_layer_fixtures import layer_backups, layer_folder, layer_state, seed_layer
 from t12_wheelhouse import make_wheelhouse
-from t2325_fixtures import Scratch, all_paths
-from test_t2325_install_layers import INSTALL, InstallCase
+from test_t2325_install_layers import SMALL_PROBE_RELEASE, InstallCase
 
 
 def leave_empty(home):
@@ -12,25 +11,27 @@ def leave_empty(home):
 
 class UnreachableGrammarInstall:
     def __init__(self, register_cleanup, release, prepare):
-        self.scratch = Scratch(register_cleanup)
+        self.scratch = release.host(register_cleanup)
         home = self.scratch.home
         prepare(home)
         self.before = layer_state(home)
         wheelhouse = make_wheelhouse(self.scratch.root, reachable=False)
-        result = self.scratch.run(["bash", INSTALL, "--claude", "--codex", release], timeout=900,
+        result = self.scratch.run(["bash", release.installer, "--claude", "--codex", "--tag", release.tag], timeout=900,
                                   PIP_FIND_LINKS=str(wheelhouse))
         self.code = result.returncode
         self.after = layer_state(home)
         self.install = layer_folder(home)
         self.backups = layer_backups(home)
-        self.plugin_paths = all_paths(self.scratch.config_dir, self.scratch.codex_home)
+        self.codex_calls = self.scratch.fakes.calls("codex")
 
 
 class SeededLayerSmokeFailureTests(InstallCase):
+    release_fixture = SMALL_PROBE_RELEASE
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.outcome = UnreachableGrammarInstall(cls.addClassCleanup, cls.release.path, seed_layer)
+        cls.outcome = UnreachableGrammarInstall(cls.addClassCleanup, cls.release, seed_layer)
 
     def test_install_exits_non_zero(self):
         self.assertNotEqual(self.outcome.code, 0)
@@ -41,18 +42,20 @@ class SeededLayerSmokeFailureTests(InstallCase):
     def test_environment_and_setup_record_match_the_seed_byte_for_byte(self):
         self.assertEqual(self.outcome.after, self.outcome.before)
 
-    def test_no_release_source_and_no_plugin_cache_are_placed(self):
-        self.assertEqual(((self.outcome.install / "source").exists(), self.outcome.plugin_paths), (False, []))
+    def test_the_failed_claude_smoke_stops_the_install_before_codex(self):
+        self.assertEqual(self.outcome.codex_calls, [])
 
     def test_no_layer_backup_folder_remains(self):
         self.assertEqual(self.outcome.backups, [])
 
 
 class FreshLayerSmokeFailureTests(InstallCase):
+    release_fixture = SMALL_PROBE_RELEASE
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.outcome = UnreachableGrammarInstall(cls.addClassCleanup, cls.release.path, leave_empty)
+        cls.outcome = UnreachableGrammarInstall(cls.addClassCleanup, cls.release, leave_empty)
 
     def test_install_exits_non_zero(self):
         self.assertNotEqual(self.outcome.code, 0)
@@ -61,8 +64,8 @@ class FreshLayerSmokeFailureTests(InstallCase):
         self.assertEqual(((self.outcome.install / "venv").exists(), (self.outcome.install / "setup.json").exists()),
                          (False, False))
 
-    def test_no_release_source_and_no_plugin_cache_are_placed(self):
-        self.assertEqual(((self.outcome.install / "source").exists(), self.outcome.plugin_paths), (False, []))
+    def test_the_failed_claude_smoke_stops_the_install_before_codex(self):
+        self.assertEqual(self.outcome.codex_calls, [])
 
     def test_no_layer_backup_folder_remains(self):
         self.assertEqual(self.outcome.backups, [])

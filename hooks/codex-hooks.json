@@ -21,6 +21,15 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ADW_CODEX_HOOK=1 \"__SKILL_DIR__\"/hooks/adw-config UserPromptSubmit",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PreToolUse": [

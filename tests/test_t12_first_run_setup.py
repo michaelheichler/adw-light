@@ -27,6 +27,14 @@ target="${staging%.staging-*}"
 mkdir -p "$target" "$target.old-$PPID/leftover"
 exit 0
 """
+LOGGED_MAIN = """import sys
+sys.path.insert(0, sys.argv[1])
+from lib.first_run import main
+code = main(sys.argv[2:])
+print("after-out", flush=True)
+print("after-err", file=sys.stderr, flush=True)
+sys.exit(code)
+"""
 LOCK_TAKER = """#!/bin/sh
 printf '1' > "{lock}"
 case "$*" in *version_info*) echo "3 10"; exit 0;; esac
@@ -109,7 +117,7 @@ def downloads(home):
 def wait_for_setup_row(home, seconds=300):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline and not setup_rows(home):
-        time.sleep(0.5)
+        time.sleep(0.05)
     return setup_rows(home)
 
 
@@ -231,6 +239,17 @@ class SetupLockTests(Scratch):
         result = run_setup(self.old_python_env(), make_project(self.project, ["main.go"]))
         self.assertEqual((result.returncode, (install_dir(self.home) / "setup.json").exists()), (0, False))
 
+    def test_setup_with_a_log_appends_its_own_and_every_later_stdout_and_stderr_line_to_that_log(self):
+        self.place_lock(0, owner="busy\n")
+        log = self.scratch / "setup.log"
+        log.write_text("earlier run\n", encoding="utf-8")
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", LOGGED_MAIN, str(SETUP.parent), "--log", str(log)],
+                                capture_output=True, text=True, check=False, timeout=60,
+                                env=offline_env(self.home, self.scratch), stdin=subprocess.DEVNULL)
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual((result.returncode, result.stdout, result.stderr, lines[0], lines[2:], len(lines)),
+                         (0, "", "", "earlier run", ["after-out", "after-err"], 4))
+
     def test_a_lock_older_than_an_hour_no_longer_stops_setup(self):
         self.place_lock(7200)
         result = run_setup(self.old_python_env(), make_project(self.project, ["main.go"]))
@@ -321,14 +340,26 @@ class SessionStartTests(Scratch):
 
 
 class MalformedSetupRecordTests(Scratch):
+    @classmethod
+    def setUpClass(cls):
+        shared = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(shared.cleanup)
+        root = Path(shared.name).resolve()
+        ready_home = root / "ready-home"
+        ready_home.mkdir()
+        cls.wheelhouse = make_wheelhouse(root)
+        run_setup(offline_env(ready_home, cls.wheelhouse, ADW_PYTHON=sys.executable),
+                  make_project(root / "project", ["a.py", "main.go"]))
+        cls.ready = setup_record(ready_home)
+        cls.venv = install_dir(ready_home) / "venv"
+
     def ready_setup(self):
         make_project(self.project, ["a.py", "main.go"])
-        wheelhouse = make_wheelhouse(self.scratch)
-        run_setup(offline_env(self.home, wheelhouse, ADW_PYTHON=sys.executable), self.project)
-        (self.home / "state" / "ledger" / "ledger.jsonl").unlink()
-        env = offline_env(self.home, wheelhouse, CLAUDE_PLUGIN_ROOT=str(TREE),
+        install_dir(self.home).mkdir(parents=True)
+        (install_dir(self.home) / "venv").symlink_to(self.venv, target_is_directory=True)
+        env = offline_env(self.home, self.wheelhouse, CLAUDE_PLUGIN_ROOT=str(TREE),
                           ADW_PYTHON=str(self.scratch / "missing-python"))
-        return setup_record(self.home), env
+        return self.ready, env
 
     def seed(self, record):
         (install_dir(self.home) / "setup.json").write_text(json.dumps(record), encoding="utf-8")
@@ -342,33 +373,43 @@ class MalformedSetupRecordTests(Scratch):
                           [(row["status"], row["reason"]) for row in rows]), (0, dict, [("failed", "no_python")]))
 
     def test_a_ready_record_with_a_number_for_grammars_reruns_setup(self):
+        """Build fixtures with factory functions."""
         self.assert_treated_as_missing(lambda ready: {**ready, "grammars": 5})
 
     def test_a_ready_record_with_a_number_for_requested_reruns_setup(self):
+        """Build fixtures with factory functions."""
         self.assert_treated_as_missing(lambda ready: {**ready, "requested": 5})
 
     def test_a_ready_record_with_a_bool_timestamp_reruns_setup(self):
+        """Build fixtures with factory functions."""
         self.assert_treated_as_missing(lambda ready: {**ready, "ts": True})
 
     def test_a_ready_record_with_a_text_timestamp_reruns_setup(self):
+        """Build fixtures with factory functions."""
         self.assert_treated_as_missing(lambda ready: {**ready, "ts": "yesterday"})
 
     def test_a_ready_record_with_a_list_for_pins_reruns_setup(self):
+        """Build fixtures with factory functions."""
         self.assert_treated_as_missing(lambda ready: {**ready, "pins": [1]})
 
     def test_a_ready_record_with_a_number_for_version_reruns_setup(self):
+        """Build fixtures with factory functions."""
         self.assert_treated_as_missing(lambda ready: {**ready, "version": 3.12})
 
     def test_a_ready_record_without_a_version_reruns_setup(self):
+        """Build fixtures with factory functions."""
         self.assert_treated_as_missing(lambda ready: {key: value for key, value in ready.items() if key != "version"})
 
     def test_a_record_that_is_a_json_list_reruns_setup(self):
+        """Build fixtures with factory functions."""
         self.assert_treated_as_missing(lambda ready: [ready])
 
     def test_a_record_that_is_a_json_string_reruns_setup(self):
+        """Build fixtures with factory functions."""
         self.assert_treated_as_missing(lambda ready: "ready")
 
     def test_a_well_formed_ready_record_starts_no_setup(self):
+        """Build fixtures with factory functions."""
         ready, env = self.ready_setup()
         self.seed(ready)
         result = session_start(env, self.project)

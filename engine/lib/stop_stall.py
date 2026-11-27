@@ -53,7 +53,7 @@ def fingerprint(blocking: BlockingSet) -> str:
     rows = sorted(
         [str(row.get("path", "")), str(row.get("rule", "")), str(row.get("line", "")),
          str(row.get("snippet", "")), str(row.get("content_hash", ""))]
-        for row in blocking.findings
+        for row in blocking.findings if not blocking.stamps or not row.get("content_hash")
     )
     payload = [rows, sorted(blocking.residual), sorted(blocking.stamps)]
     return sha256(json.dumps(payload).encode("utf-8")).hexdigest()
@@ -100,9 +100,16 @@ def _allowed(cfg: dict, blocking: BlockingSet) -> int:
     return max(limit(cfg), OWN_FINDING_LIMIT) if blocking.owned else limit(cfg)
 
 
-def guarded(call: StopCall, blocking: BlockingSet, build: ReasonBuilder) -> StopOutcome:
-    key = call.stall_key
-    previous = blocker_state.stall(call.scope, key)
+class _Verdict(NamedTuple):
+    outcome: StopOutcome
+    record: dict | None
+    released: bool
+
+
+GuardedCall = tuple[StopCall, BlockingSet, ReasonBuilder]
+
+
+def _verdict(call: StopCall, blocking: BlockingSet, build: ReasonBuilder, previous: dict) -> _Verdict:
     current = fingerprint(blocking)
     stored = previous.get("count")
     same = previous.get("fp") == current and isinstance(stored, int)
@@ -110,11 +117,32 @@ def guarded(call: StopCall, blocking: BlockingSet, build: ReasonBuilder) -> Stop
     report = str(previous.get("report") or "") if same else ""
     allowed = _allowed(call.cfg, blocking)
     if count > allowed + 1:
-        return StopOutcome("", "")
+        return _Verdict(StopOutcome("", ""), None, False)
     if count == allowed + 1:
-        blocker_state.note_stall(call.scope, {"fp": current, "count": count, "report": report}, key)
-        _record_release(call, blocking.owned)
-        return StopOutcome("", notice(blocking, allowed, report))
+        return _Verdict(StopOutcome("", notice(blocking, allowed, report)), {"fp": current, "count": count, "report": report}, True)
     reason, written = build(report or None)
-    blocker_state.note_stall(call.scope, {"fp": current, "count": count, "report": written}, key)
-    return StopOutcome(reason, "")
+    return _Verdict(StopOutcome(reason, ""), {"fp": current, "count": count, "report": written}, False)
+
+
+def guarded(call: StopCall, blocking: BlockingSet, build: ReasonBuilder) -> StopOutcome:
+    verdict = _verdict(call, blocking, build, blocker_state.stall(call.scope, call.stall_key))
+    if verdict.record is not None:
+        blocker_state.note_stall(call.scope, verdict.record, call.stall_key)
+    if verdict.released:
+        _record_release(call, blocking.owned)
+    return verdict.outcome
+
+
+def guarded_all(calls: list[GuardedCall]) -> list[StopOutcome]:
+    if not calls:
+        return []
+    scope, key = calls[0][0].scope, calls[0][0].stall_key
+    previous = blocker_state.stalls(scope.session_id, scope.root, key)
+    verdicts = [_verdict(call, blocking, build, previous.get(call.scope.agent_id, {})) for call, blocking, build in calls]
+    records = {call.scope.agent_id: verdict.record for (call, _, _), verdict in zip(calls, verdicts) if verdict.record is not None}
+    if records:
+        blocker_state.note_stalls(scope.session_id, scope.root, records, key)
+    for (call, blocking, _), verdict in zip(calls, verdicts):
+        if verdict.released:
+            _record_release(call, blocking.owned)
+    return [verdict.outcome for verdict in verdicts]

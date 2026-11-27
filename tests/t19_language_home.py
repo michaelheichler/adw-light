@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+NO_REPOSITORY_VIEW = Path(__file__).resolve().parent / "fixtures" / "no_repository_view.json"
 PACK = "tree_sitter_language_pack"
 BUNDLE = "tree-sitter-language-pack"
 SITE = Path("lib") / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
@@ -16,6 +17,9 @@ LIBRARY_READY = (VENV / SITE / PACK).is_dir() and (GRAMMARS / BUNDLE).is_dir()
 LIBRARY_NEEDED = "needs the pinned tree-sitter venv and a filled grammar cache (ADW_TEST_LANGUAGE_VENV, ADW_TEST_GRAMMAR_CACHE)"
 DENY = "deny"
 TEST_WRITER = "adw-test-writer"
+PRINCIPLE = "A test must verify what the code does for its client, never how it does it."
+CITATION = "Principle: " + PRINCIPLE
+CITATION_SLOT = "CITE_PRINCIPLE"
 
 
 class UnitHome:
@@ -40,7 +44,7 @@ class UnitHome:
             "agent_type": TEST_WRITER, "tool_input": {"file_path": str(self.repo / relative), "content": content},
         }
         return subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state)],
+            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state), "--git-view", str(NO_REPOSITORY_VIEW)],
             input=json.dumps(payload), text=True, capture_output=True, timeout=120,
             env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
         )
@@ -62,6 +66,14 @@ def exact_verdict(case, relative, content):
 
 def fallback_verdict(case, relative, content):
     return UnitHome(case, exact=False).verdict(relative, content)
+
+
+def cited(text):
+    return text.replace(CITATION_SLOT, CITATION)
+
+
+def uncited(text):
+    return "".join(line for line in text.splitlines(keepends=True) if CITATION_SLOT not in line)
 
 
 def blocked(*rows):

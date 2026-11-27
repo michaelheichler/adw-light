@@ -13,8 +13,9 @@ from .find_matches import find_calls
 from .folder_trees import folder_trees
 from .shell_expansion import Expansions, expansions_for
 from .shell_lines import command_lines
+from .shell_unfold import SPLITTER_RE
 from .shell_operators import REDIRECT_HEAD_RE
-from .shell_text import ShellBody, shell_tokens
+from .shell_text import SCRIPT_READERS, ShellBody, _substitutions, shell_tokens
 from .xargs_feed import fed_calls
 from .shell_syntax import (
     CLOBBER_HEAD_RE, DYNAMIC_RE, ENV_SPLIT_STRING_FLAGS,
@@ -30,7 +31,7 @@ from .shell_syntax import (
     _leading_assignments, _merge_adjacent_fragments, _merge_clobber_operator,
     _payload_command_index, _pipeline_groups, _segment_text, _segments,
     _skip_leading_redirect, _skip_prefixes, _skip_wrapper_options,
-    _tokens, _words, _wrapper_consumes_value,
+    _tokens, _without_redirects, _words, _wrapper_consumes_value,
     has_process_substitution, interpreter_invocation,
 )
 
@@ -65,10 +66,16 @@ DIRECTORY_VERBS = frozenset({"cd", "pushd", "popd"})
 TREE_VERB_RE = re.compile(r"\b(?:rm|mv|rsync)\b")
 EXPANSION_MEMO: ContextVar[dict[tuple[str, str | None], Expansions] | None] = ContextVar("expansion_memo", default=None)
 LITERAL_PRODUCERS = frozenset({"echo", "printf"})
+STDIN_PROGRAM_FLAGS = {
+    "python": frozenset({"-u", "-B", "-I", "-S", "-s"}),
+    "perl": frozenset({"-w", "-T"}),
+    "ruby": frozenset({"-w"}),
+    "node": frozenset(),
+}
+STDIN_PROGRAM_PATHS = frozenset({"-", "/dev/stdin"})
 HOME_TOKEN_RE = re.compile(r"^(?:~|\$HOME|\$\{HOME\})(?=/|$)")
 OPERAND_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 TEE_APPEND_FLAGS = frozenset({"-a", "--append"})
-HEREDOC_SINKS = frozenset({"cat", "tee"})
 MAX_LITERAL_OUTPUT_CHARS = 1_000_000
 PRINTF_TOKEN_RE = re.compile(r"%%|%s|\\[\\abefnrtv]|\\[0-7]{1,3}|[^%\\]+")
 PRINTF_ESCAPES = {
@@ -102,7 +109,8 @@ def write_targets(command: str) -> list[tuple[str, str]]:
 
 def literal_writes(command: str) -> list[LiteralWrite]:
     expansions = command_expansions(command)
-    rows = [write for line, bodies, _ in _logical_lines(command) for write in _line_writes(line, bodies)]
+    lines = _logical_lines(command, physical=False)
+    rows = [write for line, bodies, _ in lines for write in _line_writes(line, bodies)]
     return [write._replace(path=path) for write in rows if (path := expansions.path(write.path)) is not None]
 
 
@@ -167,13 +175,14 @@ def _fed(producer: list[str], consumer: list[str]) -> tuple[tuple[str, ...], ...
 
 
 def line_segments(command: str) -> list[list[str]]:
-    return [segment for line in command_lines(command) for segment in _segments(line.text)]
+    unroll = SPLITTER_RE.search(command) is None
+    return [segment for line in command_lines(command) for segment in _segments(line.text, unroll)]
 
 
-def _logical_lines(command: str) -> list[tuple[str, list[str | None], list[str]]]:
+def _logical_lines(command: str, *, physical: bool = True) -> list[tuple[str, list[str | None], list[str]]]:
     rows: list[tuple[str, list[str | None], list[str]]] = []
     start = 0
-    for token in shell_tokens(command, physical=True):
+    for token in shell_tokens(command, physical=physical):
         match = token.match
         if match is not None and not (match.lastgroup == "separator" and match.group() == "\n"):
             continue
@@ -199,20 +208,55 @@ def _heredoc_matches(text: str) -> list[re.Match]:
 
 def executable_text(command: str) -> str:
     kept: list[str] = []
-    for line, bodies, raw_bodies in _logical_lines(command):
-        kept.append(line)
-        unnested = "(" not in line and "`" not in line
-        cursor = 0
-        for group in _pipeline_groups(line):
-            events, cursor = _group_heredoc_events(group, bodies, raw_bodies, cursor)
-            data_only = unnested and all(_is_heredoc_sink(segment) for segment in group)
-            kept.extend(event.body for event in events if event.dynamic or not data_only)
+    start = 0
+    for token in shell_tokens(command):
+        if not token.bodies:
+            continue
+        end = token.match.start() if token.match is not None else len(command)
+        header = command[start:end]
+        kept.append(header)
+        groups = _pipeline_groups(header.rsplit("\n", 1)[-1])
+        readers = [
+            any(_shell_consumer(part) for part in group)
+            for group in groups for segment in group for _ in _heredoc_matches(_segment_text(segment))
+        ]
+        for index, body in enumerate(token.bodies):
+            if index >= len(readers) or readers[index] or not body.closed:
+                kept.append(executable_text(body.text))
+            elif body.expands:
+                kept.extend(_substitutions(body.text))
+        start = token.end
+    kept.append(command[start:])
     return "\n".join(kept)
 
 
-def _is_heredoc_sink(segment: list[str]) -> bool:
+def _shell_consumer(segment: list[str]) -> bool:
     index = _payload_command_index(segment)
-    return index < len(segment) and _basename(segment[index]) in HEREDOC_SINKS
+    if index >= len(segment) or segment[index] in SCRIPT_READERS:
+        return True
+    name = _basename(segment[index])
+    if name in {"cat", "tee"}:
+        return False
+    return not _is_stdin_program(name, segment[index + 1:])
+
+
+def _is_stdin_program(name: str, trailing: list[str]) -> bool:
+    return stdin_program(name, _words(_without_redirects(trailing)))
+
+
+def stdin_program(name: str, args: list[str]) -> bool:
+    family = "python" if name == "python3" or (
+        name.startswith("python3.") and VERSIONED_PYTHON_RE.fullmatch(name)
+    ) else name
+    flags = STDIN_PROGRAM_FLAGS.get(family)
+    if flags is None:
+        return False
+    for arg in args:
+        if arg in STDIN_PROGRAM_PATHS:
+            return True
+        if arg not in flags:
+            return False
+    return True
 
 
 def _logical_body(body: ShellBody) -> str:
@@ -368,7 +412,10 @@ def _producer_words(args: list[str]) -> list[str] | None:
             continue
         if DYNAMIC_RE.search(token) and not (token.startswith("'") and token.endswith("'")):
             return None
-        words.append(_bare(token))
+        value = _bare(token)
+        if token.startswith('"') and _is_quoted(token):
+            value = re.sub(r'\\(["\\])', r'\1', value)
+        words.append(value)
     return words
 
 

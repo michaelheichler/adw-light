@@ -35,8 +35,8 @@ def owned(handler, root, legacy_only, preserve_legacy):
         script = next((word for word in args if not re.fullmatch(r"-[ISBE]+", word)), "")
         return not preserve_legacy and Path(script).name == "adw_light.py"
     path = Path(words[0])
-    return not legacy_only and path.name == "run.sh" and path.parent.name == "hooks" and (
-        path.parent.parent == root or adw_tree(path.parent.parent)
+    return not legacy_only and path.name in {"run.sh", "adw-config"} and path.parent.name == "hooks" and (
+        (root is not None and path.parent.parent == root) or adw_tree(path.parent.parent)
     )
 
 
@@ -55,9 +55,6 @@ def strip(groups, root, legacy_only, preserve_legacy):
 
 def save(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".bak.", delete=False) as backup:
-            shutil.copy2(path, backup.name)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as output:
         json.dump(data, output, indent=2)
         output.write("\n")
@@ -69,13 +66,15 @@ def save(path, data):
 def main(codex):
     parser = argparse.ArgumentParser()
     parser.add_argument("--hooks-json" if codex else "--settings", dest="target", required=True, type=Path)
-    parser.add_argument("--skill-dir", type=Path, required=True)
+    parser.add_argument("--skill-dir", type=Path)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--remove-legacy", action="store_true")
     modes.add_argument("--strip-only", action="store_true")
     args = parser.parse_args()
+    if args.skill_dir is None and not args.strip_only:
+        parser.error("--skill-dir is required unless --strip-only is given")
     target = args.target.expanduser().resolve()
-    root = args.skill_dir.expanduser().resolve()
+    root = args.skill_dir.expanduser().resolve() if args.skill_dir is not None else None
     original = json.loads(target.read_text()) if target.exists() else {}
     data = dict(original)
     hooks = dict(data.get("hooks", {}))
@@ -100,5 +99,6 @@ def install(hooks, root, codex):
         for group in groups:
             for handler in group["hooks"]:
                 prefix = "ADW_CODEX_HOOK=1 " if codex else ""
-                handler["command"] = prefix + shlex.quote(str(root / "hooks/run.sh")) + " " + event
+                script = "adw-config" if "/hooks/adw-config" in handler["command"] else "run.sh"
+                handler["command"] = prefix + shlex.quote(str(root / "hooks" / script)) + " " + event
         hooks.setdefault(event, []).extend(groups)

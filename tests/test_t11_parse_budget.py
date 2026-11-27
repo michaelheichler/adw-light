@@ -11,7 +11,7 @@ SHARED_FILE_CHARS = 100_000
 SINGLE_PATCH_CHARS = 150_000
 LARGE_PATCH_CHARS = 200_000
 REMAINDER_PATCH_CHARS = 62_000
-FETCH_SECONDS = 3.0
+SHARED_FETCH_SECONDS = 1.5
 SIZE_BUDGET = "size_budget"
 DOWNLOAD_PENDING = "download_pending"
 SHARED_FILES = (("first.go", "f"), ("second.go", "g"), ("third.go", "h"))
@@ -66,12 +66,13 @@ class PreciseParseSizeLimit(unittest.TestCase):
 @unittest.skipUnless(BUNDLE_READY, BUNDLE_NEEDED)
 class SharedGrammarFetchDeadline(unittest.TestCase):
     def test_call_needing_three_missing_grammars_waits_one_fetch_deadline_and_logs_each_pending(self):
-        hook = HookHome(self).link_library().bundle_without_grammars().hold_download_lock(*LANGUAGES)
+        """Compute expected values independently."""
+        hook = HookHome(self, SHARED_FETCH_SECONDS).link_library().bundle_without_grammars().hold_download_lock(*LANGUAGES)
         started = time.monotonic()
         hook.patch(SOURCES)
         elapsed = time.monotonic() - started
         self.assertEqual(fallbacks(hook.precision_rows()), [(language, DOWNLOAD_PENDING) for language in LANGUAGES])
-        self.assertLess(elapsed, 2 * FETCH_SECONDS)
+        self.assertLess(elapsed, 2 * SHARED_FETCH_SECONDS)
 
     def test_grammars_fetched_in_the_background_are_used_by_the_next_call(self):
         hook = HookHome(self).link_library().bundle_without_grammars().hold_download_lock(*LANGUAGES)

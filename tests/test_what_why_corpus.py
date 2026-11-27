@@ -1,20 +1,24 @@
-from quiet_git import disable_background_maintenance
 import json
+import os
 import re
-import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import NamedTuple
+from unittest import mock
 import unittest
 
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+sys.path.insert(0, str(PROJECT / "engine"))
 
-SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+from adw_light import run_hook
+from lib.git_port import FakeGitView
+
+
 CORPUS = Path(__file__).resolve().parent / "fixtures" / "corpus_what_comments.jsonl"
 LISTED_RULE_RE = re.compile(r"^\d+\. .*\((\w+)\)$", re.M)
 COMMENT_RULES = frozenset({"what_comment", "what_docstring", "weak_why_comment"})
-WORKERS = 8
 
 
 class Agreement(NamedTuple):
@@ -53,18 +57,12 @@ def listed_rules(response):
     return frozenset(LISTED_RULE_RE.findall(text))
 
 
-def predicted_label(root, numbered_row):
-    number, row = numbered_row
-    workspace = root / ("row-%03d" % number)
-    workspace.mkdir()
+def predicted_label(root, git, number, row):
     path, content = FILE_FOR_KIND[row["kind"]](row)
     payload = {"cwd": str(root), "session_id": "corpus-%03d" % number, "hook_event_name": "PreToolUse",
-               "tool_name": "Write", "tool_input": {"file_path": str(workspace / path), "content": content}}
-    call = subprocess.run(
-        [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(workspace / ".adw-state")],
-        input=json.dumps(payload), text=True, capture_output=True, check=True,
-    )
-    return "what" if listed_rules(json.loads(call.stdout)) & COMMENT_RULES else "why"
+               "tool_name": "Write", "tool_input": {"file_path": str(root / ("row-%03d" % number) / path), "content": content}}
+    response = run_hook("PreToolUse", payload, state_dir=root / ".adw-state", git_view=git)
+    return "what" if listed_rules(response) & COMMENT_RULES else "why"
 
 
 def agreement(labels, predictions):
@@ -76,17 +74,21 @@ def agreement(labels, predictions):
 
 
 class WhatWhyCorpusAgreement(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         workspace = TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name)
-        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
-        disable_background_maintenance(self.root)
+        cls.addClassCleanup(workspace.cleanup)
+        cls.root = Path(workspace.name)
+        cls.git = FakeGitView({"roots": {}})
+        (cls.root / "home").mkdir()
+        environment = mock.patch.dict(os.environ, {"HOME": str(cls.root / "home")})
+        environment.start()
+        cls.addClassCleanup(environment.stop)
 
     def test_comment_rules_agree_with_the_labelled_corpus_at_todays_rate(self):
+        """Compute expected values independently."""
         rows = corpus_rows()
-        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            predictions = list(pool.map(lambda numbered: predicted_label(self.root, numbered), enumerate(rows)))
+        predictions = [predicted_label(self.root, self.git, number, row) for number, row in enumerate(rows)]
 
         self.assertEqual(TODAY, agreement([row["label"] for row in rows], predictions))
 

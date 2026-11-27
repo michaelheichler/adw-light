@@ -23,7 +23,7 @@ from .shell_text import (
 RESERVED_WORDS = COMMAND_LEADERS
 QUOTE_MARK = "\ue010"
 HOIST_MARK = "\ue011"
-QUOTE_START_RE = re.compile(r"[\\'\"]")
+QUOTE_START_RE = re.compile(r"[\\'\"]|\$\{\w+:\?[\w .,/-]+\}")
 PUNCTUATION_RUN_RE = re.compile(r"[;&|()\n]+")
 SHELL_OPERATOR_RE = re.compile(r"&&|\|\||\|&|[;&|()]|\n")
 UNREADABLE_QUOTING = (
@@ -155,6 +155,10 @@ def _marked_quotes(text: str) -> str:
     cursor = 0
     while (match := QUOTE_START_RE.search(text, cursor)) is not None:
         start = match.start()
+        if match.group().startswith("${"):
+            parts.extend([text[cursor:start], shlex.quote(match.group())])
+            cursor = match.end()
+            continue
         if match.group() == "\\":
             parts.extend([text[cursor:start], QUOTE_MARK, text[start:start + 2]])
             cursor = start + 2

@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-import subprocess
 import time
 from collections.abc import Sequence
 from pathlib import Path
 
 try:
-    from . import imported_baseline
+    from . import git_port, imported_baseline
     from .imported_baseline import Check, Snapshot, text_digest
     from .provenance import OWNED_RULES, Provenance, compare_any
+    from .scanner import scan_all
     from .regular_file import open_regular, read_regular_text
     from .scan_input import CONTENT_SAMPLE_BYTES, has_generated_marker
 except ImportError:
+    import git_port
     import imported_baseline
     from imported_baseline import Check, Snapshot, text_digest
     from provenance import OWNED_RULES, Provenance, compare_any
+    from scanner import scan_all
     from regular_file import open_regular, read_regular_text
     from scan_input import CONTENT_SAMPLE_BYTES, has_generated_marker
 
@@ -45,31 +47,15 @@ def remaining(until: float | None) -> float | None:
     return left
 
 
-def _git(args: list[str], cwd: Path, until: float | None = None) -> str | None:
-    left = remaining(until)
-    timeout = GIT_TIMEOUT_SECONDS if left is None else min(GIT_TIMEOUT_SECONDS, left)
-    try:
-        result = subprocess.run(
-            ["git", *args], cwd=str(cwd), text=True, capture_output=True,
-            check=True, timeout=timeout, errors="replace",
-        )
-    except subprocess.TimeoutExpired:
-        remaining(until)
-        return None
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout
-
-
 def _repo_relative(path: Path, until: float | None) -> tuple[Path, str] | None:
     directory = path.parent
     if not directory.is_dir():
         return None
-    top = _git(["rev-parse", "--show-toplevel"], directory, until)
-    if not top or not top.strip():
+    top = git_port.view().toplevel(directory, until=until)
+    if top is None:
         return None
     try:
-        relative = path.resolve().relative_to(Path(top.strip()).resolve())
+        relative = path.resolve().relative_to(top.resolve())
     except (OSError, ValueError):
         return None
     return directory, relative.as_posix()
@@ -80,7 +66,7 @@ def committed_text(path: Path, until: float | None = None) -> str | None:
     if located is None:
         return None
     directory, relative = located
-    return _git(["show", "HEAD:" + relative], directory, until)
+    return git_port.view().head_text(directory, relative, until=until)
 
 
 def partition(findings: list[dict], provenance: Provenance) -> tuple[list[dict], list[dict]]:
@@ -128,16 +114,39 @@ def _current(path: Path, text: str | None) -> str | None:
         return None
 
 
-def _owned_split(path: Path, findings: list[dict], befores: list[str], text: str | None, check: Check) -> tuple[list[dict], list[dict]]:
+def colon_ownership(path: str, rows: list[dict], befores: Sequence[str], cfg: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    ordinary = [row for row in rows if row["rule"] != "prose_colon"]
+    colons = [row for row in rows if row["rule"] == "prose_colon"]
+    if not colons:
+        return ordinary, [], []
+    minimum = min(row["occurrences"] for row in colons)
+    counts = (row["occurrences"] for before in befores if before.count(":") >= minimum
+              for row in scan_all(path, before, cfg) if row["rule"] == "prose_colon")
+    prior = max(counts, default=0)
+    return ordinary, [row for row in colons if row["occurrences"] > prior], [row for row in colons if row["occurrences"] <= prior]
+
+
+def split_pending_file(path: Path, rows: list[dict], cfg: dict, after: str, before: str | None = None) -> tuple[list[dict], list[dict]]:
+    if not any(row["rule"] == "prose_colon" for row in rows):
+        return split_committed(path, rows, cfg, after)
+    old = _current(path, before) or ""
+    ordinary, added, carried = colon_ownership(str(path), rows, [old], cfg)
+    owned, inherited = split_committed(path, ordinary, cfg, after)
+    return owned + added, inherited + (carried if baseline_mode(cfg) == "report" else [])
+
+
+def _owned_split(path: Path, findings: list[dict], befores: list[str], text: str | None, check: Check, cfg: dict) -> tuple[list[dict], list[dict]]:
     current = _current(path, text)
     if current is None or all(row.get("rule") in OWNED_RULES for row in findings):
         return findings, []
-    return partition(findings, compare_any(str(path), befores, current, check))
+    ordinary, added, carried = colon_ownership(str(path), findings, befores, cfg)
+    owned, inherited = partition(ordinary, compare_any(str(path), befores, current, check)) if ordinary else ([], [])
+    return owned + added, inherited + carried
 
 
 def _split_texts(path: Path, findings: list[dict], cfg: dict, befores: list[str], text: str | None, check: Check) -> tuple[list[dict], list[dict]]:
     relieving = next((before for before in befores if _inherited_length(before, text)), befores[0])
-    owned, inherited = _length_relief(_owned_split(path, findings, befores, text, check), relieving, text)
+    owned, inherited = _length_relief(_owned_split(path, findings, befores, text, check, cfg), relieving, text)
     return owned, inherited if baseline_mode(cfg) == "report" else []
 
 

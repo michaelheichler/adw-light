@@ -48,6 +48,7 @@ SKIPPED = Visit((), frozenset(), False, frozenset(), True)
 
 @dataclass(slots=True)
 class WalkRun:
+    git_configured: bool = False
     steps: int = 0
     skipped: bool = False
     reads: list[str] = field(default_factory=list)

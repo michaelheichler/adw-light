@@ -10,6 +10,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+NO_REPOSITORY_VIEW = Path(__file__).resolve().parent / "fixtures" / "no_repository_view.json"
 SCREENSHOT_BYTES = 2_500_000
 FLAGGED_PROSE = "We utilize this tool for the build.\n"
 REPORT_LINE = re.compile(r"Full report: (\S+\.json)")
@@ -32,7 +33,7 @@ class TurnSurvivalRegressions(unittest.TestCase):
             "cwd": str(self.root), "session_id": "turn-survival", "hook_event_name": event, **payload,
         })
         return subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), event, "--host", "claude", "--state-dir", str(self.state)],
+            [sys.executable, "-ISB", str(SCRIPT), event, "--host", "claude", "--state-dir", str(self.state), "--git-view", str(NO_REPOSITORY_VIEW)],
             input=body, text=True, capture_output=True, env=env,
         )
 

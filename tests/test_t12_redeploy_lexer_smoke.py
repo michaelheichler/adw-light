@@ -5,8 +5,8 @@ from pathlib import Path
 
 from t12_layer_fixtures import layer_folder, seed_working_layer
 from t12_wheelhouse import FAKE_PACK, PACK, build_wheel, make_wheelhouse
-from t2325_fixtures import ROOT, Scratch, all_paths
-from test_t2325_install_layers import INSTALL, InstallCase
+from t2325_fixtures import ROOT, all_paths
+from test_t2325_install_layers import SMALL_PROBE_RELEASE, InstallCase
 
 RECORDING_PROBE = """import json
 import os
@@ -38,10 +38,10 @@ def build_user_venv(scratch):
     return venv / "bin" / "python"
 
 
-def stage_recording_tools(scratch):
-    tools = scratch.root / "staged-tools"
-    tools.mkdir()
-    shutil.copy2(INSTALL, tools / "install_layers.sh")
+def stage_recording_tools(scratch, installer):
+    tools = scratch.root / "staged" / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy2(installer, tools / "install_layers.sh")
     (tools / "smoke_probe.py").write_text(RECORDING_PROBE, encoding="utf-8")
     return tools / "install_layers.sh"
 
@@ -60,11 +60,11 @@ class RecordedRedeploySmokeTests(InstallCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.scratch = Scratch(cls.addClassCleanup)
+        cls.scratch = cls.fresh_scratch()
         cls.venv_python = build_user_venv(cls.scratch)
         record = cls.scratch.root / "smoke-record.jsonl"
-        installer = stage_recording_tools(cls.scratch)
-        cls.code = cls.scratch.run(["bash", installer, "--claude", "--codex", cls.release.path], timeout=900,
+        installer = stage_recording_tools(cls.scratch, cls.release.installer)
+        cls.code = cls.scratch.run(["bash", installer, "--claude", "--codex", "--tag", cls.release.tag], timeout=900,
                                    SMOKE_RECORD=str(record)).returncode
         cls.runs = [json.loads(line) for line in record.read_text(encoding="utf-8").splitlines()]
 
@@ -82,14 +82,17 @@ class RecordedRedeploySmokeTests(InstallCase):
 
 
 class WorkingLayerRedeployTests(InstallCase):
+    release_fixture = SMALL_PROBE_RELEASE
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.scratch = Scratch(cls.addClassCleanup)
+        cls.scratch = cls.fresh_scratch()
         log = cls.scratch.root / "grammar-downloads.log"
         wheelhouse = logging_wheelhouse(cls.scratch, log)
         seed_working_layer(cls.scratch, wheelhouse, ROOT)
-        result = cls.scratch.run(["bash", INSTALL, "--claude", "--codex", cls.release.path], timeout=900,
+        result = cls.scratch.run(["bash", cls.release.installer, "--claude", "--codex", "--tag", cls.release.tag],
+                                 timeout=900,
                                  PIP_FIND_LINKS=str(wheelhouse))
         cls.code = result.returncode
         user_layer = cls.scratch.home / ".adw-lite"

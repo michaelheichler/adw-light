@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import TypedDict
 
-from lib import session_state
+from lib import payloads, session_state
 from lib.config import StorageRoots
 from lib.hookio import read_payload, system_message, write_payload
 from lib.mcp_health import (

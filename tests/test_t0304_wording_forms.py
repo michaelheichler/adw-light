@@ -1,14 +1,21 @@
-from quiet_git import disable_background_maintenance
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 import unittest
 
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+sys.path.insert(0, str(PROJECT / "engine"))
 
-SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+from adw_light import run_hook
+from lib.git_port import FakeGitView
+
+
+NO_REPOSITORY = FakeGitView({"roots": {}})
+
 AGENT = "adw-test-writer"
 TEST_FILE = "tests/test_probe.py"
 DENY = "deny"
@@ -17,9 +24,10 @@ EXCEPTION = "wording_exception_match"
 LOG = "wording_log_assertion"
 LOCATION = "literal_location"
 WATCHED = frozenset({WORDING, EXCEPTION, LOG, LOCATION})
-BODY_START = 7
-UNITTEST_HEADER = ("import logging", "import unittest", "", "", "class Probe(unittest.TestCase):", "    def test_probe(self):")
-PYTEST_HEADER = ("import logging", "import pytest", "", "", "", "def test_probe(caplog):")
+BODY_START = 8
+CITATION = '"""A test must verify what the code does for its client, never how it does it."""'
+UNITTEST_HEADER = ("import logging", "import unittest", "", "", "class Probe(unittest.TestCase):", "    def test_probe(self):", "        " + CITATION)
+PYTEST_HEADER = ("import logging", "import pytest", "", "", "", "def test_probe(caplog):", "    " + CITATION)
 SENTENCE = " ".join(("name", "must", "not", "be", "empty"))
 LOG_SENTENCE = " ".join(("the", "cache", "is", "empty"))
 MACHINE_CODE = "E042"
@@ -52,40 +60,39 @@ def unittest_module_with_constant(constant, *body):
 
 
 class WordingFormsGate(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         workspace = TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name)
-        self.repo = self.root / "repo"
-        self.state = self.root / "state"
-        self.home = self.root / "home"
-        self.home.mkdir()
-        (self.repo / "tests").mkdir(parents=True)
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
-        disable_background_maintenance(str(self.repo))
+        cls.addClassCleanup(workspace.cleanup)
+        cls.root = Path(workspace.name).resolve()
+        cls.repo = cls.root / "repo"
+        cls.state = cls.root / "state"
+        (cls.root / "home").mkdir()
+        (cls.repo / "tests").mkdir(parents=True)
+        environment = mock.patch.dict(os.environ, {"HOME": str(cls.root / "home")})
+        environment.start()
+        cls.addClassCleanup(environment.stop)
+
+    def reports(self):
+        return set((self.state / "reports").glob("*.json"))
 
     def write_test(self, content):
         payload = {
-            "cwd": str(self.repo), "session_id": "forms", "hook_event_name": "PreToolUse",
+            "cwd": str(self.repo), "session_id": self._testMethodName, "hook_event_name": "PreToolUse",
             "agent_type": AGENT, "tool_name": "Write",
             "tool_input": {"file_path": str(self.repo / TEST_FILE), "content": content},
         }
-        call = subprocess.run(
-            [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(self.state)],
-            input=json.dumps(payload), text=True, capture_output=True,
-            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
-        )
-        self.assertEqual(call.returncode, 0)
-        return json.loads(call.stdout)
+        earlier = self.reports()
+        response = run_hook("PreToolUse", payload, state_dir=self.state, git_view=NO_REPOSITORY)
+        return response, self.reports() - earlier
 
-    def watched_rows(self):
-        reports = sorted((self.state / "reports").glob("*.json"))
-        rows = [row for report in reports for row in json.loads(report.read_text(encoding="utf-8"))]
+    def watched_rows(self, new_reports):
+        rows = [row for report in sorted(new_reports) for row in json.loads(report.read_text(encoding="utf-8"))]
         return tuple((row["rule"], row["line"]) for row in rows if row["rule"] in WATCHED)
 
     def verdict(self, content):
-        decision = self.write_test(content).get("hookSpecificOutput", {}).get("permissionDecision")
-        return decision, self.watched_rows()
+        response, new_reports = self.write_test(content)
+        return response.get("hookSpecificOutput", {}).get("permissionDecision"), self.watched_rows(new_reports)
 
     def test_pytest_raises_with_a_prose_match_denies_as_an_exception_match(self):
         content = pytest_module(f"with pytest.raises(ValueError, match={quoted(SENTENCE)}):", "    build()")

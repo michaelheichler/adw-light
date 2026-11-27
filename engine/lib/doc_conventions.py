@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import ast
 import re
-import subprocess
 from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
 try:
+    from . import git_port
     from .declaration_mask import _literal_end, declaration_view
     from .findings import finding_row
 except ImportError:
+    import git_port
     from declaration_mask import _literal_end, declaration_view
     from findings import finding_row
 
@@ -57,12 +58,12 @@ def _convention(root: Path, stamps: tuple[tuple[str, int], ...], suffix: str) ->
 def repo_docs(path: Path) -> bool:
     folder = next(parent for parent in path.resolve().parents if parent.is_dir())
     try:
-        result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=folder, capture_output=True,
-                                check=True, text=True, timeout=2)
-        root = Path(result.stdout.rstrip("\n"))
+        root = git_port.view().toplevel(folder, timeout=2, errors="strict", newline_only=True)
+        if root is None:
+            return False
         stamps = tuple((name, (root / name).stat().st_mtime_ns) for name in FILES if (root / name).is_file())
         return _convention(root, stamps, path.suffix.lower())
-    except (OSError, subprocess.SubprocessError):
+    except OSError:
         return False
 
 
@@ -93,7 +94,7 @@ def comment_findings(context, source: str, scan_comment_contract, scan_all) -> l
     code = reference_source(context.text, context.path, context.tree)
     for doc in docs:
         rows.extend(unresolved_links(doc, code))
-        for row in scan_all("doc-comment.md", doc.body, context.config):
+        for row in scan_all("doc-comment.md", doc.body, context.config, document=False):
             if row["family"] in {"english", "punctuation"}:
                 located = dict(row, line=row["line"] + doc.line - 1)
                 if "end_line" in row:

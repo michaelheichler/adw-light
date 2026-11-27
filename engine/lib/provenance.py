@@ -20,6 +20,8 @@ try:
         LIST_ITEM_RE, Paragraph, ProseLine, SentenceSpan, _markdown_prose_lines, _paragraph_groups, sentence_spans,
     )
     from .scanner import _is_prose
+    from .test_rules import check_file
+    from .test_rules import principle_citation
 except ImportError:
     from comment_rules import _multiline_comment_findings, _normalize_block_comments, _scan_comment_blocks, python_comment_tokens
     from config import FIXED_OBSERVE_RULES, SCANNER_ALWAYS_BLOCKING_RULES
@@ -30,6 +32,7 @@ except ImportError:
         LIST_ITEM_RE, Paragraph, ProseLine, SentenceSpan, _markdown_prose_lines, _paragraph_groups, sentence_spans,
     )
     from scanner import _is_prose
+    from test_rules import check_file, principle_citation
 
 MOVED_KEY_FLOOR = 12
 SIZE_RULES = frozenset({"function_too_long", "oversized_list"})
@@ -331,6 +334,11 @@ class Provenance:
     carried_comments: frozenset[int] = frozenset()
 
     inherited_blocks: frozenset[tuple[int, str]] = frozenset()
+    citation_baseline: Callable[[], set[tuple[int, int]]] | None = field(default=None, repr=False, compare=False)
+
+    @cached_property
+    def inherited_citations(self) -> set[tuple[int, int]]:
+        return self.citation_baseline() if self.citation_baseline is not None else set()
 
     @cached_property
     def changed(self) -> frozenset[int]:
@@ -409,6 +417,8 @@ class Provenance:
         if rule in OWNED_RULES:
             return True
         first, last = _bounds(finding)
+        if rule == principle_citation.RULE:
+            return (first, last) not in self.inherited_citations
         if finding.get("family") == "comment" and first == last and first in self.carried_comments:
             return False
         if rule == "prose_comment_block" and (first, finding.get("snippet")) in self.inherited_blocks:
@@ -454,6 +464,25 @@ def _baseline_blocks(path: str, before: str, after: str, diff: _Diff) -> set[tup
     return {(new + 1, snippet) for new, old in pairs for snippet in blocks.get(old + 1, ())}
 
 
+def _citation_units(path: str, text: str, check: Check) -> dict[tuple[int, int], tuple[str, ...]]:
+    check()
+    lines = text.split("\n")
+    rows = check_file(path, text, (principle_citation.RULE_SET,))
+    return {(first, last): tuple(lines[first - 1:last]) for first, last in map(_bounds, rows)}
+
+
+def _inherited_citations(path: str, befores: list[str], after: str, check: Check) -> set[tuple[int, int]]:
+    current = _citation_units(path, after, check)
+    inherited = set()
+    for before in befores:
+        counts = Counter(_citation_units(path, before, check).values())
+        for span, unit in current.items():
+            if counts[unit]:
+                inherited.add(span)
+                counts[unit] -= 1
+    return inherited
+
+
 def compare_any(path: str, befores: list[str], after: str, check: Check = _unchecked) -> Provenance:
     prose = _prose_file(path, after)
     units, texts = _units(path, after, prose)
@@ -470,4 +499,7 @@ def compare_any(path: str, befores: list[str], after: str, check: Check = _unche
             blocks.update(_baseline_blocks(path, before, after, physical[-1]))
             if path.lower().endswith(".py") and "#" in before and "#" in after:
                 carried_comments.update(_carried_comments(before, after, physical[-1].edits))
-    return Provenance(tuple(units), tuple(diffs), prose, texts, tuple(physical), frozenset(carried_comments), frozenset(blocks))
+    return Provenance(
+        tuple(units), tuple(diffs), prose, texts, tuple(physical), frozenset(carried_comments), frozenset(blocks),
+        citation_baseline=lambda: _inherited_citations(path, befores, after, check),
+    )

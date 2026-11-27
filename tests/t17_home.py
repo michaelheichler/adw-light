@@ -9,6 +9,7 @@ from t19_language_home import BUNDLE, GRAMMARS, LIBRARY_NEEDED, LIBRARY_READY, V
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "adw_light.py"
+NO_REPOSITORY_VIEW = Path(__file__).resolve().parent / "fixtures" / "no_repository_view.json"
 DENY = "deny"
 TEST_WRITER = "adw-test-writer"
 WELL_FORMED_TODO = "TODO: Add CSV export to the report view to let users share results"
@@ -26,6 +27,7 @@ def _home(case, exact):
     case.addCleanup(workspace.cleanup)
     root = Path(workspace.name)
     (root / "repo").mkdir()
+    (root / "repo" / "pyproject.toml").write_text("[project]\nname = \"fixture\"\n", encoding="utf-8")
     adw = root / "home" / ".adw-lite"
     (adw / "install").mkdir(parents=True)
     (adw / "cache" / "grammars").mkdir(parents=True)
@@ -43,7 +45,7 @@ def verdict(case, relative, content, agent=None, exact=False):
     }
     payload.update({"agent_type": agent} if agent else {})
     call = subprocess.run(
-        [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(root / "state")],
+        [sys.executable, "-ISB", str(SCRIPT), "PreToolUse", "--host", "claude", "--state-dir", str(root / "state"), "--git-view", str(NO_REPOSITORY_VIEW)],
         input=json.dumps(payload), text=True, capture_output=True, timeout=120, check=False,
         env={"HOME": str(root / "home"), "PATH": os.environ.get("PATH", "")},
     )

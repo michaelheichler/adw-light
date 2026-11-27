@@ -12,9 +12,9 @@ from typing import cast
 from failure import normalize_payload, record_success
 from lib import blocker_state, captured_output, imported_baseline, journal, payloads, scan_input, temp_authorship, wording_debt
 from lib.mcp_health import config_roots
-from lib.config import effective_config
+from lib.config import contract_strings, effective_config
 from lib.findings import Finding, VerdictKind
-from lib.hookio import advise, claude_feedback_response, config_failure, read_payload, write_payload
+from lib.hookio import advise, claude_feedback_response, config_failure, join_notices, read_payload, stop_block, write_payload
 from lib.payloads import RecordPayload, exact_string_dict, record_payload
 from lib.baseline import split_committed, split_fallback
 from lib.import_advice import imported_advice
@@ -105,7 +105,8 @@ def _journal_edits(edits: _EditJournal, turn_id: str = "") -> None:
             continue
         if not outside_project_temp(path, cwd):
             _journal_candidate(edits, path, turn_id)
-    temp_authorship.note_authored_temp(session_id, edits.paths, cwd, edits.state_root)
+    if temp_authorship.note_authored_temp(session_id, edits.paths, cwd, edits.state_root):
+        append_row({**template, "event": "scratch_provenance_full", "outcome": "observe"}, edits.root)
 
 
 def _stamped(findings: list[dict], path: Path, content_hash: str | None = None) -> list[dict]:
@@ -141,7 +142,7 @@ def _held_fallback(descriptor: int, path: Path) -> list[dict]:
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
         with os.fdopen(os.dup(descriptor), "rb") as stream:
-            if scan_input.is_data_text(stream):
+            if scan_input.is_data_text(stream, path):
                 return []
             result = scan_input._count_open_file_lines(stream)
     except (OSError, ValueError):
@@ -194,6 +195,17 @@ def _scan_open_file(
         return None
     finally:
         _close_quietly(descriptor)
+
+
+def scanned_rewrite(path: Path, cfg: dict) -> list[dict]:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return []
+    if not stat.S_ISREG(metadata.st_mode):
+        return []
+    scanned = _scan_open_file(path, (metadata.st_dev, metadata.st_ino), cfg)
+    return scanned[0] if scanned is not None else []
 
 
 def _scan_paths(paths: list[str], cwd: Path, cfg: dict, *, allow_absent: bool = False) -> tuple[list[dict], list[dict]]:
@@ -308,7 +320,10 @@ def _gate_for(context: _RecordGateContext) -> Callable[[str], dict]:
             _clear_blocker_state(context.blocker_scope, context.tracked_paths, verdict, decisions)
             project = [path for path in context.tracked_paths if not outside_project_temp(path, context.cwd)]
             imported_baseline.note_written(projected["session_id"], project, context.journal.state_root)
-            wording_debt.note_written(projected["session_id"], context.tracked_paths, context.journal.state_root)
+            wording_debt.note_written(
+                projected["session_id"], context.tracked_paths, context.journal.state_root,
+                cwd=str(context.cwd), contracts=contract_strings(context.config),
+            )
         return response
 
     return gate
@@ -378,13 +393,34 @@ def _gate_context_for(
     )
 
 
-def run(payload: dict, config: dict | None = None) -> dict:
+def _merge_after_run(record: dict, after: dict) -> dict:
+    if not after or not record:
+        return after or record
+    responses = (record, after)
+    messages = [str(item.get("hookSpecificOutput", {}).get("additionalContext") or item.get("systemMessage", ""))
+                for item in responses]
+    reasons = [item["reason"] for item in responses if item.get("decision") == "block"]
+    notice = join_notices(*dict.fromkeys(messages))
+    if reasons:
+        return {**after, **stop_block(join_notices(*dict.fromkeys(reasons), notice))}
+    return {**record, **after, **advise(notice, "PostToolUse")}
+
+
+def run(payload: dict, config: dict | None = None, *, until: float | None = None) -> dict:
     try:
-        return _run_record(payload, config)
+        result = _run_record(payload, config)
+        from lib import after_run
+
+        name = payloads.tool_name(payload)
+        if name == "Bash":
+            return _merge_after_run(result, after_run.post(payload, config, until=until))
+        if name in after_run.DIRECT_WRITERS:
+            after_run.note_direct_write(payload, config, until=until)
+        return result
     except Exception as exc:
         reason = config_failure("edit", exc, payloads.cwd(payload) or None)
         blocker_state.hold_undecidable(payload, config, UNDECIDABLE_KEY, reason)
-        return {"decision": "block", "reason": reason}
+        return stop_block(reason)
 
 
 if __name__ == "__main__":

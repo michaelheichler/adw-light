@@ -6,14 +6,15 @@ import re
 import subprocess
 from collections.abc import Callable, Iterable, Iterator
 from functools import lru_cache
-from pathlib import PurePath, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple
 
 try:
-    from . import declared_tests, test_units, tests_policy
+    from . import declared_tests, git_port, test_units, tests_policy
     from .regular_file import open_regular
 except ImportError:
     import declared_tests
+    import git_port
     import test_units
     import tests_policy
     from regular_file import open_regular
@@ -23,13 +24,8 @@ MAX_WALKED_ENTRIES = 20000
 MAX_READ_FILES = 5000
 MAX_REFERRER_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 16 * 1024 * 1024
-GIT_TIMEOUT = 30
-NOT_A_REPOSITORY_EXIT = 128
-NO_MATCH_EXIT = 1
 SKIPPED_FOLDERS = frozenset({"node_modules", "vendor"})
 TEST_DECLARING_EXTS = frozenset(declared_tests.COMPILED) | declared_tests.PYTHON_EXTS | declared_tests.RUST_EXTS
-DISK_LISTING = ("ls-files", "-z", "--cached", "--others", "--exclude-standard")
-INDEX_LISTING = ("ls-files", "-z")
 FAILURES = (OSError, UnicodeError, ValueError, subprocess.SubprocessError)
 
 
@@ -166,13 +162,18 @@ def _readable(listing: Iterable[str]) -> list[str]:
     return sorted(candidates, key=lambda path: not tests_policy.in_test_dir(path))
 
 
+def _index_file() -> Path | None:
+    index = os.environ.get("GIT_INDEX_FILE")
+    return Path(index) if index else None
+
+
 def disk_source(root: str) -> Source:
-    listing = _disk_listing(root)
+    listing = _disk_listing(git_port.view(), root)
     return Source(listing, lambda name: _readable(listing), lambda path: _disk_bytes(root, path))
 
 
 def index_source(repo: str) -> Source:
-    listing = _index_listing(repo)
+    listing = _index_listing(git_port.view(), repo, _index_file())
     return Source(listing, lambda name: _index_candidates(repo, listing, name), lambda path: _index_bytes(repo, path))
 
 
@@ -182,23 +183,18 @@ def _disk_bytes(root: str, path: str) -> bytes:
 
 
 def _index_bytes(repo: str, path: str) -> bytes:
-    with subprocess.Popen(
-        ["git", "show", ":" + path], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    ) as process:
-        data = process.stdout.read(MAX_REFERRER_BYTES) if process.stdout else b""
-        process.kill()
-    return data
+    return git_port.view().index_bytes(Path(repo), path, _index_file(), limit=MAX_REFERRER_BYTES)
 
 
 def _index_candidates(repo: str, listing: tuple[str, ...], name: str) -> list[str]:
-    hits = set(_git_paths(repo, ("grep", "--cached", "-z", "-l", "-I", "-F", "-e", name), NO_MATCH_EXIT))
+    hits = set(git_port.view().grep_index(Path(repo), name, _index_file()))
     return [path for path in _readable(listing) if path in hits]
 
 
 @lru_cache(maxsize=4)
-def _disk_listing(root: str) -> tuple[str, ...]:
+def _disk_listing(git_view: git_port.GitView, root: str) -> tuple[str, ...]:
     try:
-        listing = _git_paths(root, DISK_LISTING)
+        listing = git_view.disk_paths(Path(root))
     except NotARepository:
         return _walked(root)
     _check_entries(len(listing))
@@ -206,22 +202,8 @@ def _disk_listing(root: str) -> tuple[str, ...]:
 
 
 @lru_cache(maxsize=4)
-def _index_listing(repo: str) -> tuple[str, ...]:
-    return tuple(path for path in _git_paths(repo, INDEX_LISTING) if _kept(path))
-
-
-def _git_paths(cwd: str, args: tuple[str, ...], empty_exit: int | None = None) -> tuple[str, ...]:
-    try:
-        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=GIT_TIMEOUT, check=False)
-    except FileNotFoundError as exc:
-        raise NotARepository("git is not available") from exc
-    if result.returncode == empty_exit:
-        return ()
-    if result.returncode == NOT_A_REPOSITORY_EXIT:
-        raise NotARepository(cwd)
-    if result.returncode:
-        raise OSError("git " + args[0] + " failed in " + cwd)
-    return tuple(path for path in result.stdout.decode("utf-8", errors="surrogateescape").split("\0") if path)
+def _index_listing(git_view: git_port.GitView, repo: str, index_file: Path | None) -> tuple[str, ...]:
+    return tuple(path for path in git_view.index_paths(Path(repo), index_file) if _kept(path))
 
 
 def _check_entries(entries: int) -> None:
